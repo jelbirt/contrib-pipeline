@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Query this candidate's scratch node from inside the sandbox.
+# A sandboxed command's localhost is private (Linux network namespace), so the request goes
+# through the sandbox proxy, which runs on the host and is allowed to reach exactly
+# 127.0.0.1:<this candidate's port> (the driver adds it to allowedDomains per turn).
+# Usage: xq METHOD /path ['json body'] [--ndjson]
+set -euo pipefail
+cand=${CONTRIB_CANDIDATE_DIR:?not set by the driver}
+port=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["node"]["port"])' "$cand/state.json" 2>/dev/null) \
+  || { echo "xq: no scratch node is running; ask the driver for node-start" >&2; exit 2; }
+method=${1:?METHOD}; path=${2:?/path}; body=${3:-}; ctype=application/json
+[ "${4:-}" = "--ndjson" ] && ctype=application/x-ndjson
+case "$method" in GET|HEAD|POST|PUT|DELETE) ;; *) echo "xq: bad method $method" >&2; exit 2;; esac
+case "$path" in /*) ;; *) echo "xq: path must start with /" >&2; exit 2;; esac
+proxy=${HTTP_PROXY:-${http_proxy:-}}
+via=(); [ -n "$proxy" ] && via=(--proxy "$proxy" --noproxy '')
+url="http://127.0.0.1:${port}${path}"
+args=(-sS --max-time 60 "${via[@]}" -X "$method" -w '\nHTTP %{http_code}\n')
+if [ -n "$body" ]; then
+  curl "${args[@]}" -H "Content-Type: $ctype" --data-binary "$body" "$url"
+else
+  curl "${args[@]}" "$url"
+fi

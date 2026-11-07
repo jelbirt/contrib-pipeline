@@ -1,0 +1,2027 @@
+#!/usr/bin/env python3
+"""Run the contribution pipeline for one repo: scout, then work candidates one at a time.
+
+Headless Claude sessions investigate and fix. They run in Claude Code's sandbox with no
+GitHub credentials, and may write only their own clone and their own session folder.
+Every build, test, scratch node and YAML run happens here, inside a bubblewrap jail with
+the home directory hidden. Nothing is pushed or posted: contrib-publish does that with a
+person. Design: ../DESIGN.md.
+"""
+import argparse
+import datetime
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import ctypes
+from pathlib import Path
+
+HOME = Path.home()
+SKILL = Path(__file__).resolve().parent.parent
+LEDGER = Path(os.environ.get("CONTRIB_LEDGER", HOME / "contrib-queue"))
+WORK = Path(os.environ.get("CONTRIB_WORK", HOME / "contrib-work"))
+TOKEN_FILE = Path(os.environ.get("CONTRIB_TOKEN_FILE", HOME / ".config" / "contrib" / "claude-token"))
+EXIT_DONE, EXIT_SOFT, EXIT_HARD, EXIT_SHUTDOWN_FAILED, EXIT_BUSY = 0, 10, 20, 30, 40
+SOFT_DISK_GB, HARD_DISK_GB, HARD_MEM_MB, HARD_MEM_SECS = 26, 22, 2048, 300
+MAX_TURNS = {"A": 8, "B": 10, "C": 6}
+MAX_REQUESTS_PER_TURN = 12
+TURN_TIMEOUT = 45 * 60          # one Claude turn
+REQUEST_TIMEOUT = 75 * 60       # one build or test request
+STAGE_BUDGET = 90 * 60          # soft stop when less than this is left before the deadline
+SESSION_FILE_LIMIT = 2_000_000  # bytes the driver reads back from a session-written file
+INFRA_EXITS = (97, 98, 99, 124)
+# Names Claude Code's sandbox masks with /dev/null inside a session's working folder.
+SANDBOX_MASKS = (".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zprofile",
+                 ".zshenv", ".zlogin", ".gitconfig", ".ripgreprc", ".gitmodules", ".mcp.json", ".idea",
+                 ".vscode", ".claude")
+JAIL_PORT = 19200               # the scratch node's port inside its own network namespace
+SETTING_SOURCES = ""            # sessions load no user, project or local settings
+EM_DASH, EN_DASH = chr(0x2014), chr(0x2013)
+GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "credential.helper=",
+            "-c", "core.pager=cat"]
+GH_VERBS = {("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"), ("pr", "diff"),
+            ("pr", "checks"), ("search", "issues"), ("search", "prs")}
+GH_FLAGS_VALUE = {"--json", "--limit", "-L", "--state", "-s", "--search", "-S", "--label", "-l", "--author",
+                  "-A", "--jq", "-q", "--sort", "--order", "--match"}
+GH_FLAGS_BARE = {"--comments", "--name-only", "--patch"}
+JAIL_TOOLS = {"bwrap", "socat", "cargo", "rustc", "xerj", "es-yaml-runner", "guarded.sh", "cc", "ld"}
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def die_with_driver():
+    """preexec_fn: the child gets SIGTERM if the driver dies, even by SIGKILL."""
+    _LIBC.prctl(1, signal.SIGTERM, 0, 0, 0)     # PR_SET_PDEATHSIG
+
+
+def agent_defs():
+    """User agents the stages call by name, passed inline: sessions load no user settings."""
+    out = {}
+    for name in ("code-reviewer",):
+        p = HOME / ".claude" / "agents" / f"{name}.md"
+        m = re.match(r"^---\n(.*?)\n---\n(.*)$", p.read_text() if p.is_file() else "", re.S)
+        if not m:
+            continue
+        fm = dict(re.findall(r"^(\w+):\s*(.*)$", m.group(1), re.M))
+        a = {"description": fm.get("description", name).strip().strip('"'), "prompt": m.group(2).strip()}
+        if fm.get("tools"):
+            a["tools"] = [x.strip() for x in fm["tools"].split(",") if x.strip()]
+        if fm.get("model"):
+            a["model"] = fm["model"].strip()
+        out[name] = a
+    return out
+
+
+def now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def load_env(path):
+    env = {}
+    for line in Path(path).read_text().splitlines():
+        line = "" if line.lstrip().startswith("#") else line.split(" #", 1)[0].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def read_json(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, obj):
+    p = Path(p)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2) + "\n")
+    tmp.replace(p)
+
+
+def tool_text(c):
+    """The text of a tool result's content (a string or a list of text parts)."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(x.get("text", "") for x in c if isinstance(x, dict) and isinstance(x.get("text"), str))
+    return ""
+
+
+def inp_text(v):
+    return v if isinstance(v, str) else json.dumps(v)[:4000]
+
+
+SECRET_ENV = re.compile(r"^CLAUDE|TOKEN|KEY|SECRET|PASSW|CREDENTIAL|COOKIE|^SSH_AUTH_SOCK$|^AWS_|^AZURE_|^GOOGLE_|^GCP_",
+                        re.I)
+SAFE_ENV = ("HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TZ", "PATH")
+
+
+def read_session_file(p, limit=SESSION_FILE_LIMIT):
+    """Read a file a session wrote: a regular file (never a symlink), not too big."""
+    try:
+        st = os.lstat(p)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as f:
+            return f.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def read_session_json(p):
+    t = read_session_file(p)
+    if t is None:
+        return None
+    try:
+        v = json.loads(t)
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def file_sha256(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def copy_regular(src, dest):
+    """Copy a build output out of a target dir on the host: a regular file, never through a link."""
+    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise RuntimeError(f"{src} is not a regular file")
+        tmp = Path(str(dest) + ".tmp")
+        with open(tmp, "wb") as o:
+            shutil.copyfileobj(f, o)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dest)
+
+
+def one_line(s, n=300):
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", str(s or ""))
+    s = re.sub(r"\s+", " ", s).strip().replace(EM_DASH, ",").replace(EN_DASH, "-")
+    return s[:n]
+
+
+def inside(path, root):
+    """True when path (resolved, following symlinks) is root or below it."""
+    p, r = os.path.realpath(path), os.path.realpath(root)
+    return p == r or p.startswith(r + os.sep)
+
+
+def c_free_gb():
+    st = os.statvfs("/mnt/c")
+    return st.f_bavail * st.f_frsize // (1 << 30)
+
+
+def mem_avail_mb():
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) // 1024
+    return 0
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, TypeError):
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_group(pgid, first=signal.SIGTERM, grace=30, log=None):
+    """Signal a process group, wait, then SIGKILL that group only. True if it is gone."""
+    if not pgid:
+        return True
+    for sig, wait in ((first, grace), (signal.SIGTERM, 15), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.5)
+        if log:
+            log(f"group {pgid} still alive after {sig.name}")
+    try:
+        os.killpg(pgid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+
+
+def cmdline(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def gh_argv(args, repo):
+    """Turn a session's gh request into a read-only argv, or refuse it."""
+    if not isinstance(args, list) or not args or not all(isinstance(a, str) for a in args):
+        return None, "args must be a list of strings"
+    if any(len(a) > 400 or re.search(r"[\x00-\x1f]", a) for a in args):
+        return None, "an argument is too long or has control characters"
+    owner, name = repo.split("/", 1)
+    if args[0] == "api":
+        if len(args) < 2:
+            return None, "gh api needs a path"
+        path = args[1].lstrip("/")
+        ok = rf"repos/{re.escape(owner)}/{re.escape(name)}/(issues|pulls)(/\d+)?" \
+             r"(/(comments|files|commits|reviews|timeline|events|labels))?(\?[A-Za-z0-9_=&.-]*)?"
+        if not re.fullmatch(ok, path):
+            return None, "gh api path is not on the read list (issues and pulls of this repo)"
+        out, i, rest = ["api", path, "--method", "GET"], 0, args[2:]
+        while i < len(rest):
+            a = rest[i]
+            if a == "--paginate":
+                out.append(a)
+                i += 1
+            elif a in ("--jq", "-q") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+                out += ["--jq", rest[i + 1]]
+                i += 2
+            else:
+                return None, f"gh api flag {a!r} is not allowed"
+        return out, ""
+    if len(args) < 2 or (args[0], args[1]) not in GH_VERBS:
+        return None, f"gh {' '.join(args[:2])} is not on the read-only list"
+    out, i, rest = args[:2], 0, args[2:]
+    while i < len(rest):
+        a = rest[i]
+        if a in GH_FLAGS_BARE:
+            out.append(a)
+            i += 1
+        elif a in GH_FLAGS_VALUE and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+            out += [a, rest[i + 1]]
+            i += 2
+        elif not a.startswith("-"):
+            out.append(a)
+            i += 1
+        else:
+            return None, f"gh flag {a!r} is not allowed"
+    out += ["--repo", repo] if args[0] == "search" else ["-R", repo]
+    return out, ""
+
+
+class StopRun(Exception):
+    pass
+
+
+class Driver:
+    def __init__(self, args):
+        self.args = args
+        self.repo = args.repo
+        pdir = Path(os.environ.get("CONTRIB_PROFILE_DIR", SKILL / "profiles"))
+        self.prof = load_env(pdir / f"{self.repo.replace('/', '-')}.env")
+        self.prof_md = (pdir / f"{self.repo.replace('/', '-')}.md").read_text()
+        self.repo_dir = Path(self.prof["REPO_DIR"])
+        self.upstream = f"{self.prof['UPSTREAM_REMOTE']}/{self.prof['BASE_BRANCH']}"
+        for d in (LEDGER / "candidates", LEDGER / "runs", WORK / "bins", WORK / "clones", WORK / "bin", WORK / "nodes", WORK / "tmp",
+                  WORK / "targets", WORK / "cargo-home"):
+            d.mkdir(parents=True, exist_ok=True)
+        if not (LEDGER / "rejects.md").exists():
+            (LEDGER / "rejects.md").write_text("# Rejected candidates\n\n")
+        self.lockf = open(LEDGER / ".run.lock", "w")
+        try:
+            fcntl.flock(self.lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("another contrib-run holds the ledger lock; not starting", file=sys.stderr)
+            sys.exit(EXIT_BUSY)
+        self.run_id = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        self.run_dir = LEDGER / "runs" / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.logf = open(LEDGER / "runs" / f"{self.run_id}.log", "a")
+        self.deadline = time.time() + args.hours * 3600
+        self.stop_kind = None
+        self.stop_reason = None
+        self.lock = threading.RLock()
+        self.current = {}            # role -> pgid of what is running now
+        self.started = set()         # every process group this run started
+        self.cand = None             # candidate folder being worked (driver-owned)
+        self.target_name = None      # retest builds into its own target dir
+        # Sessions cannot see ~/.gitconfig, so the driver hands them the user's commit identity.
+        ident = {}
+        for k, a, c in (("user.name", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"),
+                        ("user.email", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL")):
+            v = subprocess.run(["git", "config", "--global", k], capture_output=True, text=True).stdout.strip()
+            if v:
+                ident[a] = ident[c] = v
+        self.identity = ident
+        # xq lives in the skill folder, which sessions cannot read; they run this copy instead.
+        copy_regular(SKILL / "bin" / "xq", WORK / "bin" / "xq")
+        self.failures_in_row = 0
+        self.guard_kills = 0
+        self.low_mem_since = None
+        self.done = []
+
+    # ----- paths ----------------------------------------------------------------------
+    @property
+    def sdir(self):
+        """The one folder of the candidate a session may write."""
+        return self.cand / "session"
+
+    def st(self):
+        return read_json(self.cand / "state.json", {}) if self.cand else {}
+
+    def clone(self):
+        return WORK / "clones" / self.cand.name
+
+    def bins(self):
+        return WORK / "bins" / self.cand.name
+
+    # ----- logging and stop control -------------------------------------------------
+    def log(self, msg):
+        line = f"{now()} {msg}"
+        try:
+            print(line, flush=True)
+        except OSError:
+            pass
+        try:
+            self.logf.write(line + "\n")
+            self.logf.flush()
+        except OSError:
+            pass
+
+    def request_stop(self, kind, reason):
+        with self.lock:
+            if self.stop_kind == "hard" or (self.stop_kind == "soft" and kind == "soft"):
+                return
+            first = self.stop_kind is None
+            self.stop_kind, self.stop_reason = kind, reason
+        if first or kind == "hard":
+            self.log(f"STOP ({kind}): {reason}")
+        if kind == "hard":
+            threading.Thread(target=self.interrupt_current, daemon=True).start()
+
+    def interrupt_current(self):
+        for role, pgid in list(self.current.items()):
+            first = signal.SIGINT if role == "session" else signal.SIGTERM
+            grace = 60 if role == "session" else 30
+            self.log(f"interrupting {role} (group {pgid})")
+            stop_group(pgid, first, grace, self.log)
+
+    def check_stop(self, between=False):
+        if self.stop_kind == "hard" or (between and self.stop_kind == "soft"):
+            raise StopRun()
+
+    def watchdog(self):
+        while True:
+            time.sleep(self.args.tick)
+            try:
+                if (LEDGER / "STOP-NOW").exists():
+                    self.request_stop("hard", "STOP-NOW file")
+                elif (LEDGER / "STOP").exists():
+                    self.request_stop("soft", "STOP file")
+                gb = c_free_gb()
+                if gb < HARD_DISK_GB:
+                    self.request_stop("hard", f"C: free {gb} GB (hard floor {HARD_DISK_GB})")
+                elif gb < SOFT_DISK_GB:
+                    self.request_stop("soft", f"C: free {gb} GB (soft floor {SOFT_DISK_GB})")
+                mem = mem_avail_mb()
+                if mem < HARD_MEM_MB:
+                    self.low_mem_since = self.low_mem_since or time.time()
+                    if time.time() - self.low_mem_since > HARD_MEM_SECS:
+                        self.request_stop("hard", f"MemAvailable {mem} MB for over {HARD_MEM_SECS}s")
+                else:
+                    self.low_mem_since = None
+                if time.time() > self.deadline:
+                    self.request_stop("hard", "deadline passed")
+                elif self.deadline - time.time() < STAGE_BUDGET:
+                    self.request_stop("soft", "deadline less than one stage away")
+            except Exception as e:      # the watchdog must never die
+                self.log(f"watchdog error: {e}")
+
+    def on_signal(self, signum, _frame):
+        self.request_stop("hard", f"signal {signal.Signals(signum).name}")
+
+    # ----- subprocess helpers ---------------------------------------------------------
+    def run_tracked(self, role, cmd, cwd=None, env=None, timeout=None, out=None, err_apart=False):
+        """Run in its own process group, tracked so a hard stop can interrupt it."""
+        fh = open(out, "w") if out else subprocess.DEVNULL
+        eh = open(str(out) + ".err", "w") if (out and err_apart) else subprocess.STDOUT
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fh, stderr=eh,
+                             start_new_session=True, text=True, encoding="utf-8", errors="replace", preexec_fn=die_with_driver)
+        self.current[role] = p.pid
+        self.started.add(p.pid)
+        try:
+            try:
+                rc = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.log(f"{role} timed out after {timeout}s")
+                stop_group(p.pid, signal.SIGTERM, 30, self.log)
+                rc = 124
+            try:                      # anything it left running in its group goes too
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        finally:
+            self.current.pop(role, None)
+            self.started.discard(p.pid)
+            if out:
+                fh.close()
+                if err_apart:
+                    eh.close()
+        return rc
+
+    def git_env(self):
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith("GIT_"):
+                env.pop(k)
+        env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+        return env
+
+    def git(self, *a, cwd=None, check=True, env=None):
+        cmd = ["git", *GIT_SAFE, "-C", str(cwd or self.repo_dir), *a]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env or self.git_env())
+        if check and r.returncode:
+            raise RuntimeError(f"git {' '.join(a[:4])}: {r.stderr.strip()[:300]}")
+        return r.stdout.strip()
+
+    def gh(self, *a):
+        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", BROWSER="false")
+        r = subprocess.run(["gh", *a], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=env)
+        if r.returncode:
+            raise RuntimeError(f"gh {' '.join(a[:3])}: {r.stderr.strip()[:300]}")
+        return r.stdout
+
+    # ----- environment for sessions -------------------------------------------------
+    def headless_env(self):
+        # An allowlist, not a denylist: a run started from inside a Claude Code session or a
+        # shell with exported tokens passes none of that on.
+        env = {k: v for k, v in os.environ.items() if k in SAFE_ENV or k.startswith("LC_")}
+        if self.args.stub:
+            # Test mode only: the stub reads its knobs from STUB_* and writes a fake transcript.
+            env.update({k: v for k, v in os.environ.items()
+                        if k.startswith("STUB_") or k == "CONTRIB_TRANSCRIPTS"})
+        env.update({
+            "XERJ_DISABLE_FEEDBACK": "true",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            # ~/.gitconfig is hidden from sessions, and git treats an unreadable one as fatal.
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            # An empty credential.helper resets the helper list: git has no credentials.
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": "core.hooksPath", "GIT_CONFIG_VALUE_1": "/dev/null",
+            "GIT_CONFIG_KEY_2": "core.fsmonitor", "GIT_CONFIG_VALUE_2": "false",
+            "CONTRIB_CANDIDATE_DIR": str(self.cand) if self.cand else "",
+            "PATH": f"{WORK / 'bin'}:{env.get('PATH', '')}",
+            # ~/.gitconfig is hidden from sessions, so they commit under these names.
+            **self.identity,
+        })
+        return env
+
+    def claude_env(self):
+        env = self.headless_env()
+        if TOKEN_FILE.exists():
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = TOKEN_FILE.read_text().strip()
+        return env
+
+    # ----- the jail -------------------------------------------------------------------
+    def jail(self, inner, *, net=False, rw=(), ro=(), over=(), chdir=None, env=None, argv=()):
+        """bwrap argv: root read-only, home, /tmp, /run and /mnt replaced by empty tmpfs, then
+        only the listed paths bound back: ro, then rw, then `over`, read-only (src, dest) binds
+        laid on top. No network unless net. Session code runs here."""
+        a = ["bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc",
+             "--unshare-uts", "--unshare-cgroup-try"]
+        if not net:
+            a.append("--unshare-net")
+        a += ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run",
+              "--tmpfs", "/mnt", "--tmpfs", str(HOME)]
+        for p in (HOME / ".rustup", HOME / ".cargo" / "bin", *map(Path, ro)):
+            a += ["--ro-bind", str(p), str(p)]
+        for p in rw:
+            a += ["--bind", str(p), str(p)]
+        for src, dest in over:
+            a += ["--ro-bind", str(src), str(dest)]
+        e = {"PATH": f"{HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(HOME),
+             "RUSTUP_HOME": str(HOME / ".rustup"), "RUSTUP_TOOLCHAIN": self.prof.get("RUST_TOOLCHAIN", "stable"),
+             "CARGO_HOME": str(WORK / "cargo-home"), "CARGO_TARGET_DIR": str(self.target_dir()),
+             "CC": "/usr/bin/cc", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "/usr/bin/cc",
+             "CARGO_BUILD_JOBS": "4", "RUST_TEST_THREADS": "4", "TMPDIR": "/tmp", "XERJ_DISABLE_FEEDBACK": "true",
+             "LANG": "C.UTF-8", "TERM": "dumb", "CARGO_TERM_COLOR": "never", "RUSTUP_AUTO_INSTALL": "0"}
+        if not net:
+            e["CARGO_NET_OFFLINE"] = "true"
+        e.update(env or {})
+        a.append("--clearenv")
+        for k, v in e.items():
+            a += ["--setenv", k, str(v)]
+        if chdir:
+            a += ["--chdir", str(chdir)]
+        return a + ["bash", "-c", inner, "jail", *argv]
+
+    def target_dir(self):
+        """Each candidate builds into its own target dir: code one candidate's tests run cannot
+        plant artifacts another candidate links. Removed when the candidate is finished."""
+        return WORK / "targets" / (self.target_name or (self.cand.name if self.cand else "_none"))
+
+    def git_dir_check(self):
+        """The clone's .git must still be a plain directory before the driver binds or reads it."""
+        g = self.clone() / ".git"
+        if not stat.S_ISDIR(os.lstat(g).st_mode):
+            raise RuntimeError(f"{g} is no longer a directory")
+
+    def cgit(self, *a, check=True, index=False):
+        """git on the candidate clone, in a no-network jail that sees only the clone. The clone's
+        config is writable by the session (filters, includes, commondir), so no driver git command
+        may run it on the host. Objects leave the clone only by a fetch into the pipeline clone,
+        whose upload-pack side does not run the served repository's config."""
+        dst = self.clone()
+        env = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+               "GIT_AUTHOR_NAME": "contrib-run", "GIT_AUTHOR_EMAIL": "contrib-run@localhost",
+               "GIT_COMMITTER_NAME": "contrib-run", "GIT_COMMITTER_EMAIL": "contrib-run@localhost"}
+        if index:
+            env["GIT_INDEX_FILE"] = str(dst / ".git" / "contrib-index")
+        argv = self.jail('exec git "$@"', rw=(dst,), chdir=dst, env=env, argv=(*GIT_SAFE, "-C", str(dst), *a))
+        r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, preexec_fn=die_with_driver)
+        if check and r.returncode:
+            raise RuntimeError(f"git {' '.join(a[:4])}: {r.stderr.strip()[:300]}")
+        return r.stdout.strip()
+
+    def git_ok(self, *a):
+        return subprocess.run(["git", *GIT_SAFE, "-C", str(self.repo_dir), *a], capture_output=True,
+                              env=self.git_env()).returncode == 0
+
+    def guarded(self, rid, argv, retries=None):
+        """Run argv (usually a jail) under the build guard: one at a time, memory and disk kills."""
+        out = self.cand / "results" / f"{rid}.log"
+        if self.args.stub and not self.args.real_requests:
+            out.write_text(f"[stub] would run: {shlex.join(argv)[:4000]}\n")
+            return 0, out
+        env = dict(os.environ, CARGO_TARGET_DIR=str(self.target_dir()))
+        if retries is not None:
+            env["RETRIES"] = str(retries)
+        rc = self.run_tracked("build", [self.prof["GUARD"], shlex.join(argv)], env=env, timeout=REQUEST_TIMEOUT,
+                              out=out)
+        if rc == 98:
+            self.guard_kills += 1
+            if self.guard_kills >= 2:
+                self.request_stop("hard", "the build guard killed two runs for memory or disk")
+        return rc, out
+
+    def engine_dir(self):
+        return self.clone() / self.prof.get("CRATE_ROOT", ".")
+
+    def cargo_jail(self, inner, extra_rw=(), over=(), env=None, argv=()):
+        """Builds and tests: the clone and this candidate's target dir writable; the crate cache
+        and the clone's .git read-only, so session code cannot poison later builds or change
+        the repository's config and refs while it runs."""
+        self.git_dir_check()
+        t = self.target_dir()
+        t.mkdir(parents=True, exist_ok=True)
+        (WORK / "cargo-home").mkdir(parents=True, exist_ok=True)
+        g = self.clone() / ".git"
+        return self.jail(inner, rw=(self.clone(), t, *extra_rw), ro=(WORK / "cargo-home",),
+                         over=((g, g), *over), chdir=self.engine_dir(), env=env, argv=argv)
+
+    def ensure_fetched(self, rid):
+        """Download crates for the base commit's Cargo.lock, never the session's. The fetch jail
+        has network, so it sees only upstream files exported from the pipeline clone. A candidate
+        that adds a dependency fails its offline build, and the session is told why."""
+        base = self.st()["base_sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", base or ""):
+            raise RuntimeError("state.json base_sha is not a commit id")
+        root = self.prof.get("CRATE_ROOT", ".")
+        lock_id = self.git("rev-parse", "--verify", "--quiet", f"{base}:{root}/Cargo.lock", check=False) or base
+        home = WORK / "cargo-home"
+        home.mkdir(parents=True, exist_ok=True)
+        stamp = home / ".fetched-locks"
+        if lock_id in (stamp.read_text().split() if stamp.is_file() else []):
+            return 0
+        exp = WORK / "tmp" / f"fetch-{lock_id[:12]}"
+        shutil.rmtree(exp, ignore_errors=True)
+        exp.mkdir(parents=True)
+        try:
+            if not (self.args.stub and not self.args.real_requests):
+                r = subprocess.run(f"git {shlex.join(GIT_SAFE)} -C {shlex.quote(str(self.repo_dir))} archive {base}"
+                                   f" | tar -x -C {shlex.quote(str(exp))}", shell=True, capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", env=self.git_env())
+                if r.returncode:
+                    self.log(f"export of {base[:12]} for cargo fetch failed: {one_line(r.stderr, 200)}")
+                    return 1
+            argv = self.jail("cargo fetch --locked", net=True, rw=(home,), ro=(exp,), chdir=exp / root)
+            rc, _ = self.guarded(f"{rid}-fetch", argv, retries=0)
+        finally:
+            shutil.rmtree(exp, ignore_errors=True)
+        if rc == 0:
+            with open(stamp, "a") as f:
+                f.write(lock_id + "\n")
+        return rc
+
+    # ----- preflight -----------------------------------------------------------------
+    def preflight(self):
+        self.log(f"run {self.run_id}: repo {self.repo}, limit {self.args.limit}, "
+                 f"deadline {datetime.datetime.fromtimestamp(self.deadline).isoformat(timespec='minutes')}")
+        self.recover_stale()
+        # Session scratch folders left by a run that did not finish (the run lock means none is
+        # in use); a resumed session needs only its transcript, not its scratch files.
+        for d in (WORK / "tmp").glob("*"):
+            if d.is_dir() and not d.is_symlink() and re.fullmatch(r"(scout|cand|session)-[\w.-]+", d.name):
+                shutil.rmtree(d, ignore_errors=True)
+        gb = c_free_gb()
+        if gb < int(self.prof.get("START_GB", 32)) and not (self.args.stub and not self.args.real_requests):
+            raise RuntimeError(f"C: has {gb} GB free, below the {self.prof.get('START_GB', 32)} GB start floor")
+        if not shutil.which(self.args.claude):
+            raise RuntimeError(f"{self.args.claude} not found")
+        if not shutil.which("bwrap") or not shutil.which("socat"):
+            raise RuntimeError("bubblewrap or socat missing: the sandbox and the jails cannot run")
+        for rem in self.git("remote", check=False).split():
+            if self.git("remote", "get-url", "--push", rem) != "no_push":
+                raise RuntimeError(f"remote {rem} of {self.repo_dir} can push; set its push URL to no_push")
+        if self.args.stub:
+            self.log("preflight ok (stub)")
+            return
+        self.gh("auth", "status")
+        fork = f"https://github.com/{self.prof['CONTRIBUTOR']}/{self.repo.split('/')[1]}.git"
+        r = subprocess.run(["git", "-C", str(self.repo_dir), "push", "--dry-run", fork,
+                            f"HEAD:refs/heads/contrib-preflight-{self.run_id}"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.headless_env(), timeout=120)
+        if r.returncode == 0:
+            raise RuntimeError("a headless push dry-run succeeded; credentials are reachable")
+        self.git("fetch", "--quiet", self.prof["UPSTREAM_REMOTE"], self.prof["BASE_BRANCH"])
+        if not TOKEN_FILE.exists():
+            raise RuntimeError(f"no token at {TOKEN_FILE}; run `claude setup-token` and save it there")
+        if TOKEN_FILE.stat().st_mode & 0o077:
+            raise RuntimeError(f"{TOKEN_FILE} is readable by others; chmod 600 it")
+        settings = self.run_dir / "settings-preflight.json"
+        write_json(settings, self.settings_for([self.run_dir / "preflight"], None))
+        (self.run_dir / "preflight").mkdir(exist_ok=True)
+        cmd = self.claude_cmd("Reply with the single word: ok", "haiku", settings, [self.run_dir / "preflight"],
+                              None, "") + ["--no-session-persistence"]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.claude_env(), stdin=subprocess.DEVNULL,
+                           timeout=180, cwd=str(self.run_dir / "preflight"))
+        if r.returncode or '"is_error":true' in r.stdout.replace(" ", ""):
+            raise RuntimeError("claude cannot start a sandboxed session: " + (r.stdout + r.stderr).strip()[-300:])
+        self.log("preflight ok")
+
+    def open_count(self):
+        if self.args.stub:
+            mine = 0
+        else:
+            mine = len(json.loads(self.gh("pr", "list", "-R", self.repo, "--author", self.prof["CONTRIBUTOR"],
+                                          "--state", "open", "--json", "number", "--limit", "100")))
+        ready = sum(1 for s in self.all_states() if s.get("status") == "ready")
+        return mine, ready
+
+    # ----- ledger --------------------------------------------------------------------
+    def all_states(self):
+        out = []
+        for d in sorted((LEDGER / "candidates").glob("*/state.json")):
+            s = read_json(d, {})
+            s["_dir"] = str(d.parent)
+            out.append(s)
+        return out
+
+    def state(self, **upd):
+        p = self.cand / "state.json"
+        s = read_json(p, {})
+        s.update(upd)
+        s["updated"] = now()
+        write_json(p, s)
+        return s
+
+    def ledger_commit(self, msg):
+        subprocess.run(["git", *GIT_SAFE, "-C", str(LEDGER), "add", "-A"], capture_output=True)
+        subprocess.run(["git", *GIT_SAFE, "-C", str(LEDGER), "commit", "-qm", one_line(msg, 200)],
+                       capture_output=True)
+
+    def rebuild_queue(self, banner=None):
+        groups = {}
+        for s in self.all_states():
+            groups.setdefault(s.get("status", "stopped"), []).append(s)
+        lines = ["# Queue", ""]
+        if banner:
+            lines += banner + [""]
+        titles = [("ready", "Ready for your review"), ("needs-you", "Needs your decision"),
+                  ("stopped", "Stopped mid-way (resumable)"), ("running", "Running"), ("failed", "Failed"),
+                  ("abandoned", "Abandoned"), ("published", "Published")]
+        for key, title in titles:
+            items = groups.get(key, [])
+            if not items:
+                continue
+            lines.append(f"## {title} ({len(items)})")
+            for s in sorted(items, key=lambda s: s.get("updated", ""), reverse=True):
+                slug = Path(s["_dir"]).name
+                note = one_line(s.get("summary") or s.get("question") or s.get("reason") or s.get("stop_reason"), 200)
+                lines.append(f"- [{slug}](candidates/{slug}/session/packet.md): {one_line(s.get('title'), 120)}"
+                             f"{(' (' + note + ')') if note else ''}")
+            lines.append("")
+        (LEDGER / "QUEUE.md").write_text("\n".join(lines).rstrip() + "\n")
+
+    def reject(self, slug, reason):
+        with open(LEDGER / "rejects.md", "a") as f:
+            f.write(f"- {datetime.date.today()} {self.repo} {slug}: {one_line(reason)}\n")
+
+    # ----- GitHub snapshots (driver only; sessions never hold a token) ------------------
+    def snapshot(self, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        if self.args.stub:
+            for n in ("issues", "prs", "mine"):
+                write_json(dest / f"{n}.json", [])
+            return
+        issues = self.gh("issue", "list", "-R", self.repo, "--state", "open", "--limit", "300", "--json",
+                         "number,title,body,labels,author,createdAt,updatedAt,comments,assignees")
+        prs = self.gh("pr", "list", "-R", self.repo, "--state", "open", "--limit", "200", "--json",
+                      "number,title,body,author,createdAt,headRefName,files,isDraft,closingIssuesReferences")
+        mine = self.gh("pr", "list", "-R", self.repo, "--author", self.prof["CONTRIBUTOR"], "--state", "all",
+                       "--limit", "50", "--json", "number,title,state,createdAt,mergedAt,files")
+        (dest / "issues.json").write_text(issues)
+        (dest / "prs.json").write_text(prs)
+        (dest / "mine.json").write_text(mine)
+        (dest / "fetched.txt").write_text(now() + "\n")
+
+    # ----- sandboxed Claude sessions -------------------------------------------------
+    def settings_for(self, write_dirs, clone):
+        """Session settings. Sandboxed Bash may write only write_dirs; the file tools only those too."""
+        h = str(HOME)
+        # Reads are closed by default: every entry in the home directory is hidden except the
+        # ledger and the work dir (and their parents), and so are the Windows drives under /mnt.
+        keep = [Path(os.path.realpath(p)) for p in (LEDGER, WORK)]
+        secret_files = ["/mnt", str(TOKEN_FILE.parent), f"/run/user/{os.getuid()}"]
+        # Every Claude Code scratch folder on this machine (/tmp/claude-<uid>) is hidden: the
+        # session's own scratch folder is moved under WORK/tmp by session_tmp().
+        tmp_root = Path(f"/tmp/claude-{os.getuid()}")
+        if tmp_root.is_dir():
+            for e in sorted(os.listdir(tmp_root)):
+                secret_files.append(str(tmp_root / e))
+        for e in sorted(os.listdir(h)):
+            q = Path(h) / e
+            if not any(k == q or q in k.parents for k in keep):
+                secret_files.append(str(q))
+        deny_write = [f"{h}/.claude", str(SKILL), str(LEDGER / "QUEUE.md"), str(LEDGER / "rejects.md")]
+        deny_edit = [f"Edit(/{h}/.claude/**)", f"Edit(/{SKILL}/**)"]
+        if clone:
+            g = Path(clone) / ".git"
+            deny_write += [str(g / "config"), str(g / "hooks"), str(g / "info")]
+            deny_edit += [f"Edit(/{g}/config)", f"Edit(/{g}/hooks/**)", f"Edit(/{g}/info/**)"]
+        domains = ["raw.githubusercontent.com"]
+        node = self.st().get("node")
+        if node and node.get("port"):
+            # The sandbox's own localhost is private; the proxy runs on the host and may reach
+            # this one loopback port, where the bridge to the jailed node listens.
+            domains.append(f"127.0.0.1:{int(node['port'])}")
+        return {
+            "sandbox": {
+                "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+                "autoAllowBashIfSandboxed": True,
+                "filesystem": {"allowWrite": [str(d) for d in write_dirs], "denyWrite": deny_write,
+                               # The whole scratch root, so folders other sessions create during
+                               # this turn are covered too.
+                               "denyRead": [str(tmp_root)]},
+                "credentials": {
+                    "files": [{"path": p, "mode": "deny"} for p in secret_files],
+                    "envVars": [{"name": n, "mode": "deny"} for n in sorted(
+                                {"GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "CARGO_REGISTRY_TOKEN",
+                                 "CLAUDE_CODE_OAUTH_TOKEN", "SSH_AUTH_SOCK"}
+                                | {k for k in os.environ if SECRET_ENV.search(k)})],
+                },
+                "network": {"allowedDomains": domains, "strictAllowlist": True},
+            },
+            "permissions": {
+                "deny": [f"Read(/{p})" for p in secret_files] + [f"Read(/{p}/**)" for p in secret_files]
+                + ["Read(//proc/**)", "Read(//sys/**)", f"Read(/{tmp_root})", f"Read(/{tmp_root}/**)"] + deny_edit
+                + ["Bash(git push:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(xerj:*)",
+                   "Bash(cargo:*)", "Bash(sudo:*)", "WebFetch(domain:api.github.com)", "WebSearch"],
+            },
+        }
+
+    def claude_cmd(self, prompt, model, settings, write_dirs, system_text, session_arg):
+        cmd = [self.args.claude, "-p", prompt, "--output-format", "json", "--model", model,
+               "--permission-mode", "dontAsk", "--settings", str(settings),
+               "--setting-sources", SETTING_SOURCES, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+               "--allowedTools", "Read", "Glob", "Grep", "Bash", "Agent",
+               "WebFetch(domain:raw.githubusercontent.com)", *[f"Edit(/{d}/**)" for d in write_dirs]]
+        agents = agent_defs()
+        if agents:
+            cmd += ["--agents", json.dumps(agents)]
+        if system_text:
+            cmd += ["--append-system-prompt", system_text]
+        for d in write_dirs:
+            cmd += ["--add-dir", str(d)]
+        if session_arg:
+            cmd += session_arg
+        return cmd
+
+    def transcripts(self, sid):
+        root = Path(os.environ.get("CONTRIB_TRANSCRIPTS", HOME / ".claude" / "projects"))
+        return list(root.glob(f"*/{sid}.jsonl"))
+
+    def session_tmp(self, home, make=True):
+        """The session's scratch folder: its own, outside the shared /tmp/claude-<uid> (which is
+        hidden from it), removed when the candidate or the scout finishes and swept at start."""
+        scout = self.run_dir / "scout"
+        d = WORK / "tmp" / (f"scout-{self.run_id}" if home == scout else f"cand-{home.name}")
+        if make:
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return d
+
+    def session(self, stage, cwd, prompt, system_text, model, write_dirs, clone, home, _fresh=False):
+        """One turn of a sandboxed headless session. home is a driver-owned folder for its records.
+        A session id is recorded only once the session exists (its result names it, or its
+        transcript is on disk), so a launch that failed is never 'resumed'."""
+        sess = home / "sessions.json"
+        known = read_json(sess, {})
+        settings = self.run_dir / f"settings-{home.name}-{stage}.json"
+        stmp = self.session_tmp(home)
+        write_json(settings, self.settings_for([*write_dirs, stmp], clone))
+        new_sid = None
+        pend = known.get(f"{stage}.pending")
+        if stage not in known and isinstance(pend, str) and self.transcripts(pend):
+            # A turn that a stop interrupted: the session exists, so carry on in it.
+            known[stage] = pend
+        known.pop(f"{stage}.pending", None)
+        if stage in known:
+            arg = ["--resume", known[stage]]
+        else:
+            new_sid = str(uuid.uuid4())
+            known[f"{stage}.pending"] = new_sid
+            arg = ["--session-id", new_sid]
+        write_json(sess, known)
+        cmd = self.claude_cmd(prompt, model, settings, write_dirs, system_text, arg)
+        out = home / "sessions" / f"{stage}-{int(time.time())}.json"
+        out.parent.mkdir(exist_ok=True)
+        self.log(f"session {stage}: turn starts ({model})")
+        env = self.claude_env()
+        env["CLAUDE_CODE_TMPDIR"] = env["TMPDIR"] = str(stmp)
+        rc = self.run_tracked("session", cmd, cwd=str(cwd), env=env, timeout=TURN_TIMEOUT, out=out,
+                              err_apart=True)
+        text = out.read_text(errors="replace") if out.exists() else ""
+        err = Path(str(out) + ".err").read_text(errors="replace")[-4000:] if Path(str(out) + ".err").exists() else ""
+        res = read_json(out, None)
+        if not isinstance(res, dict):
+            res = {"is_error": True, "result": text[-2000:]}
+        res["_rc"] = rc
+        msg = str(res.get("result", ""))
+        if new_sid:
+            known.pop(f"{stage}.pending", None)
+            if res.get("session_id") == new_sid or self.transcripts(new_sid):
+                known[stage] = new_sid
+            write_json(sess, known)
+        if (res.get("is_error") or rc) and not new_sid and not _fresh \
+                and "no conversation found" in (msg + " " + err).lower():
+            # The recorded session is gone (never started, or its transcript was removed): drop
+            # it and start this stage's session afresh. The stage's files carry its progress.
+            self.log(f"session {stage}: recorded session not found; starting a new one")
+            known.pop(stage, None)
+            write_json(sess, known)
+            note = ("Your earlier session for this stage was lost, so this is a new one. Read the "
+                    "candidate folder (state.json, results/, and session/ including any plan.md and "
+                    "packet.md) to see where the work stands, then carry on.\n\n")
+            self.check_stop()
+            return self.session(stage, cwd, note + prompt, system_text, model, write_dirs, clone, home,
+                                _fresh=True)
+        if res.get("is_error") or rc:
+            low = (msg + " " + err).lower()
+            if any(k in low for k in ("usage limit", "rate limit", "limit reached", "credit balance",
+                                      "please run /login", "authentication", "oauth", "invalid api key")):
+                self.request_stop("hard", f"Claude usage or auth error: {one_line(msg or err, 160)}")
+            self.log(f"session {stage}: error rc={rc}: {one_line(msg or err, 200)}")
+        else:
+            self.log(f"session {stage}: turn ends")
+        return res
+
+    def system_text(self, stage_file):
+        parts = [(SKILL / "rules" / "common.md").read_text(), self.prof_md,
+                 (SKILL / "stages" / stage_file).read_text()]
+        return "\n\n---\n\n".join(parts)
+
+    # ----- builds, tests, nodes and reads ------------------------------------------------
+    def tree_key(self):
+        """Id of the clone's whole working tree, dirty edits included: a binary is built for this."""
+        self.git_dir_check()
+        self.cgit("read-tree", "HEAD", index=True)
+        self.cgit("add", "-A", index=True)
+        tree = self.cgit("write-tree", index=True)
+        if not re.fullmatch(r"[0-9a-f]{40}", tree):
+            raise RuntimeError("git write-tree did not return a tree id")
+        return tree
+
+    def binary_for(self, what, rid):
+        """Build if needed and return this candidate's copy of the binary for the current tree."""
+        tree = self.tree_key()
+        bindir = self.bins()
+        bindir.mkdir(parents=True, exist_ok=True)
+        name = "xerj" if what == "server" else "es-yaml-runner"
+        dest = bindir / f"{name}-{tree[:12]}"
+        if dest.is_file() and not dest.is_symlink():
+            rec = self.st().get("binaries", {}).get(dest.name, {})
+            if rec.get("sha256") and rec["sha256"] == file_sha256(dest):
+                return dest, 0
+            dest.unlink()
+        rc = self.ensure_fetched(rid)
+        if rc:
+            return None, rc
+        build = self.prof["SERVER_BUILD"] if what == "server" else self.prof["RUNNER_BUILD"]
+        src = self.target_dir() / (self.prof["SERVER_BIN"] if what == "server" else self.prof["RUNNER_BIN"])
+        # The build runs in the jail; the binary is copied out on the host after the jail is gone.
+        # The bin dir is never writable from a jail, so code that runs at build time cannot plant
+        # a binary under another tree's name. The target dir is this candidate's own.
+        rc, _ = self.guarded(f"{rid}-build-{what}", self.cargo_jail(build))
+        if rc:
+            return None, rc
+        if self.args.stub and not self.args.real_requests:
+            dest.write_text("stub")
+        else:
+            if not inside(Path(os.path.realpath(src)), self.target_dir()):
+                return None, 1
+            copy_regular(src, dest)
+        s = self.st()
+        s.setdefault("binaries", {})[dest.name] = {"head": self.cgit("rev-parse", "HEAD"),
+                                                   "tree": tree, "built": now(), "sha256": file_sha256(dest)}
+        self.state(binaries=s["binaries"])
+        return dest, 0
+
+    def free_port(self):
+        base = int(self.prof.get("PORT_BASE", 19400))
+        for port in range(base, base + 50):
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) != 0:
+                    return port
+        raise RuntimeError("no free scratch port")
+
+    def node_start(self, rid):
+        """A jailed node in its own network namespace, reached through a socat bridge on 127.0.0.1."""
+        self.node_stop()
+        bin_, rc = self.binary_for("server", rid)
+        if not bin_:
+            return rc, "server build failed"
+        port = self.free_port()
+        ndir = WORK / "nodes" / str(port)
+        shutil.rmtree(ndir, ignore_errors=True)
+        (ndir / "data").mkdir(parents=True)
+        sock = ndir / "node.sock"
+        log = open(self.cand / "results" / f"{rid}-node.log", "w")
+        if self.args.stub and not self.args.real_requests:
+            p = subprocess.Popen(["sleep", "3600"], start_new_session=True)
+            b = subprocess.Popen(["sleep", "3600"], start_new_session=True)
+        else:
+            inner = (f'socat UNIX-LISTEN:"$2",fork TCP:127.0.0.1:{JAIL_PORT} & '
+                     f'exec "$1" --insecure --data-dir "$3" --port {JAIL_PORT}')
+            p = subprocess.Popen(self.jail(inner, rw=(ndir,), ro=(bin_,), argv=(str(bin_), str(sock), str(ndir / "data"))),
+                                 stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True, preexec_fn=die_with_driver)
+            self.started.add(p.pid)
+            bridge = self.jail(f'exec socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:"$1"',
+                               net=True, rw=(ndir,), argv=(str(sock),))
+            b = subprocess.Popen(bridge, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True, preexec_fn=die_with_driver)
+        self.started.update((p.pid, b.pid))
+        log.close()
+        self.state(node={"pid": p.pid, "bridge": b.pid, "port": port, "dir": str(ndir), "bin": bin_.name})
+        if not (self.args.stub and not self.args.real_requests):
+            for _ in range(120):
+                try:
+                    c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                    c.request("GET", "/")
+                    c.getresponse().read()
+                    break
+                except (OSError, http.client.HTTPException):
+                    time.sleep(0.5)
+            else:
+                self.node_stop()
+                return 1, f"node did not answer on port {port}"
+        return 0, f"node up on 127.0.0.1:{port} (binary {bin_.name}); use xq"
+
+    def node_stop(self):
+        node = self.st().get("node") if self.cand else None
+        if not node:
+            return True
+        gone = all(stop_group(node.get(k), signal.SIGTERM, 20, self.log) for k in ("pid", "bridge"))
+        d = node.get("dir", "")
+        if gone and d and inside(d, WORK / "nodes") and Path(d) != WORK / "nodes":
+            shutil.rmtree(d, ignore_errors=True)
+        if gone:
+            self.started.difference_update({node.get("pid"), node.get("bridge")})
+            self.state(node=None)
+        return gone
+
+    def run_requests(self, reqs):
+        res_dir = self.cand / "results"
+        res_dir.mkdir(exist_ok=True)
+        index = res_dir / "index.jsonl"
+        if not isinstance(reqs, list):
+            reqs = []
+        extra = len(reqs) - MAX_REQUESTS_PER_TURN
+        reqs = reqs[:MAX_REQUESTS_PER_TURN]
+        if extra > 0:
+            with open(index, "a") as f:
+                f.write(json.dumps({"id": "too-many", "kind": "invalid", "exit": 2, "expect": "any", "met": False,
+                                    "infra": False, "secs": 0, "log": "", "note":
+                                    f"{extra} requests past the first {MAX_REQUESTS_PER_TURN} were not run; "
+                                    "ask again next turn"}) + "\n")
+        for n, req in enumerate(reqs):
+            self.check_stop()
+            if not isinstance(req, dict):
+                req = {"kind": "invalid"}
+            rid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(req.get("id") or f"r{int(time.time())}-{n}"))[:60]
+            kind = req.get("kind")
+            t0 = time.time()
+            rc, note, out = 0, "", res_dir / f"{rid}.log"
+            if n >= MAX_REQUESTS_PER_TURN:
+                rc, note = 2, f"more than {MAX_REQUESTS_PER_TURN} requests in one turn; ask again next turn"
+            else:
+                try:
+                    if kind == "test":
+                        rc, out, note = self.req_test(rid, req)
+                    elif kind == "fmt":
+                        rc = self.ensure_fetched(rid)
+                        if not rc:
+                            rc, out = self.guarded(rid, self.cargo_jail("cargo fmt --all"), retries=0)
+                        note = self.cgit("diff", "--no-ext-diff", "--stat", check=False)
+                    elif kind == "clippy":
+                        crates = [c for c in req.get("crates", []) if isinstance(c, str) and re.fullmatch(r"[\w-]{1,60}", c)]
+                        rc = self.ensure_fetched(rid)
+                        if not rc:
+                            sel = " ".join(f"-p {c}" for c in crates)
+                            rc, out = self.guarded(rid, self.cargo_jail(
+                                f"cargo clippy --profile ci-test {sel} --tests -- -D warnings"))
+                    elif kind == "build":
+                        b, rc = self.binary_for("runner" if req.get("what") == "runner" else "server", rid)
+                        note = f"binary {b.name if b else 'none'}"
+                    elif kind == "node-start":
+                        rc, note = self.node_start(rid)
+                    elif kind == "node-stop":
+                        rc = 0 if self.node_stop() else 1
+                    elif kind == "yaml":
+                        rc, out, note = self.req_yaml(rid, req)
+                    elif kind == "gh":
+                        rc, note = self.req_gh(req, out)
+                    else:
+                        rc, note = 2, f"unknown request kind {kind!r}"
+                except StopRun:
+                    raise
+                except Exception as e:
+                    rc, note = 1, f"driver error: {e}"
+            if not Path(out).exists():
+                Path(out).write_text(note + "\n")
+            expect = req.get("expect", "pass" if kind in ("test", "clippy", "yaml", "fmt", "build") else "any")
+            if expect not in ("pass", "fail", "any"):
+                expect = "pass"
+            infra = rc in INFRA_EXITS
+            met = (not infra) and ((expect == "any") or (expect == "pass" and rc == 0) or (expect == "fail" and rc != 0))
+            if met and kind == "test" and expect == "fail":
+                log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
+                if re.search(r"^error(\[E\d+\])?:", log, re.M) or "test result: FAILED" not in log:
+                    met, note = False, (note + "; " if note else "") + "it did not compile or no test failed"
+            if met and kind == "test" and expect == "pass":
+                log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
+                ran = sum(int(x) for x in re.findall(r"^test result: ok\. (\d+) passed", log, re.M))
+                if ran == 0 and not log.startswith("[stub]"):
+                    met, note = False, (note + "; " if note else "") + "no test ran: check the target and filter"
+            rec = {"id": rid, "kind": kind, "exit": rc, "expect": expect, "met": met, "infra": infra,
+                   "secs": int(time.time() - t0), "log": str(Path(out).relative_to(self.cand)), "note": one_line(note, 500)}
+            if kind == "test" and rc not in (2,) and not req.get("without"):
+                rec["req"] = {k: req[k] for k in ("crate", "target", "filter") if isinstance(req.get(k), str)}
+            with open(index, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            self.log(f"request {rid} ({kind}): exit {rc}, expect {expect}, met {met}")
+
+    def clone_path(self, p):
+        """A session-named path inside the clone, or None."""
+        if not isinstance(p, str) or not p or p.startswith("/") or ".." in Path(p).parts or "\x00" in p:
+            return None
+        f = self.clone() / p
+        return f if inside(f.parent, self.clone()) and not f.is_symlink() else None
+
+    def req_test(self, rid, req):
+        out = self.cand / "results" / f"{rid}.log"
+        crate, target, filt = req.get("crate", ""), req.get("target", "lib"), req.get("filter", "")
+        if not all(isinstance(x, str) for x in (crate, target, filt)):
+            return 2, out, "crate, target and filter must be strings"
+        if not re.fullmatch(r"[\w-]{1,60}", crate) or not re.fullmatch(r"[\w-]{1,80}", target):
+            return 2, out, "bad crate or target"
+        if filt and not re.fullmatch(r"[\w:]{1,200}", filt):
+            return 2, out, "bad filter"
+        sel = "--lib" if target == "lib" else f"--test {target}"
+        inner = f"cargo test --profile ci-test -p {crate} {sel}" + (f" -- {filt}" if filt else "")
+        without = req.get("without", [])
+        rels = without if isinstance(without, list) else []
+        if any(self.clone_path(p) is None for p in rels) or len(rels) > 20:
+            return 2, out, "a without path is not a plain file path inside the clone"
+        if any(not os.path.lexists(self.clone() / p) for p in rels):
+            return 2, out, "a without path does not exist in the clone; only files the fix changed or added can be reverted"
+        rc = self.ensure_fetched(rid)
+        if rc:
+            return rc, out, "cargo fetch failed"
+        # The base versions are laid over the clone inside this run's jail only: nothing in the
+        # clone is touched on the host, so there is nothing to restore and no path to follow.
+        base = self.st()["base_sha"]
+        tmp = WORK / "tmp" / f"without-{self.cand.name}-{rid}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        over = []
+        try:
+            if rels:
+                tmp.mkdir(parents=True)
+            for i, rel in enumerate(rels):
+                r = subprocess.run(["git", *GIT_SAFE, "-C", str(self.repo_dir), "cat-file", "blob", f"{base}:{rel}"],
+                                   capture_output=True, env=self.git_env())
+                src = tmp / str(i)
+                src.write_bytes(r.stdout if r.returncode == 0 else b"")
+                over.append((src, self.clone() / rel))
+            rc, out = self.guarded(rid, self.cargo_jail(inner, over=over),
+                                   retries=0 if req.get("expect") == "fail" else None)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        note = "reverted to base for this run: " + ", ".join(rels) if rels else ""
+        return rc, out, note
+
+    def req_yaml(self, rid, req):
+        """Node and runner together in one jail with no network; a fresh node per request."""
+        out = self.cand / "results" / f"{rid}.log"
+        ydir = self.engine_dir() / self.prof["YAML_DIR"]
+        if req.get("full"):
+            files = []
+        else:
+            files = req.get("files", [])
+            files = files if isinstance(files, list) else []
+            ok = [f for f in files if isinstance(f, str) and re.fullmatch(r"[A-Za-z0-9_./-]{1,200}\.ya?ml", f)
+                  and ".." not in f.split("/") and not f.startswith("/") and (ydir / f).is_file()
+                  and inside(ydir / f, ydir)]
+            if not ok or len(ok) != len(files):
+                return 2, out, "yaml needs full, or files that exist under the YAML dir"
+            files = ok
+        server, rc = self.binary_for("server", rid)
+        if not server:
+            return rc, out, "server build failed"
+        runner, rc = self.binary_for("runner", rid)
+        if not runner:
+            return rc, out, "runner build failed"
+        ndir = WORK / "nodes" / f"yaml-{self.cand.name}"
+        shutil.rmtree(ndir, ignore_errors=True)
+        (ndir / "data").mkdir(parents=True)
+        inner = (
+            'srv=$1 run=$2 data=$3 ydir=$4; shift 4\n'
+            f'"$srv" --insecure --data-dir "$data" --port {JAIL_PORT} > "$data/../node.log" 2>&1 &\n'
+            f'for i in $(seq 1 240); do (exec 3<>/dev/tcp/127.0.0.1/{JAIL_PORT}) 2>/dev/null && break; sleep 0.5; done\n'
+            'rc=0\n'
+            f'if [ $# -eq 0 ]; then "$run" --url http://127.0.0.1:{JAIL_PORT} --dir "$ydir" || rc=$?\n'
+            f'else for f in "$@"; do "$run" --url http://127.0.0.1:{JAIL_PORT} --verbose --file "$ydir/$f" || rc=$?; done; fi\n'
+            'kill %1 2>/dev/null; wait\n'
+            'exit $rc\n')
+        argv = (str(server), str(runner), str(ndir / "data"), str(ydir), *files)
+        jail = self.jail(inner, rw=(ndir,), ro=(self.clone(), server, runner), chdir=self.engine_dir(), argv=argv)
+        try:
+            rc, out = self.guarded(rid, jail, retries=0)
+        finally:
+            shutil.rmtree(ndir, ignore_errors=True)
+        tail = out.read_text(errors="replace").strip().splitlines()[-3:] if out.exists() else []
+        return rc, out, " | ".join(tail)
+
+    def req_gh(self, req, out):
+        argv, why = gh_argv(req.get("args"), self.repo)
+        if not argv:
+            return 2, why
+        if self.args.stub:
+            Path(out).write_text("[stub] gh " + shlex.join(argv) + "\n")
+            return 0, "stub"
+        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", BROWSER="false")
+        r = subprocess.run(["gh", *argv], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=env)
+        Path(out).write_text((r.stdout + r.stderr)[:400_000])
+        return r.returncode, ""
+
+    # ----- the clone ------------------------------------------------------------------
+    def wip_refs(self, slug):
+        refs = self.git("for-each-ref", "--format=%(refname)", f"refs/contrib-wip/{slug}/", check=False).split()
+        return sorted(refs, key=lambda r: int(r.rsplit("/", 1)[1]) if r.rsplit("/", 1)[1].isdigit() else -1)
+
+    def make_clone(self, slug, branch, base, restore=True):
+        """Each candidate gets its own clone with its own copy of the objects (no hardlinks into
+        the pipeline clone), so a session can only ever write its own repository. Resume brings
+        back the last snapshot of unfinished work."""
+        dst = self.clone()
+        if dst.exists():
+            raise RuntimeError(f"{dst} already exists; recover_stale should have saved and removed it")
+        self.git("clone", "--quiet", "--no-hardlinks", "--no-checkout", "--origin", "pipeline", str(self.repo_dir),
+                 str(dst))
+        self.git("remote", "set-url", "--push", "pipeline", "no_push", cwd=dst)
+        # Inside the session sandbox, Claude Code masks shell and git startup files in the
+        # working folder with /dev/null devices; git would list them as untracked and fail to
+        # add them. info/ is not writable from a session, so this list holds.
+        excl = dst / ".git" / "info" / "exclude"
+        excl.parent.mkdir(parents=True, exist_ok=True)
+        with open(excl, "a") as fh:
+            fh.write("\n# sandbox masks (contrib-run)\n" + "".join(f"/{n}\n" for n in SANDBOX_MASKS))
+        self.git("update-ref", f"refs/remotes/{self.upstream}", base, cwd=dst)
+        if self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
+            self.git("checkout", "-q", "-B", branch, f"pipeline/{branch}", cwd=dst)
+        else:
+            self.git("checkout", "-q", "-b", branch, base, cwd=dst)
+        wips = self.wip_refs(slug)
+        if restore and wips and self.st().get("wip_pending"):
+            last = wips[-1]
+            self.git("fetch", "-q", "--no-tags", str(self.repo_dir), f"+{last}:refs/contrib-restore", cwd=dst)
+            self.cgit("read-tree", "-u", "--reset", "refs/contrib-restore")
+            self.cgit("reset", "-q")
+            got = self.tree_key()
+            want = self.cgit("rev-parse", "refs/contrib-restore^{tree}")
+            self.cgit("update-ref", "-d", "refs/contrib-restore")
+            if got != want:
+                self.log(f"restored {last} but the tree differs ({got[:12]} vs {want[:12]}); check by hand")
+            self.state(wip_pending=False, wip_restored=last)
+        return dst
+
+    def save_clone(self):
+        """Copy every branch out first (an object transfer runs nothing from the clone's config),
+        then snapshot unfinished work in the jail, copy the branch and the snapshot into the
+        pipeline clone, verify both, and only then delete the clone. A HEAD that does not
+        resolve keeps the clone for a person; a rewritten branch keeps its old tip."""
+        dst = self.clone()
+        if not dst.exists():
+            return "no clone"
+        if dst.is_symlink() or not inside(dst, WORK):
+            raise RuntimeError(f"{dst} is not a plain folder under {WORK}; kept")
+        s = self.st()
+        slug, branch = self.cand.name, s.get("branch", "")
+        n = len(self.wip_refs(slug)) + 1
+        keep = f"refs/contrib-keep/{slug}/{n}"
+        self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/heads/*:{keep}/*", check=False)
+        notes = []
+        self.git_dir_check()
+        head = self.cgit("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise RuntimeError(f"HEAD does not resolve in {dst}; its branches are copied under {keep}/, "
+                               "the clone is kept for a person")
+        self.cgit("read-tree", "HEAD", index=True)
+        self.cgit("add", "-A", index=True)
+        keep_files = []
+        for p in self.cgit("ls-files", "-z", "-o", "-i", "--exclude-standard", check=False).split("\0"):
+            try:
+                st_ = os.lstat(dst / p) if p else None
+            except OSError:
+                st_ = None
+            if st_ and stat.S_ISREG(st_.st_mode) and st_.st_size <= 1_000_000:
+                keep_files.append(p)
+        keep_files = keep_files[:200]
+        for i in range(0, len(keep_files), 50):
+            self.cgit("add", "-f", "--", *keep_files[i:i + 50], index=True)
+        tree = self.cgit("write-tree", index=True)
+        snap = None
+        if tree != self.cgit("rev-parse", "HEAD^{tree}"):
+            snap = self.cgit("commit-tree", tree, "-p", head, "-m",
+                             f"WIP snapshot of {slug} at stop ({one_line(self.stop_reason or 'stop', 100)})")
+        elif branch and head != self.cgit("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
+            snap = head      # a detached or moved HEAD: keep it too
+        for op, marker in (("rebase", "rebase-merge"), ("rebase", "rebase-apply"), ("merge", "MERGE_HEAD"),
+                           ("cherry-pick", "CHERRY_PICK_HEAD"), ("revert", "REVERT_HEAD")):
+            if os.path.lexists(dst / ".git" / marker):
+                self.cgit(op, "--abort", check=False)
+                notes.append(f"aborted an in-progress {op} (its state is in the snapshot)")
+        if branch and self.cgit("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
+            inc = f"refs/contrib-incoming/{slug}"
+            self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/heads/{branch}:{inc}")
+            new = self.git("rev-parse", inc)
+            if new != self.cgit("rev-parse", f"refs/heads/{branch}"):
+                raise RuntimeError("branch copy does not match; clone kept")
+            old = self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+            if old and old != new and not self.git_ok("merge-base", "--is-ancestor", old, new):
+                self.git("update-ref", f"refs/contrib-rewritten/{slug}/{n}", old)
+                notes.append(f"the branch was rewritten; its old tip is kept as refs/contrib-rewritten/{slug}/{n}")
+            self.git("update-ref", f"refs/heads/{branch}", new)
+            self.git("update-ref", "-d", inc)
+        if snap:
+            ref = f"refs/contrib-wip/{slug}/{n}"
+            self.cgit("update-ref", "refs/contrib-save", snap)
+            self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/contrib-save:{ref}")
+            if self.git("rev-parse", ref) != snap:
+                raise RuntimeError("snapshot copy does not match; clone kept")
+            self.state(wip_ref=ref, wip_saved=now(), wip_pending=True)
+            notes.append(f"unfinished work saved as {ref}")
+        tip = self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False) if branch else ""
+        others = []
+        for line in self.git("for-each-ref", "--format=%(objectname) %(refname)", f"{keep}/", check=False).splitlines():
+            sha, ref = line.split(" ", 1)
+            if tip and (sha == tip or self.git_ok("merge-base", "--is-ancestor", sha, tip)):
+                self.git("update-ref", "-d", ref)
+            else:
+                others.append(ref)
+        if others:
+            notes.append(f"other branches the session made are kept under {keep}/")
+        shutil.rmtree(dst)
+        self.state(clone_removed=now())
+        return "; ".join(notes + ["clone removed"])
+
+    # ----- stages --------------------------------------------------------------------
+    def stage_loop(self, stage, stage_file, model, extra_prompt=""):
+        nxt = self.sdir / "next.json"
+        first = True
+        for _turn in range(MAX_TURNS[stage]):
+            self.check_stop(between=first)
+            nxt.unlink(missing_ok=True)
+            if first:
+                prompt = (f"Run stage {stage} for the candidate in {self.cand}. That folder is read-only for you "
+                          f"except {self.sdir}, where your packet, notes, PR body and next.json go. Your working "
+                          f"directory is the candidate's own clone. Read state.json, gh/, results/index.jsonl and "
+                          f"session/packet.md (if any) first. Follow the stage checklist in your instructions. "
+                          f"End by writing {nxt}." + extra_prompt)
+            else:
+                prompt = (f"The driver ran your requests. New lines are at the end of {self.cand}/results/index.jsonl; "
+                          f"each line names its log file. Continue stage {stage}, then write {nxt}.")
+            res = self.session(stage, self.clone(), prompt, self.system_text(stage_file), model,
+                               [self.clone(), self.sdir], self.clone(), self.cand)
+            self.check_stop()
+            first = False
+            act = read_session_json(nxt)
+            if not act:
+                if res.get("is_error") or res.get("_rc"):
+                    return {"action": "failed", "reason": f"session error: {one_line(res.get('result'), 200)}"}
+                return {"action": "failed", "reason": "stage ended without a readable next.json"}
+            a = act.get("action")
+            if a == "run":
+                self.state(stage=stage, last_request=now())
+                self.run_requests(act.get("requests"))
+                continue
+            if a in ("stage-done", "needs-you", "abandon"):
+                return act
+            return {"action": "failed", "reason": f"next.json has an unknown action {one_line(a, 40)!r}"}
+        return {"action": "failed", "reason": f"stage {stage} used all {MAX_TURNS[stage]} turns"}
+
+    def final_checks(self):
+        """Mechanical checks on stage C output: files exist, flowcharts, no dashes, no attribution."""
+        problems = []
+        texts = {}
+        for f in ("packet.md", "PR_BODY.md"):
+            t = read_session_file(self.sdir / f)
+            if t is None:
+                problems.append(f"session/{f} missing (or not a regular file)")
+                continue
+            texts[f] = t
+            if EM_DASH in t or EN_DASH in t:
+                problems.append(f"session/{f} contains an em or en dash")
+            if re.search(r"co-authored-by|generated with \[?claude", t, re.I):
+                problems.append(f"session/{f} contains attribution")
+        if "packet.md" in texts and texts["packet.md"].count("```mermaid") < 2:
+            problems.append("session/packet.md needs two mermaid flowcharts (the problem and the fix)")
+        review = read_session_file(self.sdir / "evidence" / "review.md")
+        if not review or len(review.strip()) < 200:
+            problems.append("session/evidence/review.md (the code-reviewer subagent's own report) is missing or empty")
+        why = self.review_check()
+        if why:
+            problems.append(why + "; then save its report as session/evidence/review.md")
+        base = self.st()["base_sha"]
+        self.git_dir_check()
+        if self.cgit("symbolic-ref", "-q", "HEAD", check=False) != f"refs/heads/{self.st()['branch']}":
+            problems.append(f"HEAD is not on branch {self.st()['branch']}; check it out and commit there")
+        log = self.cgit("log", "--no-show-signature", "--format=%B", f"{base}..HEAD", check=False)
+        if not self.cgit("rev-list", f"{base}..HEAD", check=False):
+            problems.append("no commits on the branch")
+        if EM_DASH in log or EN_DASH in log:
+            problems.append("a commit message contains an em or en dash")
+        if re.search(r"co-authored-by|generated with \[?claude", log, re.I):
+            problems.append("a commit message contains attribution")
+        diff = self.cgit("diff", "--no-ext-diff", "--no-textconv", f"{base}..HEAD", check=False)
+        added = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        if any(EM_DASH in l or EN_DASH in l for l in added):
+            problems.append("the diff adds a line with an em or en dash")
+        if self.cgit("status", "--porcelain", check=False):
+            problems.append("uncommitted changes left in the clone")
+        return problems
+
+    def review_check(self):
+        """'' when stage C's own transcript (under ~/.claude, which sessions can neither read nor
+        write) shows a code-reviewer subagent call that completed, used tools and returned a
+        real report; else the reason. Every reviewer call, in order, goes to the driver-owned
+        results/review-transcript.md with its brief and report, followed by every tool call made
+        after the last good review that could have changed code, so the user sees all of it."""
+        sid = read_json(self.cand / "sessions.json", {}).get("C")
+        if not isinstance(sid, str) or not re.fullmatch(r"[0-9a-f-]{36}", sid):
+            return "stage C has no session id"
+        uses, results, calls = {}, {}, []
+        pos = 0
+        for t in self.transcripts(sid):
+            with open(t, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    msg = o.get("message") if isinstance(o, dict) else None
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    for part in content if isinstance(content, list) else []:
+                        if not isinstance(part, dict):
+                            continue
+                        pos += 1
+                        inp = part.get("input") if isinstance(part.get("input"), dict) else {}
+                        if part.get("type") == "tool_use":
+                            if part.get("name") in ("Agent", "Task") and inp.get("subagent_type") == "code-reviewer":
+                                uses[str(part.get("id"))] = (pos, inp)
+                            else:
+                                calls.append((pos, str(part.get("name")), inp))
+                        elif part.get("type") == "tool_result" and part.get("tool_use_id"):
+                            results[str(part["tool_use_id"])] = (part, o.get("toolUseResult"))
+        if not uses:
+            return ("no code-reviewer subagent call is in the stage C transcript; spawn it with the Agent "
+                    "tool, subagent_type code-reviewer, in the foreground")
+        verdicts = []
+        for uid, (at, inp) in uses.items():
+            why, text = "", ""
+            if uid not in results:
+                why = "the code-reviewer call has no result in the transcript"
+            else:
+                part, tur = results[uid]
+                text = tool_text(part.get("content"))
+                if part.get("is_error"):
+                    why = "the code-reviewer call ended in an error"
+                elif isinstance(tur, dict) and (tur.get("status") not in (None, "completed")
+                                                or tur.get("agentType") not in (None, "code-reviewer")):
+                    why = f"the code-reviewer call did not complete (status {tur.get('status')!r})"
+                elif isinstance(tur, dict) and isinstance(tur.get("totalToolUseCount"), int) \
+                        and tur["totalToolUseCount"] < 1:
+                    why = "the code-reviewer read nothing (no tool calls); give it the diff to review"
+                else:
+                    if isinstance(tur, dict):
+                        text = tool_text(tur.get("content")) or text
+                    if len(text.strip()) < 200:
+                        why = "the code-reviewer's report is too short to be a review"
+            verdicts.append((uid, at, inp, why, text))
+        good = [v for v in verdicts if not v[3]]
+        if not good:
+            return verdicts[-1][3]
+        last_at = good[-1][1]
+        sdir = os.path.realpath(self.sdir)
+
+        def may_change_code(name, inp):
+            if name in ("Read", "Glob", "Grep", "WebFetch", "TodoWrite"):
+                return False
+            if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                path = os.path.realpath(str(inp.get("file_path") or inp.get("notebook_path") or "/"))
+                return not (path == sdir or path.startswith(sdir + "/"))
+            return True
+
+        # A reviewer call can itself run commands, and a background command started before the
+        # review can finish after it: both count as changes the review may not have seen.
+        after = [(n, i) for at, n, i in calls if at > last_at and may_change_code(n, i)]
+        after += [("Agent", i) for at, i in uses.values() if at > last_at]
+        after += [(n, i) for at, n, i in calls if at <= last_at and n == "Bash" and i.get("run_in_background")]
+        out = [f"# Code review, copied by the driver from stage C's transcript\n\nSession {sid}: "
+               f"{len(verdicts)} reviewer call(s), {len(good)} usable. All of them follow, in order.\n"]
+        for k, (uid, at, inp, why, text) in enumerate(verdicts, 1):
+            out.append(f"\n## Review {k} (call {uid}){': NOT USABLE, ' + why if why else ''}\n\n"
+                       f"### The brief the session gave the reviewer\n\n{inp_text(inp.get('prompt'))}\n\n"
+                       f"### The reviewer's report\n\n{text.strip() or '(none)'}\n")
+        out.append(f"\n## Calls after the last usable review that could have changed code: {len(after)}\n\n")
+        for n, i in after[:200]:
+            detail = i.get("command") or i.get("file_path") or i.get("notebook_path") or i.get("prompt") or ""
+            out.append(f"- {n}: `{one_line(str(detail), 240).replace('`', chr(39))}`\n")
+        if not after:
+            out.append("None: the final code is the code the last usable review saw.\n")
+        (self.cand / "results" / "review-transcript.md").write_text("".join(out))
+        self.state(review={"calls": len(verdicts), "usable": len(good), "changes_after": len(after)})
+        return ""
+
+    def replay_tests(self):
+        """The candidate's passing test requests, each (crate, target, filter) once."""
+        tests, seen = [], set()
+        idx = self.cand / "results" / "index.jsonl"
+        for line in (idx.read_text(errors="replace").splitlines() if idx.is_file() else []):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            r = rec.get("req") if isinstance(rec, dict) else None
+            if rec.get("kind") == "test" and rec.get("expect") == "pass" and rec.get("met") and isinstance(r, dict) \
+                    and not str(rec.get("id", "")).startswith(("retest-", "gate-")):
+                key = (r.get("crate"), r.get("target", "lib"), r.get("filter", ""))
+                if key not in seen:
+                    seen.add(key)
+                    tests.append({"kind": "test", "crate": key[0], "target": key[1], "filter": key[2]})
+        return tests
+
+    def changed_crates(self, base):
+        """Package names of the crates the branch's own commits touch (nearest Cargo.toml)."""
+        out, clone = set(), self.clone()
+        for n in self.cgit("diff", "--name-only", "-z", f"{base}..HEAD", check=False).split("\0"):
+            if not n or ".." in Path(n).parts:
+                continue
+            d = (clone / n).parent
+            while True:
+                m = d / "Cargo.toml"
+                if m.is_file() and not m.is_symlink():
+                    txt = m.read_text(errors="replace")[:20000]
+                    pk = re.search(r'^\[package\][^\[]*?^name\s*=\s*"([\w-]{1,60})"', txt, re.M)
+                    if pk:
+                        out.add(pk.group(1))
+                    break
+                if d == clone or d == d.parent:
+                    break
+                d = d.parent
+        return out
+
+    def final_gate(self):
+        """The driver's own last word, on a fresh clone of the committed branch: nothing the
+        session left in its working tree (ignored files, a local .cargo config) is present, the
+        target dir and cached binaries are thrown away, and before every step the tree is
+        cleaned and checked against the commit. Runs the candidate's passing tests, clippy on
+        the crates it tested and touched, and the full YAML suite. '' or the reason."""
+        tests = self.replay_tests()
+        if not tests:
+            return "no passing test requests were recorded"
+        self.node_stop()
+        s = self.st()
+        ignored = [p for p in self.cgit("ls-files", "-z", "-o", "-i", "--exclude-standard",
+                                        check=False).split("\0") if p and p not in SANDBOX_MASKS][:20]
+        if ignored:
+            self.log(f"candidate {self.cand.name}: files git ignores were in the clone, left out of the gate: "
+                     + one_line(", ".join(ignored), 300))
+        tip = self.cgit("rev-parse", f"refs/heads/{s['branch']}")
+        self.save_clone()
+        self.make_clone(self.cand.name, s["branch"], s["base_sha"], restore=False)
+        self.state(wip_pending=False)
+        head = self.cgit("rev-parse", "HEAD")
+        if head != tip:
+            return f"the fresh clone is at {head[:12]}, not the branch tip {tip[:12]} the checks covered"
+        shutil.rmtree(self.target_dir(), ignore_errors=True)
+        shutil.rmtree(self.bins(), ignore_errors=True)
+        self.state(binaries={})
+        stamp = "gate-" + time.strftime("%m%d-%H%M%S")
+        crates = sorted({t["crate"] for t in tests} | self.changed_crates(s["base_sha"]))
+        # The YAML suite and clippy run first, so nothing a session-chosen test build leaves in
+        # the target dir can feed them.
+        reqs = [{"kind": "yaml", "full": True, "id": f"{stamp}-yaml"},
+                {"kind": "clippy", "crates": crates, "id": f"{stamp}-clippy"}]
+        reqs += [dict(t, id=f"{stamp}-t{i}") for i, t in enumerate(tests)]
+        self.log(f"candidate {self.cand.name}: final gate on a fresh clone and build, {len(reqs)} runs")
+        bad = []
+
+        def tree_moved():
+            return bool(self.cgit("status", "--porcelain", check=False)) or self.cgit("rev-parse", "HEAD") != head
+
+        for r in reqs:
+            self.cgit("clean", "-ffdxq")
+            if tree_moved():
+                bad.append(f"the clone changed before {r['id']} (a gate step wrote to tracked files)")
+                break
+            self.run_requests([r])
+        self.check_stop()
+        self.node_stop()
+        if not bad and tree_moved():
+            bad.append("the clone changed during the last gate step")
+        recs = {}
+        idx = self.cand / "results" / "index.jsonl"
+        for line in idx.read_text(errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and str(rec.get("id", "")).startswith(stamp + "-"):
+                recs[rec["id"]] = rec
+        if not bad:
+            bad = [f"not met: {r['id']}" for r in reqs if not recs.get(r["id"], {}).get("met")]
+        self.state(gate={"at": now(), "head": head, "ok": not bad, "ids": [r["id"] for r in reqs],
+                         "crates": crates, "ignored_files": ignored})
+        return "; ".join(bad)
+
+    def safe_final_checks(self):
+        try:
+            return self.final_checks()
+        except Exception as e:      # session-made content must not stop the whole run
+            return [f"the final checks could not run: {type(e).__name__}: {one_line(e, 200)}"]
+
+    def new_slug(self, raw):
+        slug = re.sub(r"[^a-z0-9-]+", "-", str(raw or "").lower()).strip("-")[:48].strip("-")
+        if not slug:
+            slug = f"cand-{self.run_id}"
+        base, n = slug, 2
+        while (LEDGER / "candidates" / slug).exists() or (WORK / "clones" / slug).exists():
+            slug = f"{base}-{n}"
+            n += 1
+        return slug
+
+    def work_candidate(self, c, resume_dir=None):
+        if resume_dir:
+            self.cand = Path(resume_dir)
+            slug = self.cand.name
+        else:
+            slug = self.new_slug(c.get("slug"))
+            self.cand = LEDGER / "candidates" / slug
+        for d in ("results", "gh", "sessions", "session"):
+            (self.cand / d).mkdir(parents=True, exist_ok=True)
+        if not resume_dir:
+            base = self.git("rev-parse", self.upstream)
+            self.state(slug=slug, repo=self.repo, title=one_line(c.get("title"), 200),
+                       source=one_line(c.get("source"), 200), issue=c.get("issue") if isinstance(c.get("issue"), int) else None,
+                       status="running", stage="A", stages_done=[], base_sha=base,
+                       branch=self.prof.get("BRANCH_PREFIX", "fix/") + slug, clone=str(self.clone()),
+                       search_terms=c.get("search_terms", []),
+                       run=self.run_id, started=now(), candidate=c)
+        else:
+            self.state(status="running", run=self.run_id, stop_reason=None, stop_kind=None)
+        s = self.st()
+        self.snapshot(self.cand / "gh")
+        self.make_clone(slug, s["branch"], s["base_sha"])
+        self.log(f"candidate {slug}: {'resuming at stage ' + s.get('stage', 'A') if resume_dir else 'started'}")
+        act = {}
+        for stage, f in (("A", "A-investigate.md"), ("B", "B-fix.md"), ("C", "C-finish.md")):
+            if stage in self.st().get("stages_done", []):
+                continue
+            self.state(stage=stage)
+            extra = ""
+            if stage == "C":
+                self.snapshot(self.cand / "gh")      # fresh view for the last overlap check
+                extra = " The gh/ snapshot was just refreshed: recheck claims and overlapping PRs first."
+            act = self.stage_loop(stage, f, self.args.model, extra)
+            if stage == "C" and act.get("action") == "stage-done":
+                problems = self.safe_final_checks()
+                if problems and not self.stop_kind:
+                    (self.cand / "results" / "final-checks.txt").write_text("\n".join(problems) + "\n")
+                    act = self.stage_loop("C", f, self.args.model,
+                                          f" The driver's final checks found problems, listed in "
+                                          f"{self.cand}/results/final-checks.txt. Fix every one, then finish again.")
+                    problems = self.safe_final_checks() if act.get("action") == "stage-done" else problems
+                if act.get("action") == "stage-done" and problems:
+                    return self.finish("failed", reason="final checks: " + "; ".join(problems))
+            a = act.get("action")
+            if a == "stage-done":
+                self.state(stages_done=self.st().get("stages_done", []) + [stage])
+                self.log(f"candidate {slug}: stage {stage} done: {one_line(act.get('summary'), 200)}")
+                continue
+            if a == "needs-you":
+                return self.finish("needs-you", question=one_line(act.get("question"), 400),
+                                   context=one_line(act.get("context"), 800))
+            if a == "abandon":
+                self.reject(slug, act.get("reason", ""))
+                return self.finish("abandoned", reason=one_line(act.get("reason"), 300))
+            return self.finish("failed", reason=one_line(act.get("reason", f"stage {stage}: {a}"), 300))
+        gate = self.final_gate()
+        if gate:
+            return self.finish("needs-you", question="the driver's own final gate on a fresh build did not pass: "
+                               + gate, context="see results/ for the gate-* logs")
+        return self.finish("ready", summary=one_line(act.get("summary"), 300))
+
+    def finish(self, status, **info):
+        self.node_stop()
+        try:
+            note = self.save_clone()
+        except Exception as e:
+            note = f"clone kept: {one_line(e, 200)}"
+            status, info["question"] = "needs-you", note
+        for d in (self.target_dir(), self.bins(), self.session_tmp(self.cand, make=False)):
+            if inside(d, WORK) and d not in (WORK, WORK / "targets", WORK / "bins", WORK / "tmp"):
+                shutil.rmtree(d, ignore_errors=True)
+        self.state(status=status, finished=now(), cleanup=note, **info)
+        self.log(f"candidate {self.cand.name}: {status} ({note})")
+        self.failures_in_row = self.failures_in_row + 1 if status == "failed" else 0
+        self.done.append((self.cand.name, status))
+        self.rebuild_queue()
+        self.ledger_commit(f"{self.cand.name}: {status}")
+        self.cand = None
+        if self.failures_in_row >= 2:
+            self.request_stop("soft", "two candidates failed in a row")
+        return status
+
+    def scout(self):
+        home = self.run_dir / "scout"
+        sdir = home / "session"
+        sdir.mkdir(parents=True, exist_ok=True)
+        (home / "results").mkdir(exist_ok=True)
+        self.snapshot(home / "gh")
+        known = {Path(s["_dir"]).name for s in self.all_states()}
+        (home / "known.txt").write_text("\n".join(sorted(known)) + "\n")
+        shutil.copy2(LEDGER / "rejects.md", home / "rejects.md")
+        topic = one_line(self.args.topic, 200) or "none given; use the profile's focus"
+        prompt = (f"Scout {self.repo} for contribution candidates. Topic: {topic}. Your folder is {home} (read-only "
+                  f"except {sdir}): GitHub snapshots in gh/, slugs already in the ledger in known.txt, past rejects "
+                  f"in rejects.md. The clone is {self.repo_dir}; read code with `git -C {self.repo_dir} show "
+                  f"{self.upstream}:<path>`. Write {sdir}/candidates.json, then {sdir}/next.json with action "
+                  f"stage-done.")
+        system = "\n\n---\n\n".join([(SKILL / "rules" / "common.md").read_text(), self.prof_md,
+                                     (SKILL / "stages" / "scout.md").read_text()])
+        nxt = sdir / "next.json"
+        self.cand = None
+        try:
+            for _ in range(4):
+                self.check_stop(between=True)
+                nxt.unlink(missing_ok=True)
+                self.session("scout", sdir, prompt, system, self.args.scout_model, [sdir], None, home)
+                act = read_session_json(nxt)
+                if act and act.get("action") == "run":
+                    self.cand = home          # the scout may only ask for gh reads
+                    reqs = act.get("requests") if isinstance(act.get("requests"), list) else []
+                    self.run_requests([r for r in reqs if isinstance(r, dict) and r.get("kind") == "gh"])
+                    self.cand = None
+                    prompt = f"Your gh reads are done; see {home}/results/index.jsonl. Finish and write {nxt}."
+                    continue
+                break
+        finally:
+            self.cand = None
+            shutil.rmtree(self.session_tmp(home, make=False), ignore_errors=True)
+        raw = read_session_file(sdir / "candidates.json")
+        try:
+            cands = json.loads(raw) if raw else []
+        except ValueError:
+            cands = []
+        out = []
+        for c in cands if isinstance(cands, list) else []:
+            if isinstance(c, dict) and isinstance(c.get("slug"), str) and c["slug"] not in known:
+                out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "issue_less")
+                            if k in c})
+                terms = c.get("search_terms")
+                if isinstance(terms, list):
+                    out[-1]["search_terms"] = [one_line(t, 60) for t in terms[:3] if isinstance(t, str) and t.strip()]
+        return out
+
+    # ----- publish-time retest --------------------------------------------------------
+    def retest(self, slug, merge):
+        """Re-run, in the jail, a candidate's passing test requests, clippy on their crates and
+        the full YAML suite, on its branch as it now is in the pipeline clone, or with --merge on
+        a trial merge with the current base. Nothing is saved back: the clone is thrown away."""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug or ""):
+            raise RuntimeError(f"bad slug {slug!r}")
+        self.cand = LEDGER / "candidates" / slug
+        s = self.st()
+        if not s.get("branch") or not s.get("base_sha"):
+            raise RuntimeError(f"{slug}: state.json has no branch or base")
+        if not shutil.which("bwrap") or not shutil.which("socat"):
+            raise RuntimeError("bubblewrap or socat missing")
+        self.git("fetch", "--quiet", self.prof["UPSTREAM_REMOTE"], self.prof["BASE_BRANCH"])
+        base_now = self.git("rev-parse", self.upstream)
+        idx = self.cand / "results" / "index.jsonl"
+        tests = self.replay_tests()
+        if not tests:
+            raise RuntimeError("no passing test requests are recorded for this candidate; test it by hand")
+        if self.clone().exists():
+            raise RuntimeError(f"{self.clone()} exists; another run may be using it")
+        if not self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{s['branch']}", check=False):
+            raise RuntimeError(f"the pipeline clone has no branch {s['branch']}; nothing to retest")
+        stamp = time.strftime("%m%d-%H%M%S") + uuid.uuid4().hex[:4]
+        self.target_name = f"retest-{slug}"
+        dst, head, merged = self.clone(), "", ""
+        try:
+            self.make_clone(slug, s["branch"], s["base_sha"], restore=False)
+            head = self.cgit("rev-parse", "HEAD")
+            crates = sorted({t["crate"] for t in tests} | self.changed_crates(s["base_sha"]))
+            if merge:
+                self.git("fetch", "-q", str(self.repo_dir), f"+refs/remotes/{self.upstream}:refs/remotes/{self.upstream}", cwd=dst)
+                try:
+                    self.cgit("merge", "-q", "--no-ff", "--no-edit", self.upstream)
+                except RuntimeError as e:
+                    raise RuntimeError(f"the trial merge with the base failed ({one_line(e, 150)}); rebase first")
+                merged = base_now
+            reqs = [dict(t, id=f"retest-{stamp}-t{i}") for i, t in enumerate(tests)]
+            reqs += [{"kind": "clippy", "crates": crates, "id": f"retest-{stamp}-clippy"},
+                     {"kind": "yaml", "full": True, "id": f"retest-{stamp}-yaml"}]
+            for r in reqs:
+                self.run_requests([r])
+        finally:
+            try:
+                self.node_stop()
+                self.sweep([dst, WORK / "nodes"])
+            finally:
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.rmtree(self.target_dir(), ignore_errors=True)
+                shutil.rmtree(self.bins(), ignore_errors=True)
+        recs = []
+        for line in idx.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if str(rec.get("id", "")).startswith(f"retest-{stamp}-"):
+                recs.append(rec)
+        ok = len(recs) == len(reqs) and all(r.get("met") for r in recs)
+        self.state(retest={"at": now(), "head": head, "merged_with": merged, "ok": ok,
+                           "ids": [r["id"] for r in recs]})
+        for r in recs:
+            print(f"{'ok  ' if r.get('met') else 'FAIL'} {r['id']} ({r['kind']}) exit {r['exit']}: "
+                  f"{self.cand / r['log']}")
+        print(f"RETEST {'ok' if ok else 'failed'} on {head[:12]}" + (f" merged with {merged[:12]}" if merged else ""))
+        return EXIT_DONE if ok else EXIT_SOFT
+
+    # ----- main and shutdown ---------------------------------------------------------
+    def main(self):
+        signal.signal(signal.SIGINT, self.on_signal)
+        signal.signal(signal.SIGTERM, self.on_signal)
+        signal.signal(signal.SIGHUP, self.on_signal)
+        threading.Thread(target=self.watchdog, daemon=True).start()
+        if self.args.retest:
+            try:
+                return self.retest(self.args.retest, self.args.merge)
+            except StopRun as e:
+                print(f"retest stopped: {e}", file=sys.stderr)
+                return EXIT_HARD
+            except Exception as e:
+                print(f"retest: {type(e).__name__}: {e}", file=sys.stderr)
+                return EXIT_SOFT
+        code = EXIT_DONE
+        try:
+            self.preflight()
+            queue = []
+            if self.args.resume:
+                queue = [("resume", s["_dir"]) for s in self.all_states() if s.get("status") == "stopped"]
+            while len(self.done) < self.args.limit:
+                self.check_stop(between=True)
+                mine, ready = self.open_count()
+                if mine + ready >= int(self.prof.get("MAX_OPEN", 10)):
+                    self.request_stop("soft", f"open-PR cap: {mine} open PRs + {ready} ready packets "
+                                              f">= {self.prof.get('MAX_OPEN', 10)}")
+                    break
+                if not queue:
+                    queue = [("new", c) for c in self.scout()]
+                    if not queue:
+                        self.request_stop("soft", "no good candidates left")
+                        break
+                kind, item = queue.pop(0)
+                try:
+                    if kind == "resume":
+                        self.work_candidate({}, resume_dir=item)
+                    else:
+                        self.work_candidate(item)
+                except StopRun:
+                    raise
+                except Exception as e:
+                    self.log(f"candidate error: {e!r}")
+                    if not self.cand or self.st().get("status") != "running":
+                        raise
+                    self.finish("needs-you", question=f"the driver hit an error on this candidate: "
+                                f"{type(e).__name__}: {one_line(e, 200)}")
+            if not self.stop_kind:
+                self.stop_kind, self.stop_reason = "done", f"candidate limit reached ({self.args.limit})"
+        except StopRun:
+            pass
+        except Exception as e:
+            self.log(f"driver error: {e!r}")
+            self.request_stop("hard", f"driver error: {one_line(e, 200)}")
+        finally:
+            ok = self.shutdown()
+        if not ok:
+            code = EXIT_SHUTDOWN_FAILED
+        elif self.stop_kind == "soft":
+            code = EXIT_SOFT
+        elif self.stop_kind == "hard":
+            code = EXIT_HARD
+        self.log(f"exit {code}")
+        return code
+
+    def sweep(self, roots):
+        """Stop jail and build processes still pointing at our folders (after a guard was killed)."""
+        roots = [str(r) for r in roots]
+        killed = []
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit() or int(d.name) == os.getpid():
+                continue
+            pid = int(d.name)
+            try:
+                comm = (d / "comm").read_bytes().decode(errors="replace").strip()
+            except OSError:
+                continue
+            if comm not in JAIL_TOOLS:
+                continue
+            cl = cmdline(pid)
+            if any(r in cl for r in roots):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed.append(f"{comm}({pid})")
+                except ProcessLookupError:
+                    pass
+        if killed:
+            self.log("stopped leftovers: " + ", ".join(killed))
+        return killed
+
+    def shutdown(self):
+        """Steps 1 to 9 of the shutdown routine in DESIGN.md. Never raises."""
+        steps, leftovers = [], []
+        reason = self.stop_reason or "finished"
+        self.log(f"shutdown: {self.stop_kind or 'done'} stop, reason: {reason}")
+        for role, pgid in list(self.current.items()):
+            if not stop_group(pgid, signal.SIGINT if role == "session" else signal.SIGTERM,
+                              60 if role == "session" else 30, self.log):
+                leftovers.append(f"{role} process group {pgid}")
+        try:
+            if self.cand and (self.cand / "state.json").exists() and self.cand.parent == LEDGER / "candidates":
+                if not self.node_stop():
+                    node = self.st().get("node") or {}
+                    leftovers.append(f"scratch node pid {node.get('pid')} port {node.get('port')}")
+                self.sweep([self.clone(), WORK / "nodes", self.bins()])
+                try:
+                    note = self.save_clone()
+                except Exception as e:
+                    note = f"clone kept: {one_line(e, 200)}"
+                    leftovers.append(note)
+                steps.append(note)
+                s = self.st()
+                self.state(status="stopped", stop_reason=reason, stop_kind=self.stop_kind, stopped=now(),
+                           cleanup=note, last_good_sha=self.git("rev-parse", "--verify", "--quiet", s.get("branch", "-"),
+                                                                check=False) or None,
+                           resume=f"contrib-run --repo {self.repo} --resume")
+                self.done.append((self.cand.name, "stopped"))
+        except Exception as e:
+            leftovers.append(f"candidate cleanup error: {one_line(e, 200)}")
+        try:
+            self.sweep([WORK / "nodes", WORK / "targets"])
+        except Exception as e:
+            leftovers.append(f"leftover sweep error: {one_line(e, 200)}")
+        for pid in list(self.started):
+            try:
+                os.killpg(pid, 0)
+                os.killpg(pid, signal.SIGKILL)
+                time.sleep(0.5)
+                os.killpg(pid, 0)
+                leftovers.append(f"process group {pid} still alive")
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+        stamp = now()
+        kind = f"Stopped ({self.stop_kind}): " if self.stop_kind in ("soft", "hard") else ""
+        banner = [f"> **Run {self.run_id} ended {stamp}.** {kind}{one_line(reason, 200)}."]
+        if self.done:
+            banner.append("> This run: " + ", ".join(f"{n} ({st})" for n, st in self.done) + ".")
+        for st in steps:
+            banner.append(f"> Cleanup: {one_line(st, 200)}.")
+        if leftovers:
+            banner.append("> **Still running or kept, check these:** " + "; ".join(leftovers) + ".")
+        if any(st == "stopped" for _, st in self.done):
+            banner.append(f"> Resume with: `contrib-run --repo {self.repo} --resume`")
+        try:
+            self.rebuild_queue(banner)
+            self.ledger_commit(f"run {self.run_id}: {self.stop_kind or 'done'}: {reason}")
+        except Exception as e:
+            leftovers.append(f"ledger write error: {one_line(e, 200)}")
+        for f in ("STOP", "STOP-NOW"):
+            (LEDGER / f).unlink(missing_ok=True)
+        self.log("shutdown complete" + (f"; leftovers: {leftovers}" if leftovers else "; nothing left running"))
+        return not leftovers
+
+    def recover_stale(self):
+        """A previous run that could not shut down (sleep, wsl --shutdown, power loss)."""
+        for s in self.all_states():
+            if s.get("status") != "running":
+                self.cand = Path(s["_dir"])
+                if s.get("status") == "stopped" and self.clone().exists():
+                    try:
+                        note = self.save_clone()
+                    except Exception as e:
+                        note = f"clone still kept: {one_line(e, 200)}"
+                    self.log(f"{self.cand.name}: a stopped candidate's clone was left behind; {note}")
+                    self.state(cleanup=note)
+                self.cand = None
+                continue
+            self.cand = Path(s["_dir"])
+            self.log(f"recovering stale candidate {self.cand.name}")
+            node = s.get("node") or {}
+            for k in ("pid", "bridge"):
+                pid = node.get(k)
+                if pid and alive(pid) and (str(WORK / "nodes") in cmdline(pid)):
+                    stop_group(pid, signal.SIGTERM, 20, self.log)
+            d = node.get("dir", "")
+            if d and inside(d, WORK / "nodes") and Path(d) != WORK / "nodes":
+                shutil.rmtree(d, ignore_errors=True)
+            self.state(node=None)
+            self.sweep([self.clone(), self.bins()])
+            try:
+                note = self.save_clone()
+            except Exception as e:
+                note = f"clone kept: {one_line(e, 200)}"
+            self.state(status="stopped", stop_reason="previous run ended without shutting down (sleep or power loss?)",
+                       stop_kind="hard", cleanup=note, resume=f"contrib-run --repo {self.repo} --resume")
+            self.cand = None
+        for d in (WORK / "nodes").iterdir():
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Run the contribution pipeline (never pushes or posts).")
+    ap.add_argument("--repo", default="xerj-org/xerj")
+    ap.add_argument("--limit", type=int, default=3, help="candidates to finish this run")
+    ap.add_argument("--hours", type=float, default=8.0, help="deadline from now")
+    ap.add_argument("--topic", default="", help="steer the scout")
+    ap.add_argument("--resume", action="store_true", help="first pick up stopped candidates")
+    ap.add_argument("--model", default="opus")
+    ap.add_argument("--scout-model", default="sonnet")
+    ap.add_argument("--claude", default="claude", help="the claude binary (a stub for tests)")
+    ap.add_argument("--stub", action="store_true", help="test mode: no GitHub, no builds")
+    ap.add_argument("--real-requests", action="store_true", help="with --stub, still run builds and nodes")
+    ap.add_argument("--tick", type=float, default=60.0, help="watchdog interval, seconds")
+    ap.add_argument("--retest", metavar="SLUG", help="publish-time: re-run a candidate's checks in the jail, then exit")
+    ap.add_argument("--merge", action="store_true", help="with --retest, test a trial merge with the current base")
+    sys.exit(Driver(ap.parse_args()).main())
+
+
+if __name__ == "__main__":
+    main()

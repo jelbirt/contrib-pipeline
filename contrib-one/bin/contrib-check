@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""contrib-check <slug>: has anything changed since this packet was made? No builds.
+
+Prints facts, then one verdict line, worst first:
+  merged-or-closed  upstream fixed it or the issue closed
+  overlap           another PR or person has the same fix
+  needs-look        something this script could not decide; read the printed lines
+  rebase-code       conflicts in code: rebase, then the full bar on the final SHA
+  rebase-docs       conflicts only in CHANGELOG or the ratchet: rebase, then the PR's tests
+  retest-merge      merges cleanly, but the base changed this branch's crates: run the PR's
+                    tests on a trial merge before opening
+  unchanged         open it as it is
+Exit 0 for unchanged, 1 for anything that needs work or a decision, 2 if the check failed.
+"""
+import datetime, json, os, re, subprocess, sys
+from pathlib import Path
+
+SKILL = Path(__file__).resolve().parent.parent
+LEDGER = Path(os.environ.get("CONTRIB_LEDGER", Path.home() / "contrib-queue"))
+DOC_FILES = {"CHANGELOG.md", "engine/tests/es-compat-yaml/catch-lenient.txt"}
+
+
+SENSITIVE = [r"(^|/)build\.rs$", r"(^|/)Cargo\.(toml|lock)$", r"(^|/)\.cargo/", r"(^|/)rust-toolchain",
+             r"^\.github/", r"(^|/)\.git(attributes|modules)$", r"\.(sh|ps1|bash)$", r"^scripts/", r"^tools/"]
+
+
+def after(t, since):
+    """GitHub times end in Z, ours carry a local offset: compare them as moments."""
+    def p(x):
+        try:
+            d = datetime.datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return d if d.tzinfo else d.astimezone()
+    a, b = p(t), p(since)
+    return a is not None and (b is None or a > b)
+
+
+def fail(msg):
+    print(f"CHECK FAILED: {msg}")
+    print("VERDICT needs-look")
+    sys.exit(2)
+
+
+def sh(*a, check=True):
+    r = subprocess.run(a, capture_output=True, text=True)
+    if check and r.returncode:
+        fail(f"{' '.join(a[:4])}: {r.stderr.strip()[:300]}")
+    return r.stdout.strip()
+
+
+def merge_tree(repo_dir, a, b):
+    """Conflicted paths of a trial merge, [] when clean. Anything but exit 0 or 1 is an error."""
+    r = subprocess.run(["git", "-C", repo_dir, "merge-tree", "--write-tree", "--name-only",
+                        "--no-messages", a, b], capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        fail(f"merge-tree {a} {b}: {r.stderr.strip()[:300]}")
+    return r.stdout.strip().splitlines()[1:] if r.returncode == 1 else []
+
+
+CLAIM_WORDS = ("i'll take", "i will take", "working on", "i'm on it", "im on it", "/assign", "assign me",
+               "can i take", "i'd like to work", "i would like to work", "picking this up", "opened #",
+               "pr incoming", "draft pr")
+
+
+def main():
+    slug = sys.argv[1]
+    cand = LEDGER / "candidates" / slug
+    s = json.loads((cand / "state.json").read_text())
+    prof = {}
+    pdir = Path(os.environ.get("CONTRIB_PROFILE_DIR", SKILL / "profiles"))
+    for line in (pdir / f"{s['repo'].replace('/', '-')}.env").read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("#", 1)[0].split("=", 1)
+            prof[k.strip()] = v.strip().strip('"')
+    repo_dir, up, base = prof["REPO_DIR"], prof["UPSTREAM_REMOTE"], prof["BASE_BRANCH"]
+    branch, made_from = s["branch"], s["base_sha"]
+    git = lambda *a, check=True: sh("git", "-C", repo_dir, *a, check=check)
+    git("fetch", "--quiet", up, base)
+    if subprocess.run(["git", "-C", repo_dir, "rev-parse", "--verify", "--quiet", branch],
+                      capture_output=True).returncode:
+        fail(f"branch {branch} is not in {repo_dir}")
+    issue = None
+    try:
+        issue = int(s["issue"]) if s.get("issue") not in (None, "") else None
+    except (TypeError, ValueError):
+        print(f"state.json issue {s.get('issue')!r} is not a number; checking without it")
+    me = prof.get("CONTRIBUTOR", "")
+    main_ref = f"{up}/{base}"
+    main_sha = git("rev-parse", main_ref)
+    mine = git("diff", "--name-only", f"{made_from}...{branch}").splitlines()
+    print(f"branch {branch} at {git('rev-parse', '--short', branch)}, made from {made_from[:9]}, "
+          f"{main_ref} now {main_sha[:9]}")
+    print(f"files this branch changes: {', '.join(mine)}")
+    verdicts = []
+    touchy = [f for f in mine if any(re.search(rx, f) for rx in SENSITIVE)]
+    if touchy:
+        print(f"sensitive paths touched (show their full diff before any push): {', '.join(touchy)}")
+        verdicts.append("needs-look")
+
+    since = s.get("started") or ""
+    rl = "engine/tests/es-compat-yaml/catch-lenient.txt"
+    my_ratchet = set()
+    if rl in mine:
+        my_ratchet = {l[1:] for l in git("diff", f"{made_from}...{branch}", "--", rl).splitlines()
+                      if l.startswith("-") and not l.startswith("---")}
+
+    # 1. upstream already has it, the issue closed, or someone claimed it
+    if issue:
+        st = json.loads(sh("gh", "issue", "view", str(issue), "-R", s["repo"], "--json",
+                           "state,closedAt,assignees,comments"))
+        if st["state"] != "OPEN":
+            print(f"issue #{issue} is {st['state']} since {st['closedAt']}")
+            verdicts.append("merged-or-closed")
+        others = [a["login"] for a in st.get("assignees", []) if a.get("login") != me]
+        if others:
+            print(f"issue #{issue} is assigned to {', '.join(others)}")
+            verdicts.append("overlap")
+        for c in st.get("comments", []):
+            who = (c.get("author") or {}).get("login", "")
+            if who != me and after(c.get("createdAt"), since) and any(w in c.get("body", "").lower() for w in CLAIM_WORDS):
+                print(f"possible claim on #{issue} by {who} at {c['createdAt']}: "
+                      f"{' '.join(c.get('body', '').split())[:160]}")
+                verdicts.append("needs-look")
+    if my_ratchet:
+        still = set(git("show", f"{main_ref}:{rl}", check=False).splitlines())
+        gone = sorted(my_ratchet - still)
+        if gone:
+            print(f"the base already removed {len(gone)} of this branch's ratchet lines: {gone[0][:120]}")
+            verdicts.append("merged-or-closed")
+
+    # 2. overlap: open PRs touching the same non-doc files, and the same ratchet lines
+    prs = json.loads(sh("gh", "pr", "list", "-R", s["repo"], "--state", "open", "--limit", "200",
+                        "--json", "number,title,author,createdAt,files,headRefName,headRepositoryOwner,"
+                        "closingIssuesReferences"))
+    code_files = set(mine) - DOC_FILES
+    quiet = []
+    for pr in prs:
+        if (pr.get("headRefName") == branch and (pr.get("author") or {}).get("login") == me
+                and (pr.get("headRepositoryOwner") or {}).get("login") == me):
+            continue                  # this candidate's own PR, already opened
+        files = {f["path"] for f in pr.get("files", [])}
+        shared = code_files & files
+        issue_hit = bool(issue) and any(i.get("number") == issue for i in pr.get("closingIssuesReferences", []))
+        ratchet_hit = False
+        if my_ratchet and rl in files:
+            diff = sh("gh", "pr", "diff", str(pr["number"]), "-R", s["repo"])
+            theirs = {l[1:] for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")}
+            ratchet_hit = bool(my_ratchet & theirs)
+        if issue_hit or ratchet_hit:
+            print(f"OVERLAP #{pr['number']} {pr['title']} ({pr['author']['login']}): "
+                  f"{'closes the same issue' if issue_hit else 'deletes the same ratchet line'}")
+            verdicts.append("overlap")
+        elif shared:
+            # Same file is common (es_compat.rs is touched by most PRs). What matters is whether
+            # the two changes meet: a trial merge of this branch with that PR's head.
+            f = subprocess.run(["git", "-C", repo_dir, "fetch", "--quiet", up, f"pull/{pr['number']}/head"],
+                               capture_output=True, text=True)
+            if f.returncode:
+                print(f"could not fetch #{pr['number']}; read it by hand: {pr['title']}")
+                verdicts.append("needs-look")
+                continue
+            # A PR cut from an older base also "conflicts" in files neither change touched;
+            # only clashes in this branch's own files mean the two changes meet.
+            clash = [c for c in merge_tree(repo_dir, branch, "FETCH_HEAD") if c in mine]
+            if clash:
+                new = after(pr.get("createdAt"), since)
+                code_clash = set(clash) - DOC_FILES
+                what = ("same code, maybe the same fix: read its diff" if code_clash
+                        else "neighbouring CHANGELOG or ratchet lines only; whichever merges second rebases")
+                print(f"{'NEW ' if new else ''}CONFLICTS with #{pr['number']} {pr['title']} "
+                      f"({pr['author']['login']}): {', '.join(clash)}  <- {what}")
+                if code_clash:
+                    verdicts.append("overlap")
+            else:
+                quiet.append(pr["number"])
+
+    # 2b. a PR on the same topic that shares no file and names no issue (the #2960 case)
+    seen = {pr["number"] for pr in prs}
+    for term in s.get("search_terms") or []:
+        hits = json.loads(sh("gh", "search", "prs", "--repo", s["repo"], "--state", "open", "--json",
+                             "number,title,author,createdAt", "--limit", "20", "--", term))
+        for h in hits:
+            if (h.get("author") or {}).get("login") != me and after(h.get("createdAt"), since):
+                print(f"same-topic PR #{h['number']} {h['title']} ({h['author']['login']}), "
+                      f"found by \"{term}\": read it")
+                verdicts.append("needs-look")
+        seen |= {h["number"] for h in hits}
+
+    if quiet:
+        print(f"{len(quiet)} open PRs share files but merge cleanly with this branch: "
+              f"{', '.join('#' + str(n) for n in quiet)}")
+
+    # 3. does it still merge, and did the base change code this branch depends on
+    if subprocess.run(["git", "-C", repo_dir, "merge-base", "--is-ancestor", main_ref, branch]).returncode == 0:
+        print("base has not moved")
+    else:
+        conflicts = merge_tree(repo_dir, main_ref, branch)
+        moved = git("diff", "--name-only", f"{made_from}..{main_ref}").splitlines()
+        crates = {"/".join(p.split("/")[:3]) for p in code_files if p.startswith("engine/crates/")}
+        crate_moved = sorted(p for p in moved if "/".join(p.split("/")[:3]) in crates)
+        print(f"base moved {len(moved)} files; conflicts: {', '.join(conflicts) or 'none'}")
+        if crate_moved:
+            print(f"base changed code in this branch's crates: {', '.join(crate_moved[:12])}"
+                  f"{' ...' if len(crate_moved) > 12 else ''}")
+        # No conflict means no rebase, and no rebase means no re-test: the PR is opened as is and
+        # CI runs on the merge with the base (pull_request events build the merge ref).
+        if conflicts and not set(conflicts) <= DOC_FILES:
+            verdicts.append("rebase-code")
+        elif conflicts:
+            verdicts.append("rebase-code" if crate_moved else "rebase-docs")
+        elif crate_moved:
+            print("merges cleanly, but the base changed code this branch builds on")
+            verdicts.append("retest-merge")
+    order = ["merged-or-closed", "overlap", "needs-look", "rebase-code", "rebase-docs", "retest-merge"]
+    verdict = next((v for v in order if v in verdicts), "unchanged")
+    print(f"VERDICT {verdict}")
+    sys.exit(0 if verdict == "unchanged" else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:          # any crash means "could not decide", never a green light
+        fail(f"contrib-check crashed: {type(e).__name__}: {e}")
