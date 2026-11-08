@@ -10,11 +10,11 @@ echo "== needs-you then answer"; STUB_PREFIX=smkn STUB_NEEDS_YOU=A run --limit 1
 run --answer smkn-0 "yes, go on"; st smkn-0
 echo "== ledger"; git -C $CONTRIB_LEDGER status --porcelain | head -5; echo "session files tracked: $(git -C $CONTRIB_LEDGER ls-files | grep -c '/session/')"; echo "record files tracked: $(git -C $CONTRIB_LEDGER ls-files | grep -c '/record/')"
 git -C $CONTRIB_LEDGER ls-files candidates/smkn-0 | head
-echo "== gate requests"; grep -h '"id": "gate-' $CONTRIB_LEDGER/candidates/smkh-0/results/index.jsonl | python3 -c "import sys,json;[print(json.loads(l)['id'],json.loads(l)['kind']) for l in sys.stdin]"
-echo "== leftovers"; pgrep -af 'stub-claude|contrib-run' | grep -v pgrep || echo none
+echo "== gate requests"; grep -h '"gate-' $CONTRIB_LEDGER/candidates/smkh-0/results/index.jsonl | python3 -c "import sys,json;[print(json.loads(l)['id'],json.loads(l)['kind']) for l in sys.stdin]"
+echo "== leftovers"; pgrep -af 'stub-claude|bin/contrib-run --repo' | grep -v 'pgrep\|eval ' || echo none
 echo "== one bad next.json in A"; STUB_PREFIX=smkb STUB_BADNEXT=A:1 run --limit 1; st smkb-0; grep -c '"bad_next"' $STUB_LOG
 echo "== two bad next.json in A"; STUB_PREFIX=smkc STUB_BADNEXT=A:2 run --limit 1; st smkc-0
 python3 -c "import json;s=json.load(open('$CONTRIB_LEDGER/candidates/smkc-0/state.json'));print('asked_by',s.get('asked_by'),'|',s.get('question'))"
 run --answer smkc-0 "carry on"; st smkc-0
 echo "== ledger ignores"; cat $CONTRIB_LEDGER/.gitignore | tail -8; echo "gh tracked: $(git -C $CONTRIB_LEDGER ls-files | grep -c '/gh/')"; echo "transcripts tracked: $(git -C $CONTRIB_LEDGER ls-files | grep -c '/transcripts/')"
-echo "== leftovers2"; pgrep -af 'stub-claude|contrib-run' | grep -v pgrep || echo none
+echo "== leftovers2"; pgrep -af 'stub-claude|bin/contrib-run --repo' | grep -v 'pgrep\|eval ' || echo none
