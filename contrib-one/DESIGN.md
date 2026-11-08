@@ -340,3 +340,27 @@ Changes since:
 - **Tests.** `tests/stub-claude` is the permanent stub; stub runs covered the happy path,
   needs-you then answer, an answer held back by a STOP file, a gate-raised answer reopening C,
   the refusals, STOP-NOW mid-B with resume.
+
+## Review rounds 8 and 9 (2026-11-08, before resuming the first real candidate)
+
+- **Ledger git never enters a session folder.** The ledger ignores `candidates/*/session/`
+  and `runs/*/scout/session/`; the driver copies an allowlist of plain files (packet, PR
+  body, plan, next.json, candidates.json, evidence text) into a driver-owned `record/` and
+  commits that. Every commit first rewrites the ignore rules, untracks session files with
+  `git rm -f --cached` (no status run inside a nested repo), and refuses to commit while a
+  gitlink or a session file is tracked or any other nested `.git` exists. contrib-publish
+  commits through `contrib-run --commit-ledger`. Proven by running a planted nested-repo
+  filter: it ran under the old driver and under round 8 on an upgraded ledger, and does not
+  run now.
+- **`without` runs** touch the real files afterwards (paths rechecked inside the clone), so
+  cargo cannot reuse a build of the base code. Proven on a small crate: a false pass before
+  the touch, a real failure after.
+- **Session errors** (an overloaded API, a timeout) are retried once after 60 s in the same
+  session and do not use up a turn; a second error in a row stops the run softly, leaving
+  the candidate resumable.
+- **Final gate** adds `cargo fmt --all --check` and runs clippy as CI does
+  (`--workspace --all-targets`, without incremental data or debuginfo, its output removed
+  afterwards; sessions cannot ask for the workspace form). A memory kill, full disk or lock
+  timeout in the gate stops the run softly instead of failing the candidate. The YAML run
+  waits for `/_cluster/health` and reports a node that never comes up as an infrastructure
+  failure.

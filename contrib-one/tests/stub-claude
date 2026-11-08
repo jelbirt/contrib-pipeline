@@ -5,7 +5,8 @@ $CONTRIB_TRANSCRIPTS/stubproj/<sid>.jsonl so the driver's review check has somet
 to read. Knobs (env): STUB_CANDS (candidates, default 1), STUB_PREFIX (slug prefix),
 STUB_NEEDS_YOU=<stage> (ask once in that stage), STUB_SLEEP_STAGE + STUB_SLEEP (seconds),
 STUB_BODY (PR body text), STUB_NO_TRANSCRIPT=1, STUB_SHORT_REVIEW=1, STUB_AFTER_REVIEW=1
-(a Bash call after the review), STUB_DENIAL=1 (report one permission denial)."""
+(a Bash call after the review), STUB_DENIAL=1 (report one permission denial),
+STUB_ERROR=<stage>:<n> (end the first n turns of that stage with an error and no next.json)."""
 import json, os, re, subprocess, sys, time, uuid
 from pathlib import Path
 
@@ -81,6 +82,16 @@ answer_kind = ("session" if answered else "gate" if "final gate on a fresh build
 say(stage=stage, checks=checks, answered=answered, answer_kind=answer_kind, prompt=prompt[:300])
 if env.get("STUB_SLEEP_STAGE") == stage:
     time.sleep(float(env.get("STUB_SLEEP", "30")))
+if env.get("STUB_ERROR", "").split(":")[0] == stage:
+    ef = sdir / f".stub_err_{stage}"
+    nerr = int(ef.read_text()) if ef.exists() else 0
+    if nerr < int(env["STUB_ERROR"].split(":")[1]):
+        ef.write_text(str(nerr + 1))
+        say(stage=stage, error_turn=nerr + 1, retry="previous turn ended with an error" in prompt)
+        print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                          "session_id": sid, "total_cost_usd": 0.1, "num_turns": 1, "duration_ms": 10,
+                          "permission_denials": [], "result": "API Error: 529 overloaded"}))
+        sys.exit(1)
 mark = sdir / f".stub_{stage}"
 turn = int(mark.read_text()) + 1 if mark.exists() else 1
 mark.write_text(str(turn))

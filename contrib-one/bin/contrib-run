@@ -52,6 +52,10 @@ SETTING_SOURCES = ""            # sessions load no user, project or local settin
 EM_DASH, EN_DASH = chr(0x2014), chr(0x2013)
 GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "credential.helper=",
             "-c", "core.pager=cat"]
+# What the driver copies from a session's folder into the ledger's record/ (the session folder
+# itself is ignored by the ledger's git, so nothing a session plants there reaches git).
+RECORD_TOP = ("packet.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json")
+LEDGER_IGNORES = ("candidates/*/session/", "runs/*/scout/session/")
 GH_VERBS = {("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"), ("pr", "diff"),
             ("pr", "checks"), ("search", "issues"), ("search", "prs")}
 GH_FLAGS_VALUE = {"--json", "--limit", "-L", "--state", "-s", "--search", "-S", "--label", "-l", "--author",
@@ -693,6 +697,7 @@ class Driver:
                 if d.is_dir() and not d.is_symlink() and d.name not in keep and re.fullmatch(r"[\w.-]+", d.name):
                     shutil.rmtree(d, ignore_errors=True)
         self.trim_kept_builds()
+        self.ensure_ledger_ignores()
         gb = c_free_gb()
         if gb < int(self.prof.get("START_GB", 32)) and not (self.args.stub and not self.args.real_requests):
             raise RuntimeError(f"C: has {gb} GB free, below the {self.prof.get('START_GB', 32)} GB start floor")
@@ -782,10 +787,94 @@ class Driver:
         write_json(p, s)
         return s
 
+    def session_homes(self):
+        homes = [d for d in sorted((LEDGER / "candidates").glob("*")) if d.is_dir() and not d.is_symlink()]
+        homes += [d / "scout" for d in sorted((LEDGER / "runs").glob("*")) if (d / "scout").is_dir()]
+        return homes
+
+    def record_sessions(self):
+        """Copy the plain files worth keeping from each session folder into its driver-owned
+        record/ folder, read the way every session file is read (regular files, size-capped)."""
+        for home in self.session_homes():
+            src = home / "session"
+            if not src.is_dir() or src.is_symlink():
+                continue
+            files = {}
+            for name in RECORD_TOP:
+                t = read_session_file(src / name)
+                if t is not None:
+                    files[name] = t
+            ev = src / "evidence"
+            if ev.is_dir() and not ev.is_symlink():
+                for q in sorted(ev.iterdir())[:60]:
+                    if re.fullmatch(r"[A-Za-z0-9][\w.-]{0,99}\.(md|txt|json|log)", q.name):
+                        t = read_session_file(q)
+                        if t is not None:
+                            files["evidence/" + q.name] = t
+            dst = home / "record"
+            shutil.rmtree(dst, ignore_errors=True)
+            for rel, t in files.items():
+                (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+                (dst / rel).write_text(t)
+
+    def ensure_ledger_ignores(self):
+        gi = LEDGER / ".gitignore"
+        have = gi.read_text().splitlines() if gi.exists() else []
+        add = [x for x in LEDGER_IGNORES if x not in have]
+        if add:
+            gi.write_text("\n".join(have + ["# Session-written folders: copied to record/ by the driver"] + add) + "\n")
+        for pat in LEDGER_IGNORES:
+            # -f skips git's local-modification check, which would run `git status` inside any
+            # nested repo an older driver committed as a gitlink; --cached leaves the files alone.
+            r = subprocess.run(["git", *GIT_SAFE, "-c", "submodule.recurse=false", "-C", str(LEDGER), "rm",
+                                "-r", "-q", "-f", "--cached", "--ignore-unmatch", pat + "*"],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               env=self.git_env())
+            if r.returncode:
+                raise RuntimeError(f"could not untrack {pat} in the ledger: {one_line(r.stderr, 200)}")
+
+    def ledger_unsafe(self):
+        """Why the ledger's index is unsafe for `git add -A`, or None."""
+        r = subprocess.run(["git", *GIT_SAFE, "-C", str(LEDGER), "ls-files", "-s"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", env=self.git_env())
+        if r.returncode:
+            return f"git ls-files failed: {one_line(r.stderr, 150)}"
+        for line in r.stdout.splitlines():
+            mode, _, rest = line.partition(" ")
+            path = rest.split("\t", 1)[-1]
+            if mode == "160000":
+                return f"a nested repository is tracked at {path}"
+            if re.match(r"(candidates/[^/]+|runs/[^/]+/scout)/session/", path):
+                return f"a session-written file is still tracked: {path}"
+        return None
+
+    def ledger_nested_git(self):
+        """Any .git the ledger's git could see, other than its own (session folders are ignored)."""
+        # Skip a session folder only when the ledger's git really ignores it.
+        rels = [str((h / "session").relative_to(LEDGER)) for h in self.session_homes() if (h / "session").is_dir()]
+        r = subprocess.run(["git", *GIT_SAFE, "-C", str(LEDGER), "check-ignore", "--stdin"],
+                           input="\n".join(rels) + "\n", capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=self.git_env()) if rels else None
+        ignored = set(r.stdout.split("\n")) if r is not None and r.returncode in (0, 1) else set()
+        skip = {LEDGER / ".git"} | {LEDGER / x for x in rels if x in ignored}
+        for root, dirs, files in os.walk(LEDGER):
+            r = Path(root)
+            dirs[:] = [d for d in dirs if r / d not in skip]
+            if ".git" in dirs or ".git" in files:
+                return r / ".git"
+        return None
+
     def ledger_commit(self, msg):
-        subprocess.run(["git", *GIT_SAFE, "-C", str(LEDGER), "add", "-A"], capture_output=True)
-        subprocess.run(["git", *GIT_SAFE, "-C", str(LEDGER), "commit", "-qm", one_line(msg, 200)],
-                       capture_output=True)
+        self.ensure_ledger_ignores()
+        self.record_sessions()
+        bad = self.ledger_unsafe() or self.ledger_nested_git()
+        if bad:
+            self.log(f"ledger commit skipped: found {bad}; remove it by hand after looking at it")
+            return
+        g = ["git", *GIT_SAFE, "-c", "diff.ignoreSubmodules=all", "-c", "core.untrackedCache=false",
+             "-c", "submodule.recurse=false", "-C", str(LEDGER)]
+        subprocess.run([*g, "add", "-A"], capture_output=True, env=self.git_env())
+        subprocess.run([*g, "commit", "-qm", one_line(msg, 200)], capture_output=True, env=self.git_env())
 
     def rebuild_queue(self, banner=None):
         groups = {}
@@ -1102,7 +1191,7 @@ class Driver:
             self.state(node=None)
         return gone
 
-    def run_requests(self, reqs):
+    def run_requests(self, reqs, driver=False):
         res_dir = self.cand / "results"
         res_dir.mkdir(exist_ok=True)
         index = res_dir / "index.jsonl"
@@ -1133,15 +1222,26 @@ class Driver:
                     elif kind == "fmt":
                         rc = self.ensure_fetched(rid)
                         if not rc:
-                            rc, out = self.guarded(rid, self.cargo_jail("cargo fmt --all"), retries=0)
+                            rc, out = self.guarded(rid, self.cargo_jail(
+                                "cargo fmt --all --check" if req.get("check") is True else "cargo fmt --all"), retries=0)
                         note = self.cgit("diff", "--no-ext-diff", "--stat", check=False)
                     elif kind == "clippy":
                         crates = [c for c in req.get("crates", []) if isinstance(c, str) and re.fullmatch(r"[\w-]{1,60}", c)]
                         rc = self.ensure_fetched(rid)
                         if not rc:
-                            sel = " ".join(f"-p {c}" for c in crates)
-                            rc, out = self.guarded(rid, self.cargo_jail(
-                                f"cargo clippy --profile ci-test {sel} --tests -- -D warnings"))
+                            if req.get("workspace") is True and driver:
+                                # What CI's lint job runs (the dev profile, every crate and target).
+                                # No incremental data or debuginfo: neither changes a lint, both cost GBs.
+                                try:
+                                    rc, out = self.guarded(rid, self.cargo_jail(
+                                        "cargo clippy --workspace --all-targets -- -D warnings",
+                                        env={"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_DEV_DEBUG": "0"}))
+                                finally:
+                                    shutil.rmtree(self.target_dir() / "debug", ignore_errors=True)
+                            else:
+                                sel = " ".join(f"-p {c}" for c in crates)
+                                rc, out = self.guarded(rid, self.cargo_jail(
+                                    f"cargo clippy --profile ci-test {sel} --tests -- -D warnings"))
                     elif kind == "build":
                         b, rc = self.binary_for("runner" if req.get("what") == "runner" else "server", rid)
                         note = f"binary {b.name if b else 'none'}"
@@ -1229,6 +1329,15 @@ class Driver:
                                    retries=0 if req.get("expect") == "fail" else None)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+            # The overlaid base files were newer than the real ones, so cargo's records now say
+            # the base build is current. Touch the real files so the next build recompiles them.
+            for rel in rels:
+                try:
+                    p = self.clone_path(rel)          # refuses a symlinked parent planted meanwhile
+                    if os.path.realpath(p).startswith(os.path.realpath(self.clone()) + os.sep):
+                        os.utime(p, follow_symlinks=False)
+                except Exception:
+                    pass
         note = "reverted to base for this run: " + ", ".join(rels) if rels else ""
         return rc, out, note
 
@@ -1259,7 +1368,9 @@ class Driver:
         inner = (
             'srv=$1 run=$2 data=$3 ydir=$4; shift 4\n'
             f'"$srv" --insecure --data-dir "$data" --port {JAIL_PORT} > "$data/../node.log" 2>&1 &\n'
-            f'for i in $(seq 1 240); do (exec 3<>/dev/tcp/127.0.0.1/{JAIL_PORT}) 2>/dev/null && break; sleep 0.5; done\n'
+            f'for i in $(seq 1 240); do curl -sf -o /dev/null --max-time 2 http://127.0.0.1:{JAIL_PORT}/_cluster/health && break; sleep 0.5; done\n'
+            f'curl -sf -o /dev/null --max-time 2 http://127.0.0.1:{JAIL_PORT}/_cluster/health || '
+            '{ echo "the node never became healthy"; tail -n 40 "$data/../node.log"; kill %1 2>/dev/null; exit 99; }\n'
             'rc=0\n'
             f'if [ $# -eq 0 ]; then "$run" --url http://127.0.0.1:{JAIL_PORT} --dir "$ydir" || rc=$?\n'
             f'else for f in "$@"; do "$run" --url http://127.0.0.1:{JAIL_PORT} --verbose --file "$ydir/$f" || rc=$?; done; fi\n'
@@ -1411,10 +1522,14 @@ class Driver:
     def stage_loop(self, stage, stage_file, model, extra_prompt=""):
         nxt = self.sdir / "next.json"
         first = True
-        for _turn in range(MAX_TURNS[stage]):
+        retry_note, last_prompt, errors = "", "", 0
+        turns = 0
+        while turns < MAX_TURNS[stage]:
             self.check_stop(between=first)
             nxt.unlink(missing_ok=True)
-            if first:
+            if retry_note:
+                prompt, retry_note = retry_note + last_prompt, ""
+            elif first:
                 prompt = (f"Run stage {stage} for the candidate in {self.cand}. That folder is read-only for you "
                           f"except {self.sdir}, where your packet, notes, PR body and next.json go. Your working "
                           f"directory is the candidate's own clone. Read state.json, gh/, results/index.jsonl and "
@@ -1423,14 +1538,31 @@ class Driver:
             else:
                 prompt = (f"The driver ran your requests. New lines are at the end of {self.cand}/results/index.jsonl; "
                           f"each line names its log file. Continue stage {stage}, then write {nxt}.")
+            last_prompt = prompt
             res = self.session(stage, self.clone(), prompt, self.system_text(stage_file), model,
                                [self.clone(), self.sdir], self.clone(), self.cand)
             self.check_stop()
             first = False
             act = read_session_json(nxt)
+            if not act and (res.get("is_error") or res.get("_rc")):
+                # An overloaded API, a dropped connection or a turn timeout is not the candidate's
+                # fault: wait and retry once, then stop the run so the candidate stays resumable.
+                errors += 1
+                why = one_line(res.get("result") or f"exit {res.get('_rc')}", 200)
+                if errors >= 2:
+                    self.request_stop("soft", f"stage {stage}: two session errors in a row ({why})")
+                    raise StopRun()
+                self.log(f"candidate {self.cand.name}: stage {stage} session error, retrying in 60 s: {why}")
+                for _ in range(60):
+                    time.sleep(1)
+                    self.check_stop()
+                retry_note = (f"Your previous turn ended with an error ({why}) before you wrote next.json. "
+                              "If you had already acted on the message below, check where you got to and "
+                              "carry on; otherwise act on it now.\n\n")
+                continue
+            errors = 0
+            turns += 1
             if not act:
-                if res.get("is_error") or res.get("_rc"):
-                    return {"action": "failed", "reason": f"session error: {one_line(res.get('result'), 200)}"}
                 return {"action": "failed", "reason": "stage ended without a readable next.json"}
             a = act.get("action")
             if a == "run":
@@ -1643,8 +1775,9 @@ class Driver:
         crates = sorted({t["crate"] for t in tests} | self.changed_crates(s["base_sha"]))
         # The YAML suite and clippy run first, so nothing a session-chosen test build leaves in
         # the target dir can feed them.
-        reqs = [{"kind": "yaml", "full": True, "id": f"{stamp}-yaml"},
-                {"kind": "clippy", "crates": crates, "id": f"{stamp}-clippy"}]
+        reqs = [{"kind": "fmt", "check": True, "id": f"{stamp}-fmt"},
+                {"kind": "yaml", "full": True, "id": f"{stamp}-yaml"},
+                {"kind": "clippy", "workspace": True, "crates": crates, "id": f"{stamp}-clippy"}]
         reqs += [dict(t, id=f"{stamp}-t{i}") for i, t in enumerate(tests)]
         self.log(f"candidate {self.cand.name}: final gate on a fresh clone and build, {len(reqs)} runs")
         bad = []
@@ -1657,7 +1790,7 @@ class Driver:
             if tree_moved():
                 bad.append(f"the clone changed before {r['id']} (a gate step wrote to tracked files)")
                 break
-            self.run_requests([r])
+            self.run_requests([r], driver=True)
         self.check_stop()
         self.node_stop()
         if not bad and tree_moved():
@@ -1671,6 +1804,12 @@ class Driver:
                 continue
             if isinstance(rec, dict) and str(rec.get("id", "")).startswith(stamp + "-"):
                 recs[rec["id"]] = rec
+        infra = [i for i, rec in recs.items() if rec.get("infra")]
+        if not bad and infra:
+            # A memory kill, a full disk or a lock timeout says nothing about the change.
+            self.request_stop("soft", f"final gate: the machine, not the change, stopped {', '.join(infra)}; "
+                                      "resume to run the gate again")
+            raise StopRun()
         if not bad:
             bad = [f"not met: {r['id']}" for r in reqs if not recs.get(r["id"], {}).get("met")]
         self.state(gate={"at": now(), "head": head, "ok": not bad, "ids": [r["id"] for r in reqs],
@@ -1737,7 +1876,7 @@ class Driver:
                           "from where it stopped.")
             act = self.stage_loop(stage, f, self.args.model, extra)
             if pend:
-                self.state(answer_pending=None, question=None, asked_by=None)
+                self.state(answer_pending=None, question=None, asked_by=None, context=None)
             if stage == "C" and act.get("action") == "stage-done":
                 problems = self.safe_final_checks()
                 if problems and not self.stop_kind:
@@ -1746,6 +1885,8 @@ class Driver:
                                           f" The driver's final checks found problems, listed in "
                                           f"{self.cand}/results/final-checks.txt. Fix every one, then finish again.")
                     problems = self.safe_final_checks() if act.get("action") == "stage-done" else problems
+                if act.get("action") == "stage-done" and problems and self.stop_kind:
+                    raise StopRun()          # stopped before the fix-up turn; resume reruns C
                 if act.get("action") == "stage-done" and problems:
                     return self.finish("failed", reason="final checks: " + "; ".join(problems))
             a = act.get("action")
@@ -2024,10 +2165,10 @@ class Driver:
                     raise RuntimeError(f"the trial merge with the base failed ({one_line(e, 150)}); rebase first")
                 merged = base_now
             reqs = [dict(t, id=f"retest-{stamp}-t{i}") for i, t in enumerate(tests)]
-            reqs += [{"kind": "clippy", "crates": crates, "id": f"retest-{stamp}-clippy"},
+            reqs += [{"kind": "clippy", "workspace": True, "crates": crates, "id": f"retest-{stamp}-clippy"},
                      {"kind": "yaml", "full": True, "id": f"retest-{stamp}-yaml"}]
             for r in reqs:
-                self.run_requests([r])
+                self.run_requests([r], driver=True)
         finally:
             try:
                 self.node_stop()
@@ -2059,6 +2200,13 @@ class Driver:
         signal.signal(signal.SIGTERM, self.on_signal)
         signal.signal(signal.SIGHUP, self.on_signal)
         threading.Thread(target=self.watchdog, daemon=True).start()
+        if self.args.commit_ledger:
+            try:
+                self.ledger_commit(self.args.commit_ledger)
+            except Exception as e:
+                print(f"commit-ledger: {type(e).__name__}: {e}", file=sys.stderr)
+                return EXIT_SOFT
+            return EXIT_DONE
         if self.args.retest:
             try:
                 return self.retest(self.args.retest, self.args.merge)
@@ -2284,6 +2432,8 @@ def main():
     ap.add_argument("--stub", action="store_true", help="test mode: no GitHub, no builds")
     ap.add_argument("--real-requests", action="store_true", help="with --stub, still run builds and nodes")
     ap.add_argument("--tick", type=float, default=60.0, help="watchdog interval, seconds")
+    ap.add_argument("--commit-ledger", metavar="MESSAGE",
+                    help="commit the ledger the safe way (contrib-publish uses this), then exit")
     ap.add_argument("--retest", metavar="SLUG", help="publish-time: re-run a candidate's checks in the jail, then exit")
     ap.add_argument("--answer", nargs=2, metavar=("SLUG", "TEXT"),
                     help="answer a needs-you candidate's question and continue it (runs only that candidate)")

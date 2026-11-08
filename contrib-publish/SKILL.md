@@ -144,7 +144,10 @@ On any STOP or error, open nothing and show the user the output. A push that is 
 because `fix/<slug>` already exists on the fork with other content is a stop, never a force
 push.
 Then mark the packet `published` with the PR URL in `state.json`, rebuild nothing else,
-commit the ledger, and offer the next ready candidate.
+and commit the ledger only through the driver, which ignores session folders and refuses a
+nested repository: `~/.claude/skills/contrib-one/bin/contrib-run --commit-ledger "publish <slug>"`.
+Never run `git add` or `git commit` in `~/contrib-queue` yourself. Then offer the next ready
+candidate.
 
 ## Rules
 No em or en dashes; no attribution in commits, PR bodies or comments; the repo's PR
