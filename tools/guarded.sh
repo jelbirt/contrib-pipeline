@@ -11,6 +11,9 @@
 #           command that must not run twice.
 #   Jobs:   cargo is pinned to JOBS (default 4); a command asking for more is refused.
 # Exit: the command's own code; 97 refused -j; 98 killed; 99 not started.
+# When GUARD_STATUS names a file, the guard writes "refused", "killed ..." or "not-started ..."
+# there for its own exits, so a caller can tell them from the command exiting 97, 98 or 99.
+status() { [ -n "${GUARD_STATUS:-}" ] && printf '%s\n' "$*" > "$GUARD_STATUS"; return 0; }
 START_GB=${START_GB:-32}; FLOOR_GB=${FLOOR_GB:-20}
 MEM_FLOOR_MB=${MEM_FLOOR_MB:-2048}; SWAP_GROW_MB=${SWAP_GROW_MB:-${SWAP_CEIL_MB:-1536}}
 WAIT_SECS=${WAIT_SECS:-1800}; RETRIES=${RETRIES:-1}; JOBS=${JOBS:-4}
@@ -23,7 +26,7 @@ swap_mb(){ awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{print int((t-f)/1024)}'
 SWAP_CAP_MB=$(( $(awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo) - 256 ))
 pid=""
 for j in $(grep -oE '(^|[[:space:]])(-j|--jobs)[ =]?[0-9]+' <<<"$*" | grep -oE '[0-9]+$'); do
-  [ "$j" -gt "$JOBS" ] && { echo "guard: refusing -j $j (limit $JOBS)"; exit 97; }
+  [ "$j" -gt "$JOBS" ] && { echo "guard: refusing -j $j (limit $JOBS)"; status refused; exit 97; }
 done
 CMD="$*"
 
@@ -35,7 +38,7 @@ mkdir -p "$(dirname "$GUARD_LOCK")"
 exec 9>"$GUARD_LOCK"
 if ! flock -n 9; then
   echo "guard: another guarded build holds the lock; waiting (up to ${LOCK_WAIT:-7200}s)"
-  flock -w "${LOCK_WAIT:-7200}" 9 || { echo "guard: lock wait timed out"; exit 99; }
+  flock -w "${LOCK_WAIT:-7200}" 9 || { echo "guard: lock wait timed out"; status not-started lock wait timed out; exit 99; }
 fi
 
 # Wait until MemAvailable is back to twice the floor and swap is below its cap, or give up
@@ -76,20 +79,20 @@ run_once() {
 
 # setsid puts the command in its own session, so a Ctrl-C, hangup or tool timeout that
 # stops the guard must take the command down with it.
-trap '[ -n "$pid" ] && { kill -TERM -- -"$pid" 2>/dev/null; sleep 2; kill -KILL -- -"$pid" 2>/dev/null; }; exit 98' INT TERM HUP
-wait_for_memory "before start" || exit 99
+trap '[ -n "$pid" ] && { kill -TERM -- -"$pid" 2>/dev/null; sleep 2; kill -KILL -- -"$pid" 2>/dev/null; }; status killed by a signal; exit 98' INT TERM HUP
+wait_for_memory "before start" || { status not-started memory stayed low; exit 99; }
 c=$(c_gb)
-[ "$c" -lt "$START_GB" ] && { echo "guard: C: ${c}G free, below ${START_GB}G; not starting"; exit 99; }
+[ "$c" -lt "$START_GB" ] && { echo "guard: C: ${c}G free, below ${START_GB}G; not starting"; status not-started C: below ${START_GB}G; exit 99; }
 attempt=0
 while :; do
   run_once
   [ "$reason" = memory ] && [ "$attempt" -lt "$RETRIES" ] || break
   attempt=$((attempt+1))
-  wait_for_memory "after a memory kill" || exit 98
+  wait_for_memory "after a memory kill" || { status killed memory; exit 98; }
   c=$(c_gb)
-  [ "$c" -lt "$START_GB" ] && { echo "guard: C: ${c}G free, below ${START_GB}G; not retrying"; exit 98; }
+  [ "$c" -lt "$START_GB" ] && { echo "guard: C: ${c}G free, below ${START_GB}G; not retrying"; status killed then C: low; exit 98; }
   echo "guard: retry $attempt of $RETRIES"
 done
-[ -n "$reason" ] && exit 98
+[ -n "$reason" ] && { status killed "$reason"; exit 98; }
 echo "guard: done rc=$rc; lows C: ${lc}G, mem ${lm}MB avail; swap high ${hs}MB"
 exit $rc

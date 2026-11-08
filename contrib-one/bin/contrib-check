@@ -199,7 +199,8 @@ def main():
         print("base has not moved")
     else:
         conflicts = merge_tree(repo_dir, main_ref, branch)
-        moved = git("diff", "--name-only", f"{made_from}..{main_ref}").splitlines()
+        meet = git("merge-base", main_ref, branch)
+        moved = git("diff", "--name-only", f"{meet}..{main_ref}").splitlines()
         crates = {"/".join(p.split("/")[:3]) for p in code_files if p.startswith("engine/crates/")}
         crate_moved = sorted(p for p in moved if "/".join(p.split("/")[:3]) in crates)
         print(f"base moved {len(moved)} files; conflicts: {', '.join(conflicts) or 'none'}")

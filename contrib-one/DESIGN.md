@@ -384,3 +384,27 @@ Changes since:
   transcripts stay on disk but out of the ledger's git.
 - contrib-check measures the branch from where it meets the base now and fetches PR heads to
   private refs. The guard's `-j` check reads whole tokens only.
+
+## Review rounds 11 and 12 (2026-11-08)
+
+- **Saving a clone never reads the session's .git.** The driver hard-links a copy of `.git`
+  into `~/contrib-work/snap/<slug>`, a folder no session can write, and checks the copy:
+  plain folders and regular files only (no symlinks, FIFOs, sockets or devices), every folder
+  listable, no `commondir`, `gitdir` or alternates, and no `include` keys in its config. It
+  then replaces the copy's config with a minimal one and fetches from the copy with
+  `git-upload-pack --strict`, `transfer.fsckObjects` and a time limit. A session process that
+  outlives its turn can no longer swap `.git` between the check and the fetch, steer the host
+  with its config, or hang the driver on a FIFO. Host git calls now have a time limit.
+- **The guard says when it, not the command, stopped a run.** `guarded.sh` writes its own
+  exits to `$GUARD_STATUS` (a driver-owned file); exit codes 97 to 99 count as infra only with
+  that file. Only "not started" stops the run, and then the rest of the turn's requests are
+  skipped and the candidate is stopped, resumable. A STOP file or a deadline lets the current
+  stage finish its requests as before, and leaves the final gate for `--resume`.
+- **Tests cannot quietly disappear.** An ignored test counts as a failure. Every final gate
+  replays every recorded test, so a renamed or removed one is reported again at each gate,
+  and contrib-publish shows the list.
+- **Smaller:** driver-raised questions count toward the failures-in-a-row stop; the soft disk
+  floor is skipped in stub mode; contrib-check measures base changes from the merge base.
+- **Tests:** `tests/smoke/suite.sh` runs in a fresh folder and checks its own results (it
+  once printed old results and looked green); `tests/smoke/unit_fetch.py` runs each attack
+  layout against the clone save.

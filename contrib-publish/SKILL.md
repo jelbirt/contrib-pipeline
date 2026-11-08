@@ -52,6 +52,9 @@ Two driver-owned records back the packet's claims; read both before you vouch fo
   `cargo fmt --check`, workspace clippy as CI runs it, the full YAML suite). Stop if `ok` is not true or `head` is
   not the branch tip. Show `ignored_files` if it is not empty: files the session left that
   git ignores, which the gate did not build with.
+  Show `gone` too: replayed tests that matched no test at the gate (renamed or removed
+  after they passed). Stop and look at each one: a fix must not ship without the test that
+  proves it.
 
 ## 3. Has anything changed? (cheap check, no build)
 Run `~/.claude/skills/contrib-one/bin/contrib-check <slug>`. It fetches, reads the open

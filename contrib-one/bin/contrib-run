@@ -422,6 +422,8 @@ class Driver:
             self.log(f"interrupting {role} (group {pgid})")
             stop_group(pgid, first, grace, self.log)
 
+    guard_blocked = False     # set when the build guard refuses to start: no request can run
+
     def check_stop(self, between=False):
         if between:
             # Between steps, read the stop files now rather than waiting for the watchdog's tick.
@@ -443,7 +445,7 @@ class Driver:
                 gb = c_free_gb()
                 if gb < HARD_DISK_GB:
                     self.request_stop("hard", f"C: free {gb} GB (hard floor {HARD_DISK_GB})")
-                elif gb < SOFT_DISK_GB:
+                elif gb < SOFT_DISK_GB and not (self.args.stub and not self.args.real_requests):
                     self.request_stop("soft", f"C: free {gb} GB (soft floor {SOFT_DISK_GB})")
                 mem = mem_avail_mb()
                 if mem < HARD_MEM_MB:
@@ -500,9 +502,13 @@ class Driver:
         env.update(getattr(self, "identity", {}) or {})
         return env
 
-    def git(self, *a, cwd=None, check=True, env=None):
+    def git(self, *a, cwd=None, check=True, env=None, timeout=1800):
         cmd = ["git", *GIT_SAFE, "-C", str(cwd or self.repo_dir), *a]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env or self.git_env())
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               env=env or self.git_env(), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"git {' '.join(a[:4])}: no answer after {timeout} s")
         if check and r.returncode:
             raise RuntimeError(f"git {' '.join(a[:4])}: {r.stderr.strip()[:300]}")
         return r.stdout.strip()
@@ -598,18 +604,72 @@ class Driver:
         binds it or a host git reads it: a session can write .git, and git follows commondir,
         alternates and symlinked object or ref folders to other repositories on the machine."""
         g = self.clone() / ".git"
+        self.check_git_tree(g)
+        where = self.cgit("rev-parse", "--absolute-git-dir", check=False)
+        if where != str(g):
+            raise RuntimeError(f"git in the clone resolves its git dir to {where!r}, not {g}. Clone kept for a look")
+
+    @staticmethod
+    def check_git_tree(g):
+        """Plain folders and regular files only, every folder listable, nothing that points git at
+        another repository. Raises with the offending path."""
         if not stat.S_ISDIR(os.lstat(g).st_mode):
-            raise RuntimeError(f"{g} is no longer a directory")
+            raise RuntimeError(f"{g} is not a plain directory. Clone kept for a look")
         for rel in ("commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates"):
             if os.path.lexists(g / rel):
                 raise RuntimeError(f"{g / rel} exists; a candidate clone never has one. Clone kept for a look")
-        for rel in ("objects", "refs", "objects/info", "objects/pack", "packed-refs", "HEAD", "shallow"):
-            if (g / rel).is_symlink():
-                raise RuntimeError(f"{g / rel} is a symlink. Clone kept for a look")
-        for root, dirs, files in os.walk(g / "refs"):
+
+        cfg = g / "config"
+        if os.path.lexists(cfg):
+            if not stat.S_ISREG(os.lstat(cfg).st_mode):
+                raise RuntimeError(f"{cfg} is not a regular file. Clone kept for a look")
+            r = subprocess.run(["git", "config", "--file", str(cfg), "--no-includes", "--name-only", "--list"],
+                               capture_output=True, text=True, errors="replace", timeout=30,
+                               env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+            if r.returncode:
+                raise RuntimeError(f"{cfg} does not parse. Clone kept for a look")
+            inc = [k for k in r.stdout.split() if k.lower().startswith(("include.", "includeif."))]
+            if inc:
+                raise RuntimeError(f"{cfg} sets {inc[0]}; a candidate clone never includes other config")
+
+        def unreadable(e):
+            raise RuntimeError(f"cannot list {e.filename}: {e.strerror}. Clone kept for a look")
+
+        for root, dirs, files in os.walk(g, followlinks=False, onerror=unreadable):
             for name in dirs + files:
-                if (Path(root) / name).is_symlink():
-                    raise RuntimeError(f"{Path(root) / name} is a symlink. Clone kept for a look")
+                q = Path(root) / name
+                m = os.lstat(q).st_mode
+                if stat.S_ISLNK(m):
+                    raise RuntimeError(f"{q} is a symlink. Clone kept for a look")
+                if stat.S_ISDIR(m):
+                    if m & 0o500 != 0o500:
+                        raise RuntimeError(f"{q} is not readable and searchable. Clone kept for a look")
+                elif not stat.S_ISREG(m):
+                    raise RuntimeError(f"{q} is not a regular file (a FIFO, socket or device). Clone kept for a look")
+
+    def fetch_from_clone(self, refspec, check=True):
+        """The only way objects leave a candidate clone. A session process may still be changing
+        .git, and git reads whatever the path holds when it opens it, so the host never reads the
+        clone's .git: it hard-links a copy into a folder no session can write (links share file
+        contents, never file types or names), checks the copy, swaps in a minimal config so the
+        session's settings (includes, partial clone, pack limits) cannot steer the host, and
+        fetches from the copy with upload-pack --strict, object checks and a time limit."""
+        self.git_dir_check()
+        snap = WORK / "snap" / self.cand.name
+        shutil.rmtree(snap, ignore_errors=True)
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            r = subprocess.run(["cp", "-a", "-l", "--no-dereference", str(self.clone() / ".git"), str(snap)],
+                               capture_output=True, text=True, errors="replace", timeout=300)
+            if r.returncode:
+                raise RuntimeError(f"could not copy the clone's .git: {r.stderr.strip()[:200]}. Clone kept for a look")
+            self.check_git_tree(snap)
+            (snap / "config").unlink(missing_ok=True)
+            (snap / "config").write_text("[core]\n\trepositoryformatversion = 0\n\tbare = true\n")
+            return self.git("-c", "transfer.fsckObjects=true", "fetch", "-q", "--no-tags", "--upload-pack",
+                            "git-upload-pack --strict", str(snap), refspec, check=check, timeout=600)
+        finally:
+            shutil.rmtree(snap, ignore_errors=True)
 
     def cgit(self, *a, check=True, index=False):
         """git on the candidate clone, in a no-network jail that sees only the clone. The clone's
@@ -638,18 +698,28 @@ class Driver:
         if self.args.stub and not self.args.real_requests:
             out.write_text(f"[stub] would run: {shlex.join(argv)[:4000]}\n")
             return 0, out
-        env = dict(os.environ, CARGO_TARGET_DIR=str(self.target_dir()), LOCK_WAIT="3600")
+        status = self.cand / "results" / f".{rid}.guard"
+        status.unlink(missing_ok=True)
+        env = dict(os.environ, CARGO_TARGET_DIR=str(self.target_dir()), LOCK_WAIT="3600", GUARD_STATUS=str(status))
         if retries is not None:
             env["RETRIES"] = str(retries)
         rc = self.run_tracked("build", [self.prof["GUARD"], shlex.join(argv)], env=env, timeout=REQUEST_TIMEOUT,
                               out=out)
+        said = status.read_text().strip() if status.is_file() else ""
+        status.unlink(missing_ok=True)
+        if rc in (97, 98, 99) and not said:
+            # The command's own exit code, passed through by the guard: not the machine's.
+            with open(out, "a") as f:
+                f.write(f"\n[driver] exit {rc} came from the command, not the guard; recorded as exit 1\n")
+            rc = 1
         if rc == 98:
             self.guard_kills += 1
             if self.guard_kills >= 2:
                 self.request_stop("hard", "the build guard killed two runs for memory or disk")
-        if rc == 99:
+        if rc == 99 and said.startswith("not-started"):
             # The guard did not start the build: low disk, low memory or another build holding
             # the lock for an hour. Nothing after this would get further.
+            self.guard_blocked = True
             self.request_stop("soft", "the build guard could not start a build: " + one_line(
                 (out.read_text(errors="replace").strip().splitlines() or ["no reason given"])[-1], 160))
         return rc, out
@@ -1232,6 +1302,13 @@ class Driver:
                                     "ask again next turn"}) + "\n")
         for n, req in enumerate(reqs):
             self.check_stop()
+            if self.guard_blocked:
+                with open(index, "a") as f:
+                    f.write(json.dumps({"at": now(), "id": "skipped", "kind": "invalid", "exit": 2, "expect": "any",
+                                        "met": False, "infra": True, "secs": 0, "log": "", "note":
+                                        f"{len(reqs) - n} requests not run: the run is stopping "
+                                        f"({one_line(self.stop_reason, 120)})"}) + "\n")
+                raise StopRun()
             if not isinstance(req, dict):
                 req = {"kind": "invalid"}
             rid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(req.get("id") or f"r{int(time.time())}-{n}"))[:60]
@@ -1298,7 +1375,10 @@ class Driver:
             if met and kind == "test" and expect == "pass":
                 log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
                 ran = sum(int(x) for x in re.findall(r"^test result: ok\. (\d+) passed", log, re.M))
-                if ran == 0 and not log.startswith("[stub]"):
+                ignored = sum(int(x) for x in re.findall(r"^test result: \w+\. \d+ passed; \d+ failed; (\d+) ignored", log, re.M))
+                if ran == 0 and ignored and not log.startswith("[stub]"):
+                    met, note = False, (note + "; " if note else "") + f"the test is ignored ({ignored} ignored), not run"
+                elif ran == 0 and not log.startswith("[stub]"):
                     met, note = False, (note + "; " if note else "") + "no test ran: check the target and filter"
             rec = {"id": rid, "at": now(), "kind": kind, "exit": rc, "expect": expect, "met": met, "infra": infra,
                    "secs": int(time.time() - t0), "log": str(Path(out).relative_to(self.cand)), "note": one_line(note, 500)}
@@ -1395,7 +1475,7 @@ class Driver:
             f'"$srv" --insecure --data-dir "$data" --port {JAIL_PORT} > "$data/../node.log" 2>&1 &\n'
             f'for i in $(seq 1 240); do curl -sf -o /dev/null --max-time 2 http://127.0.0.1:{JAIL_PORT}/_cluster/health && break; sleep 0.5; done\n'
             f'curl -sf -o /dev/null --max-time 2 http://127.0.0.1:{JAIL_PORT}/_cluster/health || '
-            '{ echo "the node never became healthy"; tail -n 40 "$data/../node.log"; kill %1 2>/dev/null; exit 99; }\n'
+            '{ echo "the node never became healthy"; tail -n 40 "$data/../node.log"; kill %1 2>/dev/null; exit 1; }\n'
             'rc=0\n'
             f'if [ $# -eq 0 ]; then "$run" --url http://127.0.0.1:{JAIL_PORT} --dir "$ydir" || rc=$?\n'
             f'else for f in "$@"; do "$run" --url http://127.0.0.1:{JAIL_PORT} --verbose --file "$ydir/$f" || rc=$?; done; fi\n'
@@ -1477,8 +1557,7 @@ class Driver:
         slug, branch = self.cand.name, s.get("branch", "")
         n = len(self.wip_refs(slug)) + 1
         keep = f"refs/contrib-keep/{slug}/{n}"
-        self.git_dir_check()
-        self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/heads/*:{keep}/*", check=False)
+        self.fetch_from_clone(f"+refs/heads/*:{keep}/*", check=False)
         notes = []
         head = self.cgit("rev-parse", "--verify", "--quiet", "HEAD", check=False)
         if not re.fullmatch(r"[0-9a-f]{40}", head):
@@ -1511,8 +1590,7 @@ class Driver:
                 notes.append(f"aborted an in-progress {op} (its state is in the snapshot)")
         if branch and self.cgit("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
             inc = f"refs/contrib-incoming/{slug}"
-            self.git_dir_check()
-            self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/heads/{branch}:{inc}")
+            self.fetch_from_clone(f"+refs/heads/{branch}:{inc}")
             new = self.git("rev-parse", inc)
             if new != self.cgit("rev-parse", f"refs/heads/{branch}"):
                 raise RuntimeError("branch copy does not match; clone kept")
@@ -1525,8 +1603,7 @@ class Driver:
         if snap:
             ref = f"refs/contrib-wip/{slug}/{n}"
             self.cgit("update-ref", "refs/contrib-save", snap)
-            self.git_dir_check()
-            self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/contrib-save:{ref}")
+            self.fetch_from_clone(f"+refs/contrib-save:{ref}")
             if self.git("rev-parse", ref) != snap:
                 raise RuntimeError("snapshot copy does not match; clone kept")
             self.state(wip_ref=ref, wip_saved=now(), wip_pending=True)
@@ -1739,7 +1816,7 @@ class Driver:
         self.state(review={"calls": len(verdicts), "usable": len(good), "changes_after": len(after)})
         return ""
 
-    def replay_tests(self):
+    def replay_tests(self, skip_gone=False):
         """The candidate's passing test requests, each (crate, target, filter) once."""
         tests, seen = [], set()
         idx = self.cand / "results" / "index.jsonl"
@@ -1755,7 +1832,13 @@ class Driver:
                 if key not in seen:
                     seen.add(key)
                     tests.append({"kind": "test", "crate": key[0], "target": key[1], "filter": key[2]})
-        return tests
+        # Each final gate replays every test, so one that is still gone is reported again and one
+        # the session restored counts again; contrib-publish shows the gate's list. Only a retest,
+        # which comes after that gate, leaves the gone ones out.
+        if not skip_gone:
+            return tests
+        gone = {tuple(g) for g in (self.st().get("gate") or {}).get("gone_reqs", []) if isinstance(g, list)}
+        return [t for t in tests if (t["crate"], t["target"], t["filter"]) not in gone]
 
     def changed_crates(self, base):
         """Package names of the crates the branch's own commits touch (nearest Cargo.toml)."""
@@ -1852,8 +1935,9 @@ class Driver:
                    if not recs.get(r["id"], {}).get("met") and r["id"] not in gone]
             if gone:
                 self.log(f"candidate {self.cand.name}: gate: {', '.join(gone)} matched no test (renamed or "
-                         "removed since it passed); not counted")
-        self.state(gate={"at": now(), "head": head, "ok": not bad, "gone": gone, "ids": [r["id"] for r in reqs],
+                         "removed since it passed); not counted, shown at publish")
+        self.state(gate={"at": now(), "head": head, "ok": not bad, "gone": gone,
+                               "gone_reqs": [[r["crate"], r["target"], r["filter"]] for r in reqs if r["id"] in gone], "ids": [r["id"] for r in reqs],
                          "crates": crates, "ignored_files": ignored})
         return "; ".join(bad)
 
@@ -1948,6 +2032,7 @@ class Driver:
                 return self.finish("needs-you", asked_by="driver", question=one_line(act.get("reason"), 400),
                                    context="answer to let the same session carry on, or reject the candidate")
             return self.finish("failed", reason=one_line(act.get("reason", f"stage {stage}: {a}"), 300))
+        self.check_stop(between=True)
         gate = self.final_gate()
         if gate:
             return self.finish("needs-you", asked_by="gate",
@@ -2113,7 +2198,8 @@ class Driver:
         self.archive_transcripts(self.cand)
         self.state(status=status, finished=now(), cleanup=note, build_kept=keep_build, **info)
         self.log(f"candidate {self.cand.name}: {status} ({note})")
-        self.failures_in_row = self.failures_in_row + 1 if status == "failed" else 0
+        driver_stop = status == "needs-you" and info.get("asked_by") == "driver"
+        self.failures_in_row = self.failures_in_row + 1 if status == "failed" or driver_stop else 0
         self.done.append((self.cand.name, status))
         self.rebuild_queue()
         self.ledger_commit(f"{self.cand.name}: {status}")
@@ -2190,7 +2276,7 @@ class Driver:
         self.git("fetch", "--quiet", self.prof["UPSTREAM_REMOTE"], self.prof["BASE_BRANCH"])
         base_now = self.git("rev-parse", self.upstream)
         idx = self.cand / "results" / "index.jsonl"
-        tests = self.replay_tests()
+        tests = self.replay_tests(skip_gone=True)
         if not tests:
             raise RuntimeError("no passing test requests are recorded for this candidate; test it by hand")
         if self.clone().exists():

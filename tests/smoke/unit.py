@@ -19,6 +19,8 @@ d = m.Driver.__new__(m.Driver)
 t = Path(tempfile.mkdtemp())
 c = t / "clone"; subprocess.run(["git", "init", "-q", str(c)], check=True)
 d.clone = lambda: c
+# git_dir_check asks git (in the jail, during a run) where the git dir is; here plain host git.
+d.cgit = lambda *a, check=True, **k: subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True).stdout.strip()
 def refused():
     try:
         d.git_dir_check(); return False
@@ -32,4 +34,8 @@ check("plain clone accepted", not refused())
 os.symlink("/home/user/xerj/.git/refs/heads", c / ".git" / "refs" / "x"); check("symlinked ref folder refused", refused())
 os.unlink(c / ".git" / "refs" / "x")
 check("clean again accepted", not refused())
+(c / ".git" / "objects" / "ab").mkdir(exist_ok=True); os.symlink("/home/user/xerj/.git/objects", c / ".git" / "objects" / "ab" / "x")
+check("symlink deep in objects refused", refused()); os.unlink(c / ".git" / "objects" / "ab" / "x")
+(c / ".git" / "HEAD").write_text("garbage\n"); (c / "HEAD").write_text("ref: refs/heads/main\n"); (c / "refs").mkdir(); (c / "objects").mkdir()
+check("fake repository at the clone root refused", refused())
 print("ALL PASS" if ok else "SOME FAILED")
