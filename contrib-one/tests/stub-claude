@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""A stand-in for `claude -p` that acts out the scout and stages A to C, for driver tests.
+It logs one line of checks per call to $STUB_LOG and writes a fake transcript under
+$CONTRIB_TRANSCRIPTS/stubproj/<sid>.jsonl so the driver's review check has something real
+to read. Knobs (env): STUB_CANDS (candidates, default 1), STUB_PREFIX (slug prefix),
+STUB_NEEDS_YOU=<stage> (ask once in that stage), STUB_SLEEP_STAGE + STUB_SLEEP (seconds),
+STUB_BODY (PR body text), STUB_NO_TRANSCRIPT=1, STUB_SHORT_REVIEW=1, STUB_AFTER_REVIEW=1
+(a Bash call after the review), STUB_DENIAL=1 (report one permission denial)."""
+import json, os, re, subprocess, sys, time, uuid
+from pathlib import Path
+
+a = sys.argv[1:]
+def opt(name):
+    return a[a.index(name) + 1] if name in a else None
+
+prompt = opt("-p") or ""
+sid = opt("--session-id") or opt("--resume") or str(uuid.uuid4())
+settings = json.loads(Path(opt("--settings")).read_text()) if opt("--settings") else {}
+root = Path(os.environ.get("CONTRIB_TRANSCRIPTS", "/nonexistent")) / "stubproj"
+root.mkdir(parents=True, exist_ok=True)
+tr = root / f"{sid}.jsonl"
+tr.touch()
+env = os.environ
+cfg = {env.get(f"GIT_CONFIG_KEY_{i}"): env.get(f"GIT_CONFIG_VALUE_{i}") for i in range(int(env.get("GIT_CONFIG_COUNT", "0")))}
+checks = {
+    "sandbox": bool(settings.get("sandbox", {}).get("enabled")),
+    "no_gh_token": not any(k in env for k in ("GH_TOKEN", "GITHUB_TOKEN")),
+    "cred_helper_empty": cfg.get("credential.helper") == "",
+    "feedback_off": env.get("XERJ_DISABLE_FEEDBACK") == "true",
+    "dontAsk": opt("--permission-mode") == "dontAsk",
+    "strict_mcp": "--strict-mcp-config" in a and "--setting-sources" in a,
+    "agents_flag": "--agents" in a,
+    "no_bare": "--bare" not in a,
+    "identity": bool(env.get("GIT_AUTHOR_NAME")),
+}
+
+def say(**kw):
+    with open(env.get("STUB_LOG", "/dev/null"), "a") as f:
+        f.write(json.dumps({"t": time.time(), "sid": sid, "resume": "--resume" in a, "cwd": os.getcwd(), **kw}) + "\n")
+
+def record(*parts, tur=None, role="assistant"):
+    o = {"type": role, "message": {"role": role, "content": list(parts)}}
+    if tur is not None:
+        o["toolUseResult"] = tur
+    with open(tr, "a") as f:
+        f.write(json.dumps(o) + "\n")
+
+def done(text="stub turn"):
+    cf = root / f"{sid}.cost"
+    cost = (float(cf.read_text()) if cf.exists() else 0.0) + 0.5
+    cf.write_text(str(cost))
+    den = [{"tool_name": "Bash", "tool_use_id": "x", "tool_input": {"command": "curl https://example.com"}}] \
+        if env.get("STUB_DENIAL") == "1" else []
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": sid,
+                      "total_cost_usd": cost, "num_turns": 3, "duration_ms": 1200, "duration_api_ms": 900,
+                      "permission_denials": den, "result": text}))
+    sys.exit(0)
+
+def write(p, text):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+
+if prompt.startswith("Scout") or prompt.startswith("Your gh reads"):
+    m = re.search(r"(/\S+)/next\.json", prompt)
+    sdir = Path(m.group(1))
+    say(stage="scout", checks=checks)
+    n, pre = int(env.get("STUB_CANDS", "1")), env.get("STUB_PREFIX", "stub-cand")
+    write(sdir / "candidates.json", json.dumps([{"slug": f"{pre}-{i}", "title": f"Stub candidate {i}",
+          "source": "stub", "issue": None, "why": "stub", "size": "S", "risk": "low",
+          "search_terms": ["stub term"]} for i in range(n)]))
+    write(sdir / "next.json", json.dumps({"action": "stage-done", "summary": "scouted"}))
+    done()
+
+m = re.search(r"(?:Run|Continue) stage ([ABC])", prompt)
+stage = m.group(1) if m else "?"
+nxt = Path(re.search(r"(/\S+/next\.json)", prompt).group(1))
+sdir = nxt.parent
+answered = "answered your needs-you question" in prompt
+answer_kind = ("session" if answered else "gate" if "final gate on a fresh build failed" in prompt
+               else "driver" if "error of its own" in prompt else None)
+say(stage=stage, checks=checks, answered=answered, answer_kind=answer_kind, prompt=prompt[:300])
+if env.get("STUB_SLEEP_STAGE") == stage:
+    time.sleep(float(env.get("STUB_SLEEP", "30")))
+mark = sdir / f".stub_{stage}"
+turn = int(mark.read_text()) + 1 if mark.exists() else 1
+mark.write_text(str(turn))
+
+if env.get("STUB_NEEDS_YOU") == stage and not answered and not (sdir / ".stub_asked").exists():
+    (sdir / ".stub_asked").write_text("1")
+    write(sdir / "next.json", json.dumps({"action": "needs-you", "question": f"Stub question in stage {stage}?",
+                                          "context": "stub"}))
+    done("asked")
+
+if stage == "A":
+    write(sdir / "plan.md", "stub plan\n")
+    write(sdir / "packet.md", "# Stub packet\n\ndraft\n")
+    if turn == 1 and not answered:
+        write(nxt, json.dumps({"action": "run", "requests": [
+            {"id": "a-fail", "kind": "test", "crate": "xerj-api", "target": "stub_test", "expect": "fail"}]}))
+        done()
+    write(nxt, json.dumps({"action": "stage-done", "summary": "investigated"}))
+    done()
+
+if stage == "B":
+    if turn == 1:
+        Path("stub_change.txt").write_text(f"change {time.time()}\n")
+        subprocess.run(["git", "add", "stub_change.txt"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "stub: change"], check=True, capture_output=True)
+        write(nxt, json.dumps({"action": "run", "requests": [
+            {"id": "b-pass", "kind": "test", "crate": "xerj-api", "target": "stub_test", "expect": "pass"}]}))
+        done()
+    write(nxt, json.dumps({"action": "stage-done", "summary": "fixed"}))
+    done()
+
+if stage == "C":
+    flow = "```mermaid\nflowchart TD\n  a --> b\n```\n"
+    write(sdir / "packet.md", "# Stub packet\n\n## Problem\n\n" + flow + "\n## Fix\n\n" + flow)
+    write(sdir / "PR_BODY.md", env.get("STUB_BODY", "Stub body, written by an agent.\n"))
+    report = "short" if env.get("STUB_SHORT_REVIEW") == "1" else ("Review of the stub change. " * 20)
+    write(sdir / "evidence" / "review.md", report + "\n")
+    if env.get("STUB_NO_TRANSCRIPT") != "1":
+        tid = "toolu_" + uuid.uuid4().hex[:12]
+        record({"type": "tool_use", "id": tid, "name": "Agent",
+                "input": {"subagent_type": "code-reviewer", "prompt": "review the diff"}})
+        record({"type": "tool_result", "tool_use_id": tid, "content": [{"type": "text", "text": report}]},
+               role="user", tur={"status": "completed", "agentType": "code-reviewer", "totalToolUseCount": 4,
+                                 "content": [{"type": "text", "text": report}]})
+        if env.get("STUB_AFTER_REVIEW") == "1":
+            record({"type": "tool_use", "id": "toolu_late", "name": "Bash", "input": {"command": "git commit -am late"}})
+    write(nxt, json.dumps({"action": "stage-done", "summary": "finished"}))
+    done()
+
+done("unknown prompt")

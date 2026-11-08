@@ -310,3 +310,33 @@ build. What changed from the sections above:
   the scout on any exit, and swept at the next start. The Read tool is also denied all of
   `/tmp/claude-<uid>`.
 - **Ignored-files log** leaves out the sandbox mask names, so real leftovers show.
+
+## After the first real run (2026-11-08)
+
+Run 1 took one candidate (`max-buckets-cluster-setting`) through scout and stage A. Stage A
+worked as designed, but the driver recorded its fail-first test as not met (the compile-error
+pattern matched cargo's "error: test failed" trailer), so the session stopped with a question.
+Changes since:
+
+- **Fail-first check.** Only `error[E....]:` or `error: could not compile` counts as a compile error.
+- **gh reads.** `--repo` and `--repo=` naming the profile repo are accepted. Arguments, search
+  terms and `--search` values that name a URL, `github.com`, or a `repo:`, `org:`, `user:` or
+  `owner:` qualifier are refused, so the driver's token cannot be pointed at another repo.
+- **`--answer SLUG TEXT`.** Accepted only for a needs-you candidate of the same repo whose clone
+  was saved. The answer is written just before the candidate runs, after preflight, the cap
+  and the stop files, so a run that stops earlier leaves the question as it was. The stage that
+  asked resumes in its own session with the answer; a question raised after stage C (the final
+  gate, or a driver error there) reopens C instead of rerunning the gate on unchanged code.
+  `asked_by` records whether a session, the gate or the driver raised it. A candidate stopped
+  after the answer was recorded continues with `--resume`.
+- **Build folders.** Kept for needs-you candidates (a cold build was 12.6 minutes), dropped
+  after `KEEP_BUILD_DAYS` (default 14) or oldest first while C: is below the start floor.
+- **Audit trail.** Transcripts and subagent transcripts are gzipped into the candidate folder
+  (Claude Code deletes its own after 30 days); `runs/<id>/SUMMARY.md` lists sessions, turns,
+  minutes, cost (this run's share of each session's cumulative figure), denials and driver
+  requests. The ledger is committed again after shutdown and after the exit line.
+- **Instructions.** Sessions are told to read ES source with WebFetch (curl is denied), to make
+  needs-you questions stand alone, and to treat the scout's suggested fix as a hypothesis.
+- **Tests.** `tests/stub-claude` is the permanent stub; stub runs covered the happy path,
+  needs-you then answer, an answer held back by a STOP file, a gate-raised answer reopening C,
+  the refusals, STOP-NOW mid-B with resume.

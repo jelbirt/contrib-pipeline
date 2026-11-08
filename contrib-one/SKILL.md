@@ -26,7 +26,8 @@ nohup ~/.claude/skills/contrib-one/bin/contrib-run --repo xerj-org/xerj --limit 
 ```
 
 Flags: `--limit N` candidates to finish (default 3), `--hours H` deadline, `--topic "..."`
-to steer the scout, `--resume` to pick up stopped candidates first, `--model` and
+to steer the scout, `--resume` to pick up stopped candidates first, `--answer SLUG "TEXT"` to
+answer a needs-you candidate's question and continue only that candidate, `--model` and
 `--scout-model` (defaults `opus` and `sonnet`).
 
 Tell the user how to stop it: `touch ~/contrib-queue/STOP` finishes the current step then

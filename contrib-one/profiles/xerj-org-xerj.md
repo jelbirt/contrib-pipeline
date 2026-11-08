@@ -14,7 +14,8 @@ say so in the packet.
 - CHANGELOG entry under `## [Unreleased]` / `### Fixed` for user-visible changes.
 - Elasticsearch is read for wire semantics only, never copied (AGPL/SSPL/Elastic licence).
   The reference is ES 8.13.4 source: fetch the file you need from
-  `https://raw.githubusercontent.com/elastic/elasticsearch/v8.13.4/<path>` and cite path:line.
+  `https://raw.githubusercontent.com/elastic/elasticsearch/v8.13.4/<path>` with the WebFetch tool
+  and cite path:line. curl and wget are denied in your shell; do not try them.
 - Honest claims only: every number from a command that ran, Verified vs Assumed split.
 - No `Co-Authored-By`. The PR's first line discloses the agent. CLA: jelbirt is already in
   `.contributors`.
@@ -63,7 +64,7 @@ with the `ci-test` profile.
 | `node-start` | none | a fresh scratch node from this candidate's server binary; port in the result |
 | `node-stop` | none | stops it, deletes its data dir |
 | `yaml` | `files` (paths under the YAML dir) or `full: true` | the ES-YAML runner against a fresh node |
-| `gh` | `args` (list) | read-only `gh`: `issue view/list`, `pr view/list/diff/checks`, `search issues/prs`, `api` GET only |
+| `gh` | `args` (list) | read-only `gh`: `issue view/list`, `pr view/list/diff/checks`, `search issues/prs`, `api` GET only. The driver adds the repo; `--repo`/`-R` naming this repo is accepted, any other is refused |
 
 Never ask for a full `cargo test -p <crate>` without a target: it runs the machine out of
 memory. CI runs full suites; list them under Not run.

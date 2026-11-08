@@ -4,6 +4,9 @@ Decide whether this candidate is real, still free, and worth a PR, and pick the 
 You may write tests in this stage, but not the fix.
 
 ## Checklist
+The scout's `why` and any fix it suggests are a hypothesis from a short look, not a finding:
+confirm them from the code before relying on them.
+
 1. **Recheck the claim and overlap** from `gh/` (fresh snapshot for this candidate). Read
    every open PR whose files or title touch the same area. Any overlap: `abandon`.
 2. **Find the code.** Read the paths the candidate names and their callers. Read

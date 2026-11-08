@@ -8,6 +8,7 @@ the home directory hidden. Nothing is pushed or posted: contrib-publish does tha
 person. Design: ../DESIGN.md.
 """
 import argparse
+import gzip
 import datetime
 import fcntl
 import hashlib
@@ -111,6 +112,20 @@ def write_json(p, obj):
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2) + "\n")
     tmp.replace(p)
+
+
+def gz_copy(src, dst):
+    """Gzip src to dst through a temp file, with a fixed mtime so an unchanged file
+    gives the same bytes (and no new ledger blob) every time it is archived."""
+    dst = Path(dst)
+    tmp = dst.with_name(dst.name + ".tmp")
+    try:
+        with open(src, "rb") as i, open(tmp, "wb") as raw, \
+                gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=6) as o:
+            shutil.copyfileobj(i, o)
+        tmp.replace(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def tool_text(c):
@@ -271,10 +286,27 @@ def gh_argv(args, repo):
         return out, ""
     if len(args) < 2 or (args[0], args[1]) not in GH_VERBS:
         return None, f"gh {' '.join(args[:2])} is not on the read-only list"
-    out, i, rest = args[:2], 0, args[2:]
+    out, i, rest = args[:2], 0, []
+    for a in args[2:]:
+        if a.startswith("--") and "=" in a:
+            rest += a.split("=", 1)
+        else:
+            rest.append(a)
+    foreign = re.compile(r"(?i)(\b(repo|org|user|owner)\s*:|github\.com|://)")
     while i < len(rest):
         a = rest[i]
-        if a in GH_FLAGS_BARE:
+        if a in ("--search", "-S") and i + 1 < len(rest) and foreign.search(rest[i + 1]):
+            return None, f"gh {a} may not name a repo, org, user or URL; the driver scopes it to {repo}"
+        if not a.startswith("-") and foreign.search(a):
+            return None, f"gh argument {a!r} names a repo, org, user or URL; only {repo} is readable"
+        if not a.startswith("-") and args[0] != "search" and not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", a):
+            return None, f"gh argument {a!r} is not a number or branch name"
+        if a in ("--repo", "-R") and i + 1 < len(rest):
+            # The driver adds the repo itself; naming the same one is harmless.
+            if rest[i + 1].lower() != repo.lower():
+                return None, f"gh {a} names another repo; only {repo} is readable"
+            i += 2
+        elif a in GH_FLAGS_BARE:
             out.append(a)
             i += 1
         elif a in GH_FLAGS_VALUE and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
@@ -296,6 +328,8 @@ class StopRun(Exception):
 class Driver:
     def __init__(self, args):
         self.args = args
+        self.t_start = time.time()
+        self.answer_cand = None
         self.repo = args.repo
         pdir = Path(os.environ.get("CONTRIB_PROFILE_DIR", SKILL / "profiles"))
         self.prof = load_env(pdir / f"{self.repo.replace('/', '-')}.env")
@@ -387,6 +421,12 @@ class Driver:
             stop_group(pgid, first, grace, self.log)
 
     def check_stop(self, between=False):
+        if between:
+            # Between steps, read the stop files now rather than waiting for the watchdog's tick.
+            if (LEDGER / "STOP-NOW").exists():
+                self.request_stop("hard", "STOP-NOW file")
+            elif (LEDGER / "STOP").exists():
+                self.request_stop("soft", "STOP file")
         if self.stop_kind == "hard" or (between and self.stop_kind == "soft"):
             raise StopRun()
 
@@ -645,6 +685,14 @@ class Driver:
         for d in (WORK / "tmp").glob("*"):
             if d.is_dir() and not d.is_symlink() and re.fullmatch(r"(scout|cand|session)-[\w.-]+", d.name):
                 shutil.rmtree(d, ignore_errors=True)
+        # Build folders are kept only for candidates that will continue (needs-you, stopped).
+        keep = {Path(st["_dir"]).name for st in self.all_states()
+                if st.get("status") in ("needs-you", "stopped", "running")}
+        for base in (WORK / "targets", WORK / "bins"):
+            for d in base.glob("*"):
+                if d.is_dir() and not d.is_symlink() and d.name not in keep and re.fullmatch(r"[\w.-]+", d.name):
+                    shutil.rmtree(d, ignore_errors=True)
+        self.trim_kept_builds()
         gb = c_free_gb()
         if gb < int(self.prof.get("START_GB", 32)) and not (self.args.stub and not self.args.real_requests):
             raise RuntimeError(f"C: has {gb} GB free, below the {self.prof.get('START_GB', 32)} GB start floor")
@@ -691,6 +739,33 @@ class Driver:
         return mine, ready
 
     # ----- ledger --------------------------------------------------------------------
+    def trim_kept_builds(self):
+        """A needs-you candidate keeps its build folder so an answer does not cost a cold build.
+        Those folders go once they are KEEP_BUILD_DAYS old, and oldest first while C: is below the
+        start floor; the candidate then simply rebuilds when answered."""
+        days = float(self.prof.get("KEEP_BUILD_DAYS", 14))
+        floor = int(self.prof.get("START_GB", 32))
+        kept = []
+        for st in self.all_states():
+            if st.get("status") != "needs-you" or not st.get("build_kept"):
+                continue
+            t = WORK / "targets" / Path(st["_dir"]).name
+            age = time.time() - (t.stat().st_mtime if t.is_dir() else 0)
+            kept.append((age, st))
+        kept.sort(key=lambda x: -x[0])          # oldest first
+        for age, st in kept:
+            if age < days * 86400 and c_free_gb() >= floor:
+                continue
+            name = Path(st["_dir"]).name
+            for base in (WORK / "targets", WORK / "bins"):
+                d = base / name
+                if d.is_dir() and not d.is_symlink():
+                    shutil.rmtree(d, ignore_errors=True)
+            d = st.pop("_dir")
+            st["build_kept"] = False
+            write_json(Path(d) / "state.json", st)
+            self.log(f"dropped the kept build folder of {name} ({age / 86400:.1f} days old)")
+
     def all_states(self):
         out = []
         for d in sorted((LEDGER / "candidates").glob("*/state.json")):
@@ -865,7 +940,12 @@ class Driver:
             arg = ["--session-id", new_sid]
         write_json(sess, known)
         cmd = self.claude_cmd(prompt, model, settings, write_dirs, system_text, arg)
-        out = home / "sessions" / f"{stage}-{int(time.time())}.json"
+        stamp = int(time.time())
+        out = home / "sessions" / f"{stage}-{stamp}.json"
+        n = 1
+        while out.exists():
+            out = home / "sessions" / f"{stage}-{stamp}_{n}.json"
+            n += 1
         out.parent.mkdir(exist_ok=True)
         self.log(f"session {stage}: turn starts ({model})")
         env = self.claude_env()
@@ -1032,7 +1112,7 @@ class Driver:
         reqs = reqs[:MAX_REQUESTS_PER_TURN]
         if extra > 0:
             with open(index, "a") as f:
-                f.write(json.dumps({"id": "too-many", "kind": "invalid", "exit": 2, "expect": "any", "met": False,
+                f.write(json.dumps({"at": now(), "id": "too-many", "kind": "invalid", "exit": 2, "expect": "any", "met": False,
                                     "infra": False, "secs": 0, "log": "", "note":
                                     f"{extra} requests past the first {MAX_REQUESTS_PER_TURN} were not run; "
                                     "ask again next turn"}) + "\n")
@@ -1088,14 +1168,14 @@ class Driver:
             met = (not infra) and ((expect == "any") or (expect == "pass" and rc == 0) or (expect == "fail" and rc != 0))
             if met and kind == "test" and expect == "fail":
                 log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
-                if re.search(r"^error(\[E\d+\])?:", log, re.M) or "test result: FAILED" not in log:
+                if re.search(r"^error\[E\d+\]:|^error: could not compile", log, re.M) or "test result: FAILED" not in log:
                     met, note = False, (note + "; " if note else "") + "it did not compile or no test failed"
             if met and kind == "test" and expect == "pass":
                 log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
                 ran = sum(int(x) for x in re.findall(r"^test result: ok\. (\d+) passed", log, re.M))
                 if ran == 0 and not log.startswith("[stub]"):
                     met, note = False, (note + "; " if note else "") + "no test ran: check the target and filter"
-            rec = {"id": rid, "kind": kind, "exit": rc, "expect": expect, "met": met, "infra": infra,
+            rec = {"id": rid, "at": now(), "kind": kind, "exit": rc, "expect": expect, "met": met, "infra": infra,
                    "secs": int(time.time() - t0), "log": str(Path(out).relative_to(self.cand)), "note": one_line(note, 500)}
             if kind == "test" and rc not in (2,) and not req.get("without"):
                 rec["req"] = {k: req[k] for k in ("crate", "target", "filter") if isinstance(req.get(k), str)}
@@ -1645,7 +1725,19 @@ class Driver:
             if stage == "C":
                 self.snapshot(self.cand / "gh")      # fresh view for the last overlap check
                 extra = " The gh/ snapshot was just refreshed: recheck claims and overlapping PRs first."
+            pend = self.st().get("answer_pending")
+            if pend:
+                who = pend.get("asked_by") or "session"
+                lead = {"session": " The user answered your needs-you question. Your question: ",
+                        "gate": " The driver's final gate on a fresh build failed after your stage C. What it said: ",
+                        "driver": " The driver stopped this candidate with an error of its own. What it said: "
+                        }.get(who, " The user answered a question about this candidate. The question: ")
+                extra += (f"{lead}{one_line(pend.get('question'), 400)} The user's answer: "
+                          f"{one_line(pend.get('answer'), 2000)} Act on the answer and continue stage {stage} "
+                          "from where it stopped.")
             act = self.stage_loop(stage, f, self.args.model, extra)
+            if pend:
+                self.state(answer_pending=None, question=None, asked_by=None)
             if stage == "C" and act.get("action") == "stage-done":
                 problems = self.safe_final_checks()
                 if problems and not self.stop_kind:
@@ -1662,7 +1754,7 @@ class Driver:
                 self.log(f"candidate {slug}: stage {stage} done: {one_line(act.get('summary'), 200)}")
                 continue
             if a == "needs-you":
-                return self.finish("needs-you", question=one_line(act.get("question"), 400),
+                return self.finish("needs-you", asked_by="session", question=one_line(act.get("question"), 400),
                                    context=one_line(act.get("context"), 800))
             if a == "abandon":
                 self.reject(slug, act.get("reason", ""))
@@ -1670,9 +1762,150 @@ class Driver:
             return self.finish("failed", reason=one_line(act.get("reason", f"stage {stage}: {a}"), 300))
         gate = self.final_gate()
         if gate:
-            return self.finish("needs-you", question="the driver's own final gate on a fresh build did not pass: "
+            return self.finish("needs-you", asked_by="gate",
+                               question="the driver's own final gate on a fresh build did not pass: "
                                + gate, context="see results/ for the gate-* logs")
         return self.finish("ready", summary=one_line(act.get("summary"), 300))
+
+    def archive_transcripts(self, home):
+        """Copy the sessions' transcripts and their subagents' into the ledger, gzipped: Claude Code
+        deletes its own copies after 30 days. Never raises."""
+        try:
+            sids = set()
+            for f in (home / "sessions").glob("*.json"):
+                try:
+                    sid = json.loads(f.read_text()).get("session_id")
+                except (ValueError, OSError, AttributeError):
+                    continue
+                if isinstance(sid, str) and re.fullmatch(r"[0-9a-f-]{36}", sid):
+                    sids.add(sid)
+            out = home / "transcripts"
+            for sid in sorted(sids):
+                for t in self.transcripts(sid):
+                    files = [(t, out / f"{sid}.jsonl.gz")]
+                    sub = t.parent / sid / "subagents"
+                    if sub.is_dir():
+                        files += [(x, out / f"{sid}-subagents" / (x.name + ".gz")) for x in sorted(sub.iterdir())
+                                  if x.is_file() and not x.is_symlink() and x.suffix in (".jsonl", ".json")]
+                    for src, dst in files:
+                        try:
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            gz_copy(src, dst)
+                        except Exception as e:
+                            self.log(f"transcript archive: {src.name}: {one_line(e, 200)}")
+        except Exception as e:
+            self.log(f"transcript archive for {home.name}: {one_line(e, 200)}")
+
+    def write_summary(self):
+        """runs/<id>/SUMMARY.md: time, cost, denials and driver requests for this run only."""
+        def ts(v):
+            try:
+                return datetime.datetime.fromisoformat(v).timestamp()
+            except (TypeError, ValueError):
+                return 0
+        homes = [("scout", self.run_dir / "scout")] + [(n, LEDGER / "candidates" / n) for n, _ in self.done]
+        lines = [f"# Run {self.run_id}", "",
+                 f"- Ended {now()}, {self.stop_kind or 'done'}: {one_line(self.stop_reason or 'finished', 200)}",
+                 f"- Wall time: {(time.time() - self.t_start) / 60:.0f} min",
+                 "- Outcomes: " + (", ".join(f"{n} ({st})" for n, st in self.done) or "none"), "",
+                 "## Sessions", "", "| Who | Stage | Turns | Model turns | Minutes | Cost (USD) | Denials |",
+                 "|---|---|---|---|---|---|---|"]
+        total, denials = 0.0, []
+        for who, home in homes:
+            per = {}
+            for f in sorted((home / "sessions").glob("*.json")) if (home / "sessions").is_dir() else []:
+                m = re.fullmatch(r"(\w+?)-(\d+)(?:_\d+)?\.json", f.name)
+                if not m:
+                    continue
+                try:
+                    d = json.loads(f.read_text())
+                except (ValueError, OSError):
+                    continue
+                stg, sid = m.group(1), d.get("session_id")
+                cost = d.get("total_cost_usd") if isinstance(d.get("total_cost_usd"), (int, float)) else 0.0
+                p = per.setdefault(stg, {"turns": 0, "mt": 0, "ms": 0, "before": {}, "after": {}, "den": []})
+                if int(m.group(2)) < int(self.t_start):
+                    p["before"][sid] = max(p["before"].get(sid, 0.0), cost)
+                    continue
+                p["turns"] += 1
+                p["mt"] += d.get("num_turns") or 0
+                p["ms"] += d.get("duration_ms") or 0
+                p["after"][sid] = max(p["after"].get(sid, 0.0), cost)
+                for x in d.get("permission_denials") or []:
+                    if isinstance(x, dict):
+                        p["den"].append(f"{x.get('tool_name')}: {one_line(inp_text(x.get('tool_input')), 160)}")
+            for stg, p in per.items():
+                if not p["turns"]:
+                    continue
+                c = sum(max(0.0, v - p["before"].get(k, 0.0)) for k, v in p["after"].items())
+                total += c
+                lines.append(f"| {who} | {stg} | {p['turns']} | {p['mt']} | {p['ms'] / 60000:.1f} | {c:.2f} | {len(p['den'])} |")
+                denials += [f"- {who} {stg}: {x}" for x in p["den"]]
+        lines += ["", f"Total: {total:.2f} USD, API-equivalent as Claude Code reports it (cumulative per session, "
+                      "so a resumed session counts only this run's share).", "", "## Denials", ""]
+        lines += denials or ["None."]
+        lines += ["", "## Driver requests", "", "| Who | Kind | Count | Not met | Infra | Minutes |", "|---|---|---|---|---|---|"]
+        for who, home in homes:
+            idx, agg = home / "results" / "index.jsonl", {}
+            if not idx.exists():
+                continue
+            for line in idx.read_text(errors="replace").splitlines():
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict) or ts(r.get("at")) < self.t_start:
+                    continue
+                a = agg.setdefault(str(r.get("kind")), [0, 0, 0, 0])
+                a[0] += 1
+                a[1] += 0 if r.get("met") else 1
+                a[2] += 1 if r.get("infra") else 0
+                a[3] += r.get("secs") or 0
+            for k, (n, nm, inf, secs) in sorted(agg.items()):
+                lines.append(f"| {who} | {k} | {n} | {nm} | {inf} | {secs / 60:.1f} |")
+        (self.run_dir / "SUMMARY.md").write_text("\n".join(lines) + "\n")
+
+    def answer_setup(self, slug, text):
+        """--answer: record the user's answer on a needs-you candidate; the run then resumes it,
+        and the stage that asked gets the answer in its next prompt."""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug or ""):
+            raise RuntimeError(f"bad slug {slug!r}")
+        cand = LEDGER / "candidates" / slug
+        try:
+            st = json.loads((cand / "state.json").read_text())
+        except (OSError, ValueError):
+            raise RuntimeError(f"no candidate {slug} in the ledger")
+        if st.get("status") == "stopped" and st.get("answer_pending"):
+            raise RuntimeError(f"{slug} already has your answer and was stopped before it finished; "
+                               "continue it with --resume")
+        if st.get("status") != "needs-you":
+            raise RuntimeError(f"{slug} is {st.get('status')!r}, not waiting on an answer")
+        if (st.get("repo") or "").lower() != self.repo.lower():
+            raise RuntimeError(f"{slug} belongs to {st.get('repo')!r}; run --answer with --repo {st.get('repo')}")
+        clone = st.get("clone")
+        if clone and Path(clone).exists():
+            raise RuntimeError(f"{slug}'s clone is still at {clone}: the driver could not save it, so its "
+                               "latest work may exist only there. Look at it, then move it aside and answer again")
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text or "").strip()
+        if not text or len(text) > 2000:
+            raise RuntimeError("the answer must be 1 to 2000 characters")
+        return cand, text
+
+    def answer_write(self, cand, text):
+        """Record the answer just before the candidate runs, so a run that stops earlier
+        (preflight, the open-PR cap, a STOP file) leaves the question as it was."""
+        st = json.loads((cand / "state.json").read_text())
+        rec = {"at": now(), "stage": st.get("stage"), "asked_by": st.get("asked_by") or "session",
+               "question": st.get("question"), "answer": text}
+        st["answers"] = (st.get("answers") or []) + [rec]
+        st["answer_pending"] = rec
+        done = st.get("stages_done") or []
+        if all(x in done for x in ("A", "B", "C")):
+            # Raised after stage C (the final gate, or a driver error there): reopen C, whose
+            # session gets the answer, rather than rerunning the gate on unchanged code.
+            st["stages_done"], st["stage"] = [x for x in done if x != "C"], "C"
+        write_json(cand / "state.json", st)
+        self.log(f"candidate {cand.name}: answer recorded for stage {st['stage']}")
 
     def finish(self, status, **info):
         self.node_stop()
@@ -1680,11 +1913,17 @@ class Driver:
             note = self.save_clone()
         except Exception as e:
             note = f"clone kept: {one_line(e, 200)}"
-            status, info["question"] = "needs-you", note
-        for d in (self.target_dir(), self.bins(), self.session_tmp(self.cand, make=False)):
+            status, info["question"], info["asked_by"] = "needs-you", note, "driver"
+        info.setdefault("asked_by", None)
+        # A needs-you candidate continues with --answer, so its build folder stays (a cold build
+        # is about 13 minutes); every other end drops it. Preflight drops orphans.
+        keep_build = status == "needs-you"
+        drop = [self.session_tmp(self.cand, make=False)] + ([] if keep_build else [self.target_dir(), self.bins()])
+        for d in drop:
             if inside(d, WORK) and d not in (WORK, WORK / "targets", WORK / "bins", WORK / "tmp"):
                 shutil.rmtree(d, ignore_errors=True)
-        self.state(status=status, finished=now(), cleanup=note, **info)
+        self.archive_transcripts(self.cand)
+        self.state(status=status, finished=now(), cleanup=note, build_kept=keep_build, **info)
         self.log(f"candidate {self.cand.name}: {status} ({note})")
         self.failures_in_row = self.failures_in_row + 1 if status == "failed" else 0
         self.done.append((self.cand.name, status))
@@ -1730,6 +1969,7 @@ class Driver:
                 break
         finally:
             self.cand = None
+            self.archive_transcripts(home)
             shutil.rmtree(self.session_tmp(home, make=False), ignore_errors=True)
         raw = read_session_file(sdir / "candidates.json")
         try:
@@ -1828,11 +2068,20 @@ class Driver:
             except Exception as e:
                 print(f"retest: {type(e).__name__}: {e}", file=sys.stderr)
                 return EXIT_SOFT
+        if self.args.answer:
+            try:
+                self.answer_cand = self.answer_setup(*self.args.answer)
+            except RuntimeError as e:
+                print(f"answer: {e}", file=sys.stderr)
+                return 2
         code = EXIT_DONE
         try:
             self.preflight()
             queue = []
-            if self.args.resume:
+            if self.answer_cand:
+                queue = [("resume", str(self.answer_cand[0]))]
+                self.args.limit = 1          # answering runs only that candidate
+            elif self.args.resume:
                 queue = [("resume", s["_dir"]) for s in self.all_states() if s.get("status") == "stopped"]
             while len(self.done) < self.args.limit:
                 self.check_stop(between=True)
@@ -1847,6 +2096,8 @@ class Driver:
                         self.request_stop("soft", "no good candidates left")
                         break
                 kind, item = queue.pop(0)
+                if self.answer_cand and kind == "resume" and item == str(self.answer_cand[0]):
+                    self.answer_write(*self.answer_cand)
                 try:
                     if kind == "resume":
                         self.work_candidate({}, resume_dir=item)
@@ -1858,7 +2109,8 @@ class Driver:
                     self.log(f"candidate error: {e!r}")
                     if not self.cand or self.st().get("status") != "running":
                         raise
-                    self.finish("needs-you", question=f"the driver hit an error on this candidate: "
+                    self.finish("needs-you", asked_by="driver",
+                                question=f"the driver hit an error on this candidate: "
                                 f"{type(e).__name__}: {one_line(e, 200)}")
             if not self.stop_kind:
                 self.stop_kind, self.stop_reason = "done", f"candidate limit reached ({self.args.limit})"
@@ -1876,6 +2128,10 @@ class Driver:
         elif self.stop_kind == "hard":
             code = EXIT_HARD
         self.log(f"exit {code}")
+        try:
+            self.ledger_commit(f"run {self.run_id}: exit {code}")
+        except Exception:
+            pass
         return code
 
     def sweep(self, roots):
@@ -1929,6 +2185,7 @@ class Driver:
                            cleanup=note, last_good_sha=self.git("rev-parse", "--verify", "--quiet", s.get("branch", "-"),
                                                                 check=False) or None,
                            resume=f"contrib-run --repo {self.repo} --resume")
+                self.archive_transcripts(self.cand)
                 self.done.append((self.cand.name, "stopped"))
         except Exception as e:
             leftovers.append(f"candidate cleanup error: {one_line(e, 200)}")
@@ -1959,6 +2216,11 @@ class Driver:
         if any(st == "stopped" for _, st in self.done):
             banner.append(f"> Resume with: `contrib-run --repo {self.repo} --resume`")
         try:
+            self.write_summary()
+            banner.append(f"> Summary: `runs/{self.run_id}/SUMMARY.md`.")
+        except Exception as e:
+            leftovers.append(f"summary error: {one_line(e, 200)}")
+        try:
             self.rebuild_queue(banner)
             self.ledger_commit(f"run {self.run_id}: {self.stop_kind or 'done'}: {reason}")
         except Exception as e:
@@ -1966,6 +2228,10 @@ class Driver:
         for f in ("STOP", "STOP-NOW"):
             (LEDGER / f).unlink(missing_ok=True)
         self.log("shutdown complete" + (f"; leftovers: {leftovers}" if leftovers else "; nothing left running"))
+        try:
+            self.ledger_commit(f"run {self.run_id}: final log")
+        except Exception:
+            pass
         return not leftovers
 
     def recover_stale(self):
@@ -2019,6 +2285,8 @@ def main():
     ap.add_argument("--real-requests", action="store_true", help="with --stub, still run builds and nodes")
     ap.add_argument("--tick", type=float, default=60.0, help="watchdog interval, seconds")
     ap.add_argument("--retest", metavar="SLUG", help="publish-time: re-run a candidate's checks in the jail, then exit")
+    ap.add_argument("--answer", nargs=2, metavar=("SLUG", "TEXT"),
+                    help="answer a needs-you candidate's question and continue it (runs only that candidate)")
     ap.add_argument("--merge", action="store_true", help="with --retest, test a trial merge with the current base")
     sys.exit(Driver(ap.parse_args()).main())
 
