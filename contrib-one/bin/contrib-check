@@ -88,7 +88,7 @@ def main():
     me = prof.get("CONTRIBUTOR", "")
     main_ref = f"{up}/{base}"
     main_sha = git("rev-parse", main_ref)
-    mine = git("diff", "--name-only", f"{made_from}...{branch}").splitlines()
+    mine = git("diff", "--name-only", f"{main_ref}...{branch}").splitlines()
     print(f"branch {branch} at {git('rev-parse', '--short', branch)}, made from {made_from[:9]}, "
           f"{main_ref} now {main_sha[:9]}")
     print(f"files this branch changes: {', '.join(mine)}")
@@ -102,7 +102,7 @@ def main():
     rl = "engine/tests/es-compat-yaml/catch-lenient.txt"
     my_ratchet = set()
     if rl in mine:
-        my_ratchet = {l[1:] for l in git("diff", f"{made_from}...{branch}", "--", rl).splitlines()
+        my_ratchet = {l[1:] for l in git("diff", f"{main_ref}...{branch}", "--", rl).splitlines()
                       if l.startswith("-") and not l.startswith("---")}
 
     # 1. upstream already has it, the issue closed, or someone claimed it
@@ -154,7 +154,9 @@ def main():
         elif shared:
             # Same file is common (es_compat.rs is touched by most PRs). What matters is whether
             # the two changes meet: a trial merge of this branch with that PR's head.
-            f = subprocess.run(["git", "-C", repo_dir, "fetch", "--quiet", up, f"pull/{pr['number']}/head"],
+            prref = f"refs/contrib-check/pr-{pr['number']}"
+            f = subprocess.run(["git", "-C", repo_dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", up,
+                                f"+pull/{pr['number']}/head:{prref}"],
                                capture_output=True, text=True)
             if f.returncode:
                 print(f"could not fetch #{pr['number']}; read it by hand: {pr['title']}")
@@ -162,7 +164,8 @@ def main():
                 continue
             # A PR cut from an older base also "conflicts" in files neither change touched;
             # only clashes in this branch's own files mean the two changes meet.
-            clash = [c for c in merge_tree(repo_dir, branch, "FETCH_HEAD") if c in mine]
+            clash = [c for c in merge_tree(repo_dir, branch, prref) if c in mine]
+            subprocess.run(["git", "-C", repo_dir, "update-ref", "-d", prref], capture_output=True)
             if clash:
                 new = after(pr.get("createdAt"), since)
                 code_clash = set(clash) - DOC_FILES

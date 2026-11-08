@@ -21,7 +21,7 @@ Check first, in this order, and stop to tell the user if one fails:
 Then start it in the background (it outlives the turn and logs to the ledger):
 
 ```bash
-nohup ~/.claude/skills/contrib-one/bin/contrib-run --repo xerj-org/xerj --limit 3 --hours 8 \
+setsid nohup ~/.claude/skills/contrib-one/bin/contrib-run --repo xerj-org/xerj --limit 3 --hours 8 \
   > /dev/null 2>&1 &
 ```
 
@@ -30,8 +30,8 @@ to steer the scout, `--resume` to pick up stopped candidates first, `--answer SL
 answer a needs-you candidate's question and continue only that candidate, `--model` and
 `--scout-model` (defaults `opus` and `sonnet`).
 
-Tell the user how to stop it: `touch ~/contrib-queue/STOP` finishes the current step then
-shuts down; `touch ~/contrib-queue/STOP-NOW` interrupts. Either way the shutdown routine
+Tell the user how to stop it: `touch ~/contrib-queue/STOP` lets the current stage finish (a stage
+can take an hour) then shuts down; `touch ~/contrib-queue/STOP-NOW` interrupts. Either way the shutdown routine
 runs: nothing is deleted that cannot be recovered, and `--resume` continues.
 
 ## Check on it

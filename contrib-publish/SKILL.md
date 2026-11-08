@@ -49,7 +49,7 @@ Two driver-owned records back the packet's claims; read both before you vouch fo
   findings (not only the last) and say which the packet fixed. If it is missing, or no
   report looks like a review of this diff, stop.
 - `state.json` `gate`: the final gate (a fresh clone and a fresh build: the passing tests,
-  clippy on the changed crates, the full YAML suite). Stop if `ok` is not true or `head` is
+  `cargo fmt --check`, workspace clippy as CI runs it, the full YAML suite). Stop if `ok` is not true or `head` is
   not the branch tip. Show `ignored_files` if it is not empty: files the session left that
   git ignores, which the gate did not build with.
 
@@ -68,8 +68,8 @@ trial merges, and prints one verdict, worst first:
 | `retest-merge` | merges cleanly, but the base changed this branch's crates | `contrib-run --retest <slug> --merge`; no rebase |
 | `unchanged` | nothing that matters moved | nothing; the packet's results stand |
 
-A retest replays the candidate's passing test requests, clippy on their crates and the
-full YAML suite, in the jail, one build at a time under the guard. It prints `RETEST ok`
+A retest runs `cargo fmt --check`, replays the candidate's passing test requests, runs
+workspace clippy and the full YAML suite, in the jail, one build at a time under the guard. It prints `RETEST ok`
 or `RETEST failed` with each log's path, and records the result in `state.json`. It cannot
 run while an unattended run holds the ledger lock (exit 40): say so and wait.
 

@@ -35,7 +35,7 @@ LEDGER = Path(os.environ.get("CONTRIB_LEDGER", HOME / "contrib-queue"))
 WORK = Path(os.environ.get("CONTRIB_WORK", HOME / "contrib-work"))
 TOKEN_FILE = Path(os.environ.get("CONTRIB_TOKEN_FILE", HOME / ".config" / "contrib" / "claude-token"))
 EXIT_DONE, EXIT_SOFT, EXIT_HARD, EXIT_SHUTDOWN_FAILED, EXIT_BUSY = 0, 10, 20, 30, 40
-SOFT_DISK_GB, HARD_DISK_GB, HARD_MEM_MB, HARD_MEM_SECS = 26, 22, 2048, 300
+SOFT_DISK_GB, HARD_DISK_GB, HARD_MEM_MB, HARD_MEM_SECS = 32, 26, 2048, 300
 MAX_TURNS = {"A": 8, "B": 10, "C": 6}
 MAX_REQUESTS_PER_TURN = 12
 TURN_TIMEOUT = 45 * 60          # one Claude turn
@@ -55,11 +55,12 @@ GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c"
 # What the driver copies from a session's folder into the ledger's record/ (the session folder
 # itself is ignored by the ledger's git, so nothing a session plants there reaches git).
 RECORD_TOP = ("packet.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json")
-LEDGER_IGNORES = ("candidates/*/session/", "runs/*/scout/session/")
+LEDGER_IGNORES = ("candidates/*/session/", "runs/*/scout/session/", "candidates/*/gh/", "runs/*/scout/gh/",
+                  "candidates/*/transcripts/", "runs/*/scout/transcripts/")
 GH_VERBS = {("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"), ("pr", "diff"),
             ("pr", "checks"), ("search", "issues"), ("search", "prs")}
 GH_FLAGS_VALUE = {"--json", "--limit", "-L", "--state", "-s", "--search", "-S", "--label", "-l", "--author",
-                  "-A", "--jq", "-q", "--sort", "--order", "--match"}
+                  "-A", "--sort", "--order", "--match"}
 GH_FLAGS_BARE = {"--comments", "--name-only", "--patch"}
 JAIL_TOOLS = {"bwrap", "socat", "cargo", "rustc", "xerj", "es-yaml-runner", "guarded.sh", "cc", "ld"}
 
@@ -282,9 +283,6 @@ def gh_argv(args, repo):
             if a == "--paginate":
                 out.append(a)
                 i += 1
-            elif a in ("--jq", "-q") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
-                out += ["--jq", rest[i + 1]]
-                i += 2
             else:
                 return None, f"gh api flag {a!r} is not allowed"
         return out, ""
@@ -498,7 +496,8 @@ class Driver:
         for k in list(env):
             if k.startswith("GIT_"):
                 env.pop(k)
-        env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+        env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"})
+        env.update(getattr(self, "identity", {}) or {})
         return env
 
     def git(self, *a, cwd=None, check=True, env=None):
@@ -508,8 +507,16 @@ class Driver:
             raise RuntimeError(f"git {' '.join(a[:4])}: {r.stderr.strip()[:300]}")
         return r.stdout.strip()
 
+    @staticmethod
+    def gh_env():
+        """gh needs its config and PATH, nothing else from the driver's environment."""
+        env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "GH_CONFIG_DIR")
+               if k in os.environ}
+        env.update(GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", BROWSER="false", NO_COLOR="1")
+        return env
+
     def gh(self, *a):
-        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", BROWSER="false")
+        env = self.gh_env()
         r = subprocess.run(["gh", *a], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=env)
         if r.returncode:
             raise RuntimeError(f"gh {' '.join(a[:3])}: {r.stderr.strip()[:300]}")
@@ -587,10 +594,22 @@ class Driver:
         return WORK / "targets" / (self.target_name or (self.cand.name if self.cand else "_none"))
 
     def git_dir_check(self):
-        """The clone's .git must still be a plain directory before the driver binds or reads it."""
+        """The clone's .git must still be a plain, self-contained repository before the driver
+        binds it or a host git reads it: a session can write .git, and git follows commondir,
+        alternates and symlinked object or ref folders to other repositories on the machine."""
         g = self.clone() / ".git"
         if not stat.S_ISDIR(os.lstat(g).st_mode):
             raise RuntimeError(f"{g} is no longer a directory")
+        for rel in ("commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates"):
+            if os.path.lexists(g / rel):
+                raise RuntimeError(f"{g / rel} exists; a candidate clone never has one. Clone kept for a look")
+        for rel in ("objects", "refs", "objects/info", "objects/pack", "packed-refs", "HEAD", "shallow"):
+            if (g / rel).is_symlink():
+                raise RuntimeError(f"{g / rel} is a symlink. Clone kept for a look")
+        for root, dirs, files in os.walk(g / "refs"):
+            for name in dirs + files:
+                if (Path(root) / name).is_symlink():
+                    raise RuntimeError(f"{Path(root) / name} is a symlink. Clone kept for a look")
 
     def cgit(self, *a, check=True, index=False):
         """git on the candidate clone, in a no-network jail that sees only the clone. The clone's
@@ -619,7 +638,7 @@ class Driver:
         if self.args.stub and not self.args.real_requests:
             out.write_text(f"[stub] would run: {shlex.join(argv)[:4000]}\n")
             return 0, out
-        env = dict(os.environ, CARGO_TARGET_DIR=str(self.target_dir()))
+        env = dict(os.environ, CARGO_TARGET_DIR=str(self.target_dir()), LOCK_WAIT="3600")
         if retries is not None:
             env["RETRIES"] = str(retries)
         rc = self.run_tracked("build", [self.prof["GUARD"], shlex.join(argv)], env=env, timeout=REQUEST_TIMEOUT,
@@ -628,6 +647,11 @@ class Driver:
             self.guard_kills += 1
             if self.guard_kills >= 2:
                 self.request_stop("hard", "the build guard killed two runs for memory or disk")
+        if rc == 99:
+            # The guard did not start the build: low disk, low memory or another build holding
+            # the lock for an hour. Nothing after this would get further.
+            self.request_stop("soft", "the build guard could not start a build: " + one_line(
+                (out.read_text(errors="replace").strip().splitlines() or ["no reason given"])[-1], 160))
         return rc, out
 
     def engine_dir(self):
@@ -822,7 +846,8 @@ class Driver:
         have = gi.read_text().splitlines() if gi.exists() else []
         add = [x for x in LEDGER_IGNORES if x not in have]
         if add:
-            gi.write_text("\n".join(have + ["# Session-written folders: copied to record/ by the driver"] + add) + "\n")
+            head = "# Kept on disk, out of git (contrib-run): session folders are copied to record/"
+            gi.write_text("\n".join(have + ([] if head in have else [head]) + add) + "\n")
         for pat in LEDGER_IGNORES:
             # -f skips git's local-modification check, which would run `git status` inside any
             # nested repo an older driver committed as a gitlink; --cached leaves the files alone.
@@ -1392,7 +1417,7 @@ class Driver:
         if self.args.stub:
             Path(out).write_text("[stub] gh " + shlex.join(argv) + "\n")
             return 0, "stub"
-        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", BROWSER="false")
+        env = self.gh_env()
         r = subprocess.run(["gh", *argv], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=env)
         Path(out).write_text((r.stdout + r.stderr)[:400_000])
         return r.returncode, ""
@@ -1452,9 +1477,9 @@ class Driver:
         slug, branch = self.cand.name, s.get("branch", "")
         n = len(self.wip_refs(slug)) + 1
         keep = f"refs/contrib-keep/{slug}/{n}"
+        self.git_dir_check()
         self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/heads/*:{keep}/*", check=False)
         notes = []
-        self.git_dir_check()
         head = self.cgit("rev-parse", "--verify", "--quiet", "HEAD", check=False)
         if not re.fullmatch(r"[0-9a-f]{40}", head):
             raise RuntimeError(f"HEAD does not resolve in {dst}; its branches are copied under {keep}/, "
@@ -1486,6 +1511,7 @@ class Driver:
                 notes.append(f"aborted an in-progress {op} (its state is in the snapshot)")
         if branch and self.cgit("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
             inc = f"refs/contrib-incoming/{slug}"
+            self.git_dir_check()
             self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/heads/{branch}:{inc}")
             new = self.git("rev-parse", inc)
             if new != self.cgit("rev-parse", f"refs/heads/{branch}"):
@@ -1499,6 +1525,7 @@ class Driver:
         if snap:
             ref = f"refs/contrib-wip/{slug}/{n}"
             self.cgit("update-ref", "refs/contrib-save", snap)
+            self.git_dir_check()
             self.git("fetch", "-q", "--no-tags", str(dst), f"+refs/contrib-save:{ref}")
             if self.git("rev-parse", ref) != snap:
                 raise RuntimeError("snapshot copy does not match; clone kept")
@@ -1522,7 +1549,7 @@ class Driver:
     def stage_loop(self, stage, stage_file, model, extra_prompt=""):
         nxt = self.sdir / "next.json"
         first = True
-        retry_note, last_prompt, errors = "", "", 0
+        retry_note, last_prompt, errors, bad_next = "", "", 0, 0
         turns = 0
         while turns < MAX_TURNS[stage]:
             self.check_stop(between=first)
@@ -1562,17 +1589,22 @@ class Driver:
                 continue
             errors = 0
             turns += 1
-            if not act:
-                return {"action": "failed", "reason": "stage ended without a readable next.json"}
-            a = act.get("action")
+            a = act.get("action") if act else None
             if a == "run":
+                bad_next = 0
                 self.state(stage=stage, last_request=now())
                 self.run_requests(act.get("requests"))
                 continue
             if a in ("stage-done", "needs-you", "abandon"):
                 return act
-            return {"action": "failed", "reason": f"next.json has an unknown action {one_line(a, 40)!r}"}
-        return {"action": "failed", "reason": f"stage {stage} used all {MAX_TURNS[stage]} turns"}
+            why = (f"next.json has an unknown action {one_line(a, 40)!r}" if act
+                   else "the turn ended without a readable next.json (a regular file holding a JSON object)")
+            bad_next += 1
+            if bad_next >= 2:
+                return {"action": "driver-stop", "reason": f"stage {stage}: {why}, twice"}
+            retry_note = f"The driver could not use your last turn: {why}. "
+            continue
+        return {"action": "driver-stop", "reason": f"stage {stage} used all {MAX_TURNS[stage]} turns"}
 
     def final_checks(self):
         """Mechanical checks on stage C output: files exist, flowcharts, no dashes, no attribution."""
@@ -1810,9 +1842,18 @@ class Driver:
             self.request_stop("soft", f"final gate: the machine, not the change, stopped {', '.join(infra)}; "
                                       "resume to run the gate again")
             raise StopRun()
+        gone = []
         if not bad:
-            bad = [f"not met: {r['id']}" for r in reqs if not recs.get(r["id"], {}).get("met")]
-        self.state(gate={"at": now(), "head": head, "ok": not bad, "ids": [r["id"] for r in reqs],
+            def no_test_ran(rec):
+                return rec.get("kind") == "test" and "no test ran" in str(rec.get("note", ""))
+            passed = [r["id"] for r in reqs if r.get("kind") == "test" and recs.get(r["id"], {}).get("met")]
+            gone = [r["id"] for r in reqs if no_test_ran(recs.get(r["id"], {}))] if passed else []
+            bad = [f"not met: {r['id']}" for r in reqs
+                   if not recs.get(r["id"], {}).get("met") and r["id"] not in gone]
+            if gone:
+                self.log(f"candidate {self.cand.name}: gate: {', '.join(gone)} matched no test (renamed or "
+                         "removed since it passed); not counted")
+        self.state(gate={"at": now(), "head": head, "ok": not bad, "gone": gone, "ids": [r["id"] for r in reqs],
                          "crates": crates, "ignored_files": ignored})
         return "; ".join(bad)
 
@@ -1888,7 +1929,10 @@ class Driver:
                 if act.get("action") == "stage-done" and problems and self.stop_kind:
                     raise StopRun()          # stopped before the fix-up turn; resume reruns C
                 if act.get("action") == "stage-done" and problems:
-                    return self.finish("failed", reason="final checks: " + "; ".join(problems))
+                    return self.finish("needs-you", asked_by="driver",
+                                       question="stage C finished twice but the driver's final checks still fail: "
+                                       + one_line("; ".join(problems), 300),
+                                       context="see results/final-checks.txt")
             a = act.get("action")
             if a == "stage-done":
                 self.state(stages_done=self.st().get("stages_done", []) + [stage])
@@ -1900,6 +1944,9 @@ class Driver:
             if a == "abandon":
                 self.reject(slug, act.get("reason", ""))
                 return self.finish("abandoned", reason=one_line(act.get("reason"), 300))
+            if a == "driver-stop":
+                return self.finish("needs-you", asked_by="driver", question=one_line(act.get("reason"), 400),
+                                   context="answer to let the same session carry on, or reject the candidate")
             return self.finish("failed", reason=one_line(act.get("reason", f"stage {stage}: {a}"), 300))
         gate = self.final_gate()
         if gate:
@@ -2164,7 +2211,8 @@ class Driver:
                 except RuntimeError as e:
                     raise RuntimeError(f"the trial merge with the base failed ({one_line(e, 150)}); rebase first")
                 merged = base_now
-            reqs = [dict(t, id=f"retest-{stamp}-t{i}") for i, t in enumerate(tests)]
+            reqs = [{"kind": "fmt", "check": True, "id": f"retest-{stamp}-fmt"}]
+            reqs += [dict(t, id=f"retest-{stamp}-t{i}") for i, t in enumerate(tests)]
             reqs += [{"kind": "clippy", "workspace": True, "crates": crates, "id": f"retest-{stamp}-clippy"},
                      {"kind": "yaml", "full": True, "id": f"retest-{stamp}-yaml"}]
             for r in reqs:
@@ -2198,7 +2246,8 @@ class Driver:
     def main(self):
         signal.signal(signal.SIGINT, self.on_signal)
         signal.signal(signal.SIGTERM, self.on_signal)
-        signal.signal(signal.SIGHUP, self.on_signal)
+        if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+            signal.signal(signal.SIGHUP, self.on_signal)
         threading.Thread(target=self.watchdog, daemon=True).start()
         if self.args.commit_ledger:
             try:
@@ -2234,7 +2283,7 @@ class Driver:
             while len(self.done) < self.args.limit:
                 self.check_stop(between=True)
                 mine, ready = self.open_count()
-                if mine + ready >= int(self.prof.get("MAX_OPEN", 10)):
+                if not self.answer_cand and mine + ready >= int(self.prof.get("MAX_OPEN", 10)):
                     self.request_stop("soft", f"open-PR cap: {mine} open PRs + {ready} ready packets "
                                               f">= {self.prof.get('MAX_OPEN', 10)}")
                     break

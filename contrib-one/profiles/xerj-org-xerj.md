@@ -6,7 +6,8 @@ say so in the packet.
 ## What upstream requires (AGENTS.md, .github/AI_CONTRIBUTIONS.md, docs/CONTRIBUTION_REVIEW.md)
 - A patched defect goes in as a PR with a test that fails before the fix and passes after.
   A suspicion that was not run is worth nothing: abandon it. Never file issues, never batch.
-- `cargo fmt --all`; clippy with `-D warnings` for the touched crates; the crate's tests for
+- `cargo fmt --all`; clippy with `-D warnings` for the touched crates (the driver's gate adds
+  workspace clippy as CI runs it); the crate's tests for
   the touched code; the ES-YAML conformance gate at 0 failed for any engine change.
 - New ES-compatible behaviour gets a YAML case under `engine/tests/es-compat-yaml/yaml/`
   where the runner can express it. If a vendored case was failing, its line in
@@ -64,7 +65,7 @@ with the `ci-test` profile.
 | `node-start` | none | a fresh scratch node from this candidate's server binary; port in the result |
 | `node-stop` | none | stops it, deletes its data dir |
 | `yaml` | `files` (paths under the YAML dir) or `full: true` | the ES-YAML runner against a fresh node |
-| `gh` | `args` (list) | read-only `gh`: `issue view/list`, `pr view/list/diff/checks`, `search issues/prs`, `api` GET only. The driver adds the repo; `--repo`/`-R` naming this repo is accepted, any other is refused |
+| `gh` | `args` (list) | read-only `gh`: `issue view/list`, `pr view/list/diff/checks`, `search issues/prs`, `api` GET only, no `--jq` (parse the JSON yourself). The driver adds the repo; `--repo`/`-R` naming this repo is accepted, any other is refused |
 
 Never ask for a full `cargo test -p <crate>` without a target: it runs the machine out of
 memory. CI runs full suites; list them under Not run.
@@ -86,7 +87,7 @@ entry next to, so two open PRs never conflict on the same lines. Name the anchor
 4. `## Evidence`: each test file, what failed with the fix reverted, what passes now; one line
    on the review pass (counts, what was fixed); the ES-YAML result with the SHA.
 5. `## Checks`: the commands, as checked items.
-6. `## Not run`: full crate suites (CI), workspace clippy, live ES, other platforms, and any
+6. `## Not run`: full crate suites (CI), live ES, other platforms, and any
    gap.
 7. `## Provenance`: **Verified:** and **Assumed:** (what would falsify it).
 Trim pass: cut anything said twice, filler, process narration, and detail the diff shows.

@@ -364,3 +364,23 @@ Changes since:
   timeout in the gate stops the run softly instead of failing the candidate. The YAML run
   waits for `/_cluster/health` and reports a node that never comes up as an infrastructure
   failure.
+
+## Review round 10 (whole pipeline, 2026-11-08)
+
+- gh `--jq` is gone (gojq could read the driver's environment) and host gh runs with an
+  allowlisted environment.
+- Before any host git reads a candidate clone, the driver refuses a `commondir`, `gitdir`,
+  alternates file or symlinked objects or refs: git follows them to other repositories.
+- Host git never reads `~/.gitconfig`; the identity comes from the environment.
+- Disk floors are soft 32 GB and hard 26 GB, matching the guard; a guard that cannot start a
+  build (exit 99) is a soft stop, and the lock wait is one hour.
+- A replayed test that now matches no test is reported in the gate, not counted as a failure,
+  when another replayed test passed.
+- An unreadable next.json gets one retry turn. Used-up turns, two bad next.json files and final
+  checks that still fail after the fix-up turn all become `needs-you` (asked by the driver), so
+  `--answer` can carry the same session on.
+- An inherited SIGHUP ignore (nohup) is kept; the launch line uses `setsid nohup`.
+- `--answer` is not blocked by the open-PR cap; retest checks formatting; gh snapshots and
+  transcripts stay on disk but out of the ledger's git.
+- contrib-check measures the branch from where it meets the base now and fetches PR heads to
+  private refs. The guard's `-j` check reads whole tokens only.
