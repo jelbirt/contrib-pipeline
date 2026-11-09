@@ -500,3 +500,23 @@ Changes since:
   asks for a detached gc, only logging on a repository with missing objects, refusing a live
   `gc.pid` and ignoring a stale one, stopping a gc that runs out of time with its child, and a
   new clone's settings. Each check fails on a copy of the driver with its fix removed.
+
+## The smoke suite's own pipeline clone (2026-11-09)
+
+The stub suite gave the driver the real profile, so every suite run cloned its candidates from
+the real pipeline clone (`~/contrib-work/repos/xerj`) and saved their `fix/smk*` branches and
+commits back into it, which is how the suite's fetch could start the gc above in the clone real
+runs use. `tests/smoke/env.sh` now makes a copy of that clone in the suite's folder and points the
+suite's copy of the profile at it; the driver is unchanged.
+
+- **The copy** is a local mirror clone (object files hard-linked, refs and config its own), made
+  non-bare with a detached HEAD like the real clone, because `repo_gc` skips a bare repository
+  and a mirror can turn a detached HEAD into a checked-out branch. Git never changes an object
+  file in place, so nothing done to the copy changes what the real clone holds. A passing suite
+  deletes the copy, since after the real clone repacks it would be the only holder of the old
+  packs; a failing one keeps it to look at.
+- **The checks:** the 7 smk branches land in the copy; the real clone has no smk refs and none of
+  the copy's smk commits (stub commits have unique ids), and its config is unchanged; preflight's
+  gc ran on the copy. These check the suite's own work rather than a snapshot of the whole real
+  clone, which a real run or a fetch by hand at the same time would also change. env.sh refuses
+  a suite folder whose path the profile rewrite cannot carry, and checks the rewrite.
