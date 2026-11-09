@@ -408,3 +408,55 @@ Changes since:
 - **Tests:** `tests/smoke/suite.sh` runs in a fresh folder and checks its own results (it
   once printed old results and looked green); `tests/smoke/unit_fetch.py` runs each attack
   layout against the clone save.
+
+## Review round 13 (2026-11-08, before resuming the first real candidate)
+
+- **The copy step itself follows nothing.** `cp -a -l` looked every path up again by name,
+  so a session process still alive during a save could swap a folder in `.git` for a symlink
+  while `cp` ran and get host files hard-linked into the copy, and a `.git` swapped for a
+  symlink left `snap/<slug>` as a symlink that `rmtree(ignore_errors=True)` silently kept for
+  the next copy to follow. The driver now copies in Python (`copy_git_dir`): every folder is
+  opened by handle relative to its parent with `O_NOFOLLOW` and checked against what was just
+  looked at, only regular files are linked (and checked after linking), folders are made
+  here with mode 0700, and size and depth are capped. `remove_snap` unlinks a symlink or file
+  in place of the copy and refuses to go on if anything is left. A swap race that won 3 of 5
+  tries against `cp` found nothing in 400 tries against the new copy.
+- **Shutdown does not read a clone while something from the run may still write it.** If a
+  session or build group survives its stop, the clone is kept unread and listed as a leftover.
+- **The last gate step is judged like the others.** The gate cleans untracked files before
+  its final tree check too, so only changes to tracked files count.
+- **A command's own exit 124 is a failure, not a machine problem.** Only the driver's time
+  limit makes 124 infra; a 124 from the command (the YAML runner, say) is recorded as exit 1.
+- **Tests:** `unit_fetch.py` adds the swapped-symlink, leftover-symlink, direct no-follow and
+  read-only-folder cases; `unit_r10.py` gets the same host-git stand-in as `unit.py`.
+
+## Review round 14 (2026-11-08, before resuming the first real candidate)
+
+- **No host check reads the live .git by path.** Round 13 made the copy safe, but
+  `git_dir_check` still checked the session's `.git` in place before every jailed git call and
+  build: an `lstat` then a host `git config --file`, and an `os.walk`, each of which looks the
+  name up again. A swap in between let a session learn whether a host file parses as git
+  config, see host file names in the refusal text, or stall the driver on a FIFO. Now
+  `git_dir_check` checks a copy made by `copy_git_dir` (`git_copy`, in
+  `snap/<slug>.<use>`), then asks jailed git where the git dir is; the save path fetches from
+  that same checked copy.
+- **A build's jail binds a checked copy of .git, not the live one.** bwrap resolves a bind's
+  source when the jail starts, which can be an hour after the check (the guard's lock wait).
+  A `.git` swapped by then for the relative symlink `../../..` bound the home folder,
+  read-only, into the jail with the session's build code: reproduced with a test home, whose
+  token file became readable. `cargo_jail` now binds `snap/<slug>.build`, a path no session
+  can change; a destination swapped by then can only make bwrap refuse to start the jail
+  or put the copy elsewhere inside it. The build
+  copy is replaced at each build and dropped when the candidate ends, after a retest, and
+  (any copy left by a stop) at the next run's start.
+- **The survivor rule now fires, and only for real survivors.** A group still there after
+  SIGKILL during a hard stop or a time limit sets `survived`, and shutdown then keeps the clone
+  unread, as round 13 said. `stop_group` now polls the leader's `Popen` when the driver
+  started it: a killed leader stays a zombie until reaped, and a group holding only a zombie
+  still answered `killpg`, so every time limit waited 50 s and reported a survivor. The node
+  and its bridge keep their `Popen` for the same reason (`node_stop` failed every time, and
+  stopped at the node without signalling the bridge); both are now always stopped.
+- **Tests:** `unit_fetch.py` swaps a folder for a symlink in the middle of the copy (not
+  before it), runs a real jail against a swapped `.git` (with a control that shows the old
+  bind leaking), and checks git still works on the bound copy. All three unit files work in a
+  temp folder they remove at exit, and exit non-zero on a failure.
