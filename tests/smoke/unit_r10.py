@@ -19,6 +19,8 @@ d = m.Driver.__new__(m.Driver)
 t = Path(tempfile.mkdtemp())
 c = t / "clone"; subprocess.run(["git", "init", "-q", str(c)], check=True)
 d.clone = lambda: c
+# git_dir_check asks git (in the jail, during a run) where the git dir is; here plain host git.
+d.cgit = lambda *a, check=True, **k: subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True).stdout.strip()
 def refused():
     try:
         d.git_dir_check(); return False
