@@ -68,22 +68,10 @@ Nothing is pushed or posted without the user's explicit "push and open".
    after the packet is written; the publish step recreates it from the branch.
 
 ## Review packet spec (packet.md)
-Order, each section short:
-1. Header: status, branch, base commit, upstream issue or source, overlap check result.
-2. **Problem, explained**: two or three plain sentences, then a flowchart of what happens
-   today next to what the reference (e.g. ES 8.13) does, using the real request path.
-3. **Fix, explained**: two or three plain sentences, then a flowchart of the changed path
-   showing where the new check or code sits and what each branch now returns.
-4. **Why this fix**: the approaches considered, in a small table, with the critic's verdict.
-5. Proof: fail-before and pass-after test lines, check results, review findings and what
-   was done with each.
-6. Decisions made without the user, each one line, so they can be overturned.
-7. Not covered and follow-up candidates.
-Visual rules: the overnight session writes the two flowcharts as Mermaid blocks in
-packet.md (text, diffable, renders on GitHub and in VS Code). Diagrams name real
-functions and outcomes, no prose inside boxes, at most about eight nodes each. In the
-morning, `contrib-publish` renders the same two diagrams in chat as visuals (the
-visualize widget in the app) before showing the PR body, and offers more on request.
+The packet's shape now lives in `rules/packet.md`, which the driver gives every stage
+session; see "The user's reports, rewritten for review" below for why it changed. The
+original spec (a header, Problem explained, Fix explained, Why this fix, Proof, Decisions,
+Not covered) is in git history.
 
 ## Changes from review round 1 (2026-11-07)
 Verified before adopting: the `upstream` remote has a push URL, the gh token has `repo` and
@@ -551,3 +539,38 @@ reads as a failure of the requests rather than a choice of the driver.
   prompt checks, and the old rules fail the last.
 - **Review:** one pass. It found the lost note after a stop or a resume (important), and raw ids,
   an uncapped list, the scout's count, the dead branch and test gaps (minor); all fixed here.
+
+## The user's reports, rewritten for review (2026-11-09, asked for after the first ready run)
+The first ready packet ran to 2724 words of file:line pointers, request ids and SHAs. It read
+like documentation for a maintainer, and it was hard to decide anything from it. The user
+reviews candidates from every corner of a project (APIs, storage, query planning, settings)
+and is not a specialist in each one, so the packet now answers three questions for that
+reader: what is wrong, in plain technical words; what the options were; what they must
+decide. The full record moves to `session/details.md`.
+- **One spec, given to every stage:** `rules/packet.md` sets the shape (title, a bold status
+  line, an at-a-glance table, then The problem, Options, The fix, Decisions for you, Not
+  covered, Review, Other open PRs nearby, and a footer linking details.md), the reader, the
+  word limit (1100 outside the diagrams) and who writes what. `examples/packet.md`, the
+  max-buckets packet rewritten by hand and approved by the user, is appended as the model.
+  `system_text` gives both to every stage session after the profile. The stage files lost
+  their own packet section and point at the spec.
+- **The driver checks the shape:** `final_checks` runs `packet_problems` on stage C's
+  packet: the title, a status starting **Ready to publish.**, every heading and row, two
+  diagrams, the word limit, no `name.ext:123` pointer, and the details.md link. Each
+  problem goes back to the session as a line, as the other final checks do. `details.md`
+  must exist, has no dashes or attribution, and is recorded with the packet.
+- **QUEUE.md:** each entry is the packet's title (linked) and, for a ready one, its status
+  line. A needs-you entry shows the question on its own line and the exact `--answer`
+  command. A candidate with no packet yet falls back to its state's title and reason.
+  `needs-you` now asks the session to make its question decision 1 of the packet.
+- **SUMMARY.md:** opens with one plain line (outcomes, minutes, cost, why the run ended), a
+  table of candidates linking each packet, and a split of the time between the sessions and
+  the driver's builds and tests. The old tables follow under Details. The QUEUE banner links
+  it.
+- **Skills:** contrib-one's "Explain what it left" and contrib-publish's step 2 now point the
+  user at the packet instead of retelling it, and walk its decisions one at a time.
+- **Tests:** `unit_report.py` checks the example against the rules, each kind of packet
+  problem, the queue's lines and the summary's top block. The committed driver fails it, and
+  so does a driver without the pointer check, the word limit or the needs-you lines. The
+  stub writes a packet in the new shape and a details.md, so the suite runs the shape check
+  on every ready candidate.

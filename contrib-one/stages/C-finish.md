@@ -19,13 +19,18 @@ Get an independent review, act on it, and write the PR body.
    that repeats another, every filler phrase, every claim without evidence. Target the
    profile's word range. Check: no em or en dashes, no attribution, every number traceable
    to `session/evidence/`.
-5. **Finish the packet.** Section 8 (review), final status line in the header (ready for
-   review, with the final SHA), and make sure the two flowcharts are there.
+5. **Finish the packet.** Write Review (counts and what happened to each real finding;
+   the full table goes in `session/details.md`), recheck Other open PRs nearby, fill every
+   at-a-glance row, set the status line to `**Ready to publish.**`, and put the PR title,
+   the PR body's word count, the branch and the final short SHA in the footer. Then reread
+   it as the user will: a reader outside this area should understand the problem, the
+   choice and each decision without opening `details.md`. Cut it to the word limit.
 6. **Overlap, one last time.** The driver refreshed `gh/` just before this stage. Read
    `gh/prs.json` (and any `gh/search-*.json`) for an open PR that is not the user's and
    touches the same behaviour, issue or ratchet line. If one appeared since stage A, stop
    with `needs-you` and name it; do not finish a duplicate.
 7. Leave the worktree clean: everything committed.
 
-End with `stage-done` and a one-line summary the queue can show. The driver then checks the
+End with `stage-done` and a one-line summary in plain words (the queue shows the packet's
+title and status line, so the summary is for the run log). The driver then checks the
 files mechanically; if it finds problems it starts this stage again with the list.

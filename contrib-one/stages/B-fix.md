@@ -23,7 +23,9 @@ Implement the approach in `plan.md`, prove it, and keep the bar green.
 7. Commit: the fix as its own commit with a full body; a runner or harness change as a
    separate commit before it. Never amend or rewrite stage A's test commit; if it needs
    changes, add a commit.
-8. Write `session/packet.md` sections 4 and 5, and add to 6 and 7.
+8. Update the packet: The fix (with its flowchart), the rows The fix, Size, Proof and Risk,
+   and any new decisions or Not covered rows. Add the file-by-file change list and every
+   result you rely on (request id, log path, numbers) to `session/details.md`.
 
 End with `stage-done` when the commits are in, every result you rely on has `met: true`,
 and the packet is updated.

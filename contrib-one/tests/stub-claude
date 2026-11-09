@@ -113,7 +113,8 @@ if env.get("STUB_NEEDS_YOU") == stage and not answered and not (sdir / ".stub_as
 
 if stage == "A":
     write(sdir / "plan.md", "stub plan\n")
-    write(sdir / "packet.md", "# Stub packet\n\ndraft\n")
+    write(sdir / "packet.md", "# Stub bug\n\n**In progress (stage A).** Nothing is posted.\n")
+    write(sdir / "details.md", "# Stub bug: details\n\nstub source\n")
     if turn == 1 and not answered:
         write(nxt, json.dumps({"action": "run", "requests": [
             {"id": "a-fail", "kind": "test", "crate": "xerj-api", "target": "stub_test", "expect": "fail"}]}))
@@ -134,7 +135,14 @@ if stage == "B":
 
 if stage == "C":
     flow = "```mermaid\nflowchart TD\n  a --> b\n```\n"
-    write(sdir / "packet.md", "# Stub packet\n\n## Problem\n\n" + flow + "\n## Fix\n\n" + flow)
+    rows = "".join(f"| **{r}** | stub |\n" for r in
+                   ("Area", "The bug", "Who notices", "The fix", "Size", "Proof", "Risk"))
+    heads = "".join(f"## {h}\n\nstub\n\n" for h in
+                    ("Decisions for you", "Not covered", "Review", "Other open PRs nearby"))
+    write(sdir / "packet.md", "# Stub bug\n\n**Ready to publish.** Nothing is posted.\n\n| | |\n|---|---|\n"
+          + rows + "\n## The problem\n\n" + flow + "\n## Options\n\nstub\n\n## The fix\n\n" + flow
+          + "\n" + heads + "---\nFull record: [details.md](details.md)\n")
+    write(sdir / "details.md", "# Stub bug: details\n\nstub source\n")
     write(sdir / "PR_BODY.md", env.get("STUB_BODY", "Stub body, written by an agent.\n"))
     report = "short" if env.get("STUB_SHORT_REVIEW") == "1" else ("Review of the stub change. " * 20)
     write(sdir / "evidence" / "review.md", report + "\n")

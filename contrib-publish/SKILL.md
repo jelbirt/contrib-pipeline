@@ -11,8 +11,9 @@ candidate.
 
 Where things are, for candidate `<slug>`:
 - Ledger: `~/contrib-queue/candidates/<slug>/`: the driver's `state.json`, `results/`
-  (logs plus `index.jsonl`) and `gh/`; the session's `session/packet.md`,
-  `session/PR_BODY.md` and `session/evidence/`.
+  (logs plus `index.jsonl`) and `gh/`; the session's `session/packet.md` (the user's
+  review), `session/details.md` (the full record behind it), `session/PR_BODY.md` and
+  `session/evidence/`.
 - The branch `fix/<slug>` lives in the pipeline clone `~/contrib-work/repos/xerj` (the
   profile's `REPO_DIR`), which cannot push. The user's checkout (`USER_REPO_DIR`) is used
   only for the final push.
@@ -25,14 +26,15 @@ Where things are, for candidate `<slug>`:
   command, and refuse anything else.
 
 ## 1. Show the queue
-Read `~/contrib-queue/QUEUE.md`. For each ready candidate, one line: title, source, final
-SHA, and its stopping notes. Ask which to review first, or take the one the user names.
+Read `~/contrib-queue/QUEUE.md`. For each ready candidate, one line: its packet's title and
+status line, and how many decisions wait on the user. Ask which to review first, or take
+the one the user names.
 
 ## 2. Explain the candidate
-From `session/packet.md`: draw the "Problem, explained" and "Fix, explained" flowcharts as
-diagrams (visualize tool when available, else the Mermaid as is), each with its two or
-three sentences. Then the proof, the decisions made without the user, and Not covered.
-Keep it short; the user asks for more. Then read the branch's whole diff yourself
+The user reads `session/packet.md` itself (link it); do not retell it. Draw its two
+flowcharts (The problem, The fix) as diagrams with the visualize tool when available, then
+take the packet's Decisions for you one at a time and get the user's answer to each. Use
+`session/details.md` for the evidence behind any claim the user questions. Then read the branch's whole diff yourself
 (`git -C ~/contrib-work/repos/xerj diff <base_sha>..refs/heads/fix/<slug>`, base from
 `state.json`), not only its stat. Always write full ref names (`refs/heads/fix/<slug>`,
 `refs/remotes/upstream/main`): a session can leave a tag with a branch's short name, and git
@@ -40,7 +42,8 @@ reads the tag first. Show the user `git log`, the stat, and every hunk that touc
 the fix's own area: anything under `.github/`, `scripts/`, `tools/`, `.cargo/`, a `build.rs`,
 `Cargo.toml`, `Cargo.lock`, `rust-toolchain*`, test harnesses or the YAML runner, or any
 network, process, file-system or credential handling. Say plainly if the diff does anything
-the packet does not mention; that is a stop, not a note.
+neither the packet nor `session/details.md`'s change list mentions; that is a stop, not a
+note.
 
 Two driver-owned records back the packet's claims; read both before you vouch for it:
 - `results/review-transcript.md`: every code-reviewer call stage C made, in order, with its

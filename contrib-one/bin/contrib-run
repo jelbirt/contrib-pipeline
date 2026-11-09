@@ -60,7 +60,7 @@ GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c"
             "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
 # What the driver copies from a session's folder into the ledger's record/ (the session folder
 # itself is ignored by the ledger's git, so nothing a session plants there reaches git).
-RECORD_TOP = ("packet.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json")
+RECORD_TOP = ("packet.md", "details.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json")
 LEDGER_IGNORES = ("candidates/*/session/", "runs/*/scout/session/", "candidates/*/gh/", "runs/*/scout/gh/",
                   "candidates/*/transcripts/", "runs/*/scout/transcripts/")
 GH_VERBS = {("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"), ("pr", "diff"),
@@ -163,7 +163,13 @@ def read_session_file(p, limit=SESSION_FILE_LIMIT):
         st = os.lstat(p)
         if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
             return None
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+        # Non-blocking, then check what was opened: a FIFO swapped in after the lstat must not
+        # hang the driver.
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            os.close(fd)
+            return None
         with os.fdopen(fd, "rb") as f:
             return f.read(limit).decode("utf-8", errors="replace")
     except OSError:
@@ -206,6 +212,84 @@ def one_line(s, n=300):
     s = re.sub(r"[\x00-\x1f\x7f]+", " ", str(s or ""))
     s = re.sub(r"\s+", " ", s).strip().replace(EM_DASH, ",").replace(EN_DASH, "-")
     return s[:n]
+
+
+# The packet is the user's review of a candidate (rules/packet.md); stage C's output must have
+# this shape, and QUEUE.md and SUMMARY.md show its title and status line.
+PACKET_HEADINGS = ("The problem", "Options", "The fix", "Decisions for you", "Not covered", "Review",
+                   "Other open PRs nearby")
+PACKET_ROWS = ("Area", "The bug", "Who notices", "The fix", "Size", "Proof", "Risk")
+PACKET_MAX_WORDS = 1100
+PACKET_MAX_BYTES = 60_000
+# A source file name and a line number, like search.rs:120 or search.rs#L120. Anchored at the
+# start of the name so a long run of name characters is scanned once, not once per start.
+POINTER_RE = re.compile(r"(?<![\w/.-])[\w/.-]+\.(?:rs|py|go|java|kt|js|ts|tsx|c|h|cc|cpp|hpp|rb|php|cs|swift|"
+                        r"scala|sh|toml|ya?ml|json|md|sql|proto|txt)(?::L?|#L)\d+")
+
+
+def md_text(v, n=300):
+    """Session text as one markdown-inert line: no links, HTML, code spans or table breaks."""
+    return re.sub(r"([\\`\[\]<>|])", r"\\\1", one_line(v, n))
+
+
+def packet_words(text):
+    """Words outside the diagrams; table pipes and other markup alone do not count."""
+    return sum(1 for w in prose(text).split() if re.search(r"[A-Za-z0-9]", w))
+
+
+def prose(text):
+    """The text outside fenced code blocks (the diagrams)."""
+    out, fenced = [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced:
+            out.append(line)
+    return "\n".join(out)
+
+
+def packet_head(text):
+    """(title, status) of a packet: its first line when that is a '# ' title, and the bold
+    status line right under it. Session text, so each is one line with no link brackets."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    if not lines or not lines[0].startswith("# "):
+        return None, None
+    clean = lambda v: md_text(v.replace("**", "").replace("`", ""), 200)
+    title = clean(lines[0][2:]) or None
+    status = clean(lines[1]) if len(lines) > 1 and lines[1].startswith("**") else None
+    return title, status
+
+
+def packet_problems(text):
+    """What a finished packet lacks against rules/packet.md, one line each for the session."""
+    if len(text.encode()) > PACKET_MAX_BYTES:
+        return [f"session/packet.md is {len(text.encode())} bytes; a packet is a short review "
+                f"(at most {PACKET_MAX_WORDS} words), so move detail to session/details.md"]
+    problems = []
+    title, status = packet_head(text)
+    if not title:
+        problems.append("session/packet.md must start with a '# ' title line")
+    if not (status or "").startswith("Ready to publish."):
+        problems.append("the packet's status line (bold, right under the title) must start with **Ready to publish.**")
+    for h in PACKET_HEADINGS:
+        if not re.search(rf"^## {re.escape(h)}[ \t]*$", text, re.M):
+            problems.append(f"session/packet.md is missing the heading '## {h}'")
+    for r in PACKET_ROWS:
+        if not re.search(rf"^\|[ \t]*\*\*{re.escape(r)}\*\*[ \t]*\|", text, re.M):
+            problems.append(f"the packet's at-a-glance table is missing the row **{r}**")
+    if text.count("```mermaid") < 2:
+        problems.append("session/packet.md needs two mermaid flowcharts (the problem and the fix)")
+    words = packet_words(text)
+    if words > PACKET_MAX_WORDS:
+        problems.append(f"session/packet.md has {words} words outside the diagrams, over the limit of "
+                        f"{PACKET_MAX_WORDS}; move detail to session/details.md")
+    m = POINTER_RE.search(prose(text))
+    if m:
+        problems.append(f"session/packet.md has a file:line pointer ({one_line(m.group(0), 80)}); "
+                        "those go in session/details.md")
+    if "(details.md)" not in text:
+        problems.append("the packet's footer must link [details.md](details.md)")
+    return problems
 
 
 def inside(path, root):
@@ -1197,11 +1281,24 @@ class Driver:
             lines.append(f"## {title} ({len(items)})")
             for s in sorted(items, key=lambda s: s.get("updated", ""), reverse=True):
                 slug = Path(s["_dir"]).name
-                note = one_line(s.get("summary") or s.get("question") or s.get("reason") or s.get("stop_reason"), 200)
-                lines.append(f"- [{slug}](candidates/{slug}/session/packet.md): {one_line(s.get('title'), 120)}"
-                             f"{(' (' + note + ')') if note else ''}")
+                name, status = self.report_head(s["_dir"])
+                name = name or packet_head("# " + one_line(s.get("title"), 200))[0] or slug
+                head = f"- [{name}](candidates/{slug}/session/packet.md) (`{slug}`)"
+                if key == "needs-you":
+                    lines += [f"{head}, stage {md_text(s.get('stage'), 10) or '?'}",
+                              f"  - **Question:** {md_text(s.get('question'), 800)}",
+                              f"  - Answer with `contrib-run --repo {self.repo} --answer {slug} \"...\"`"]
+                    continue
+                note = (status if key == "ready" else None) or md_text(
+                    s.get("reason") or s.get("stop_reason") or s.get("summary"), 200)
+                lines.append(f"{head}{(': ' + note) if note else ''}")
             lines.append("")
         (LEDGER / "QUEUE.md").write_text("\n".join(lines).rstrip() + "\n")
+
+    def report_head(self, cand_dir):
+        """(title, status) from a candidate's packet; (None, None) when it has none yet."""
+        t = read_session_file(Path(cand_dir) / "session" / "packet.md")
+        return packet_head(t) if t else (None, None)
 
     def reject(self, slug, reason):
         with open(LEDGER / "rejects.md", "a") as f:
@@ -1381,7 +1478,10 @@ class Driver:
         return res
 
     def system_text(self, stage_file):
-        parts = [(SKILL / "rules" / "common.md").read_text(), self.prof_md,
+        packet = (SKILL / "rules" / "packet.md").read_text()
+        if stage_file[:1] in ("A", "C"):
+            packet += "\n" + (SKILL / "examples" / "packet.md").read_text()
+        parts = [(SKILL / "rules" / "common.md").read_text(), self.prof_md, packet,
                  (SKILL / "stages" / stage_file).read_text()]
         return "\n\n---\n\n".join(parts)
 
@@ -1917,21 +2017,22 @@ class Driver:
         return {"action": "driver-stop", "reason": f"stage {stage} used all {MAX_TURNS[stage]} turns"}
 
     def final_checks(self):
-        """Mechanical checks on stage C output: files exist, flowcharts, no dashes, no attribution."""
+        """Mechanical checks on stage C output: files exist, the packet's shape, no dashes, no attribution."""
         problems = []
         texts = {}
-        for f in ("packet.md", "PR_BODY.md"):
+        for f in ("packet.md", "details.md", "PR_BODY.md"):
             t = read_session_file(self.sdir / f)
             if t is None:
-                problems.append(f"session/{f} missing (or not a regular file)")
+                problems.append(f"session/{f} missing, not a regular file, or over "
+                                f"{SESSION_FILE_LIMIT // 1_000_000} MB")
                 continue
             texts[f] = t
             if EM_DASH in t or EN_DASH in t:
                 problems.append(f"session/{f} contains an em or en dash")
-            if re.search(r"co-authored-by|generated with \[?claude", t, re.I):
+            if f != "details.md" and re.search(r"co-authored-by|generated with \[?claude", t, re.I):
                 problems.append(f"session/{f} contains attribution")
-        if "packet.md" in texts and texts["packet.md"].count("```mermaid") < 2:
-            problems.append("session/packet.md needs two mermaid flowcharts (the problem and the fix)")
+        if "packet.md" in texts:
+            problems += packet_problems(texts["packet.md"])
         review = read_session_file(self.sdir / "evidence" / "review.md")
         if not review or len(review.strip()) < 200:
             problems.append("session/evidence/review.md (the code-reviewer subagent's own report) is missing or empty")
@@ -2312,13 +2413,9 @@ class Driver:
             except (TypeError, ValueError):
                 return 0
         homes = [("scout", self.run_dir / "scout")] + [(n, LEDGER / "candidates" / n) for n, _ in self.done]
-        lines = [f"# Run {self.run_id}", "",
-                 f"- Ended {now()}, {self.stop_kind or 'done'}: {one_line(self.stop_reason or 'finished', 200)}",
-                 f"- Wall time: {(time.time() - self.t_start) / 60:.0f} min",
-                 "- Outcomes: " + (", ".join(f"{n} ({st})" for n, st in self.done) or "none"), "",
-                 "## Sessions", "", "| Who | Stage | Turns | Model turns | Minutes | Cost (USD) | Denials |",
+        lines = ["### Sessions", "", "| Who | Stage | Turns | Model turns | Minutes | Cost (USD) | Denials |",
                  "|---|---|---|---|---|---|---|"]
-        total, denials = 0.0, []
+        total, denials, sess_ms, req_secs = 0.0, [], 0, 0
         for who, home in homes:
             per = {}
             for f in sorted((home / "sessions").glob("*.json")) if (home / "sessions").is_dir() else []:
@@ -2347,12 +2444,13 @@ class Driver:
                     continue
                 c = sum(max(0.0, v - p["before"].get(k, 0.0)) for k, v in p["after"].items())
                 total += c
+                sess_ms += p["ms"]
                 lines.append(f"| {who} | {stg} | {p['turns']} | {p['mt']} | {p['ms'] / 60000:.1f} | {c:.2f} | {len(p['den'])} |")
                 denials += [f"- {who} {stg}: {x}" for x in p["den"]]
         lines += ["", f"Total: {total:.2f} USD, API-equivalent as Claude Code reports it (cumulative per session, "
-                      "so a resumed session counts only this run's share).", "", "## Denials", ""]
+                      "so a resumed session counts only this run's share).", "", "### Denials", ""]
         lines += denials or ["None."]
-        lines += ["", "## Driver requests", "", "| Who | Kind | Count | Not met | Infra | Minutes |", "|---|---|---|---|---|---|"]
+        lines += ["", "### Driver requests", "", "| Who | Kind | Count | Not met | Infra | Minutes |", "|---|---|---|---|---|---|"]
         for who, home in homes:
             idx, agg = home / "results" / "index.jsonl", {}
             if not idx.exists():
@@ -2371,7 +2469,26 @@ class Driver:
                 a[3] += r.get("secs") or 0
             for k, (n, nm, inf, secs) in sorted(agg.items()):
                 lines.append(f"| {who} | {k} | {n} | {nm} | {inf} | {secs / 60:.1f} |")
-        (self.run_dir / "SUMMARY.md").write_text("\n".join(lines) + "\n")
+                req_secs += secs
+        words = {"ready": "ready for your review", "needs-you": "waiting on your decision",
+                 "stopped": "stopped mid-way", "failed": "failed", "abandoned": "abandoned"}
+        counts = {}
+        for _, st in self.done:
+            counts[st] = counts.get(st, 0) + 1
+        outcome = ", ".join(f"{n} {words.get(st, st)}" for st, n in counts.items()) or "No candidate was worked"
+        top = [f"# Run {self.run_id}", "",
+               f"**{outcome[0].upper() + outcome[1:]}.** {(time.time() - self.t_start) / 60:.0f} min, "
+               f"{total:.2f} USD. Ended {now()} ({self.stop_kind or 'done'}): "
+               f"{md_text(self.stop_reason or 'finished', 200).rstrip('.')}.", ""]
+        if self.done:
+            top += ["| Candidate | Outcome | Report |", "|---|---|---|"]
+            for n, st in self.done:
+                title = self.report_head(LEDGER / "candidates" / n)[0] or n
+                top.append(f"| {title} | {words.get(st, st)} | [packet](../../candidates/{n}/session/packet.md) |")
+            top.append("")
+        top += [f"Time: the sessions worked {sess_ms / 60000:.0f} min; the driver's builds, tests and suites "
+                f"took {req_secs / 60:.0f} min between their turns.", "", "## Details", ""]
+        (self.run_dir / "SUMMARY.md").write_text("\n".join(top + lines) + "\n")
 
     def answer_setup(self, slug, text):
         """--answer: record the user's answer on a needs-you candidate; the run then resumes it,
@@ -2751,7 +2868,7 @@ class Driver:
             banner.append(f"> Resume with: `contrib-run --repo {self.repo} --resume`")
         try:
             self.write_summary()
-            banner.append(f"> Summary: `runs/{self.run_id}/SUMMARY.md`.")
+            banner.append(f"> Summary: [runs/{self.run_id}/SUMMARY.md](runs/{self.run_id}/SUMMARY.md).")
         except Exception as e:
             leftovers.append(f"summary error: {one_line(e, 200)}")
         try:

@@ -58,8 +58,9 @@ for it again if you still need it. Put the requests you need most first.
 - `stage-done` only when the stage's own checklist is complete and its outputs are written.
 - `needs-you` for a decision that is the user's: a design choice with real trade-offs, a
   behaviour change a maintainer might reject, scope larger than the profile allows. Write
-  what you found to the packet first, so the user can decide from it. Write the question so
-  it stands alone: the user reads it in the queue, not your transcript. They answer with
+  what you found to the packet first, with the status line `**Needs your decision.**` and
+  the question as decision 1, so the user can decide from the packet alone. Write the
+  question so it stands alone too: the user reads it in the queue, not your transcript. They answer with
   `contrib-run --answer`; you then continue in this same session with the answer in the prompt.
 - `abandon` when the candidate is claimed, overlaps an open PR, does not reproduce, or is not
   worth a maintainer's time. Say why in one line.

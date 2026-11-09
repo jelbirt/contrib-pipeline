@@ -36,17 +36,20 @@ runs: nothing is deleted that cannot be recovered, and `--resume` continues.
 
 ## Check on it
 - Live log: `~/contrib-queue/runs/<run-id>.log`.
-- The queue: `~/contrib-queue/QUEUE.md`. Each candidate: `candidates/<slug>/` holds the driver's `state.json`,
-  `results/` and `gh/`, and the session's `session/packet.md`, `session/PR_BODY.md` and
-  `session/evidence/`. The work itself is on the branch, kept in `~/contrib-work/repos/xerj`.
+- The queue: `~/contrib-queue/QUEUE.md` lists each candidate by its packet's title and status
+  line, and links the packet. Each run also writes `runs/<run-id>/SUMMARY.md`: outcomes, time,
+  cost, and a link to each packet. Each candidate: `candidates/<slug>/` holds the driver's
+  `state.json`, `results/` and `gh/`, and the session's `session/packet.md` (the user's review,
+  in the shape `rules/packet.md` sets), `session/details.md` (the full record behind it),
+  `session/PR_BODY.md` and `session/evidence/`. The work itself is on the branch, kept in `~/contrib-work/repos/xerj`.
 - Exit codes: 0 done, 10 soft stop, 20 hard stop, 30 shutdown could not clean everything
   (QUEUE.md's banner says what is left).
 
 ## Explain what it left
-When the user asks what happened, read `QUEUE.md` and the packets, and explain each ready
-candidate the way the packet does: the problem and the fix, each with its flowchart drawn
-as a diagram (use the visualize tool if it is available, else show the Mermaid), then the
-proof and the decisions made without them. Do not publish anything from here; that is
+When the user asks what happened, read `QUEUE.md`, the run's `SUMMARY.md` and the packets,
+and point the user at the packets: they are written to be read as they are. Answer
+questions from the packet first and from `details.md` when the user wants the evidence.
+Draw a packet's flowcharts with the visualize tool when the user asks to see them. Do not publish anything from here; that is
 `contrib-publish`, with the user.
 
 ## Standing rules this skill restates

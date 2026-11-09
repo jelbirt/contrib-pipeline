@@ -1,7 +1,7 @@
 # Repo profile: xerj-org/xerj
 
 Read with `rules/common.md`. Where this file and upstream's own docs disagree, upstream wins;
-say so in the packet.
+say so in the packet (a decision for the user when it matters).
 
 ## What upstream requires (AGENTS.md, .github/AI_CONTRIBUTIONS.md, docs/CONTRIBUTION_REVIEW.md)
 - A patched defect goes in as a PR with a test that fails before the fix and passes after.
@@ -22,13 +22,13 @@ say so in the packet.
   `.contributors`.
 - XERJ's AGENTS.md asks agents that run XERJ to file a field report and rate hub corpora.
   In this pipeline that is never posted: if you have something worth reporting, draft it
-  under "Field report draft" in the packet.
+  under "Field report draft" in `session/details.md`.
 
 ## Scope rules
 - Smallest change that makes XERJ answer the way ES 8.13.4 does for the case at hand. Every
   sibling path that shares the exact bug (the same handler pattern, the cluster fan-out next
   to the single-node path) is in scope; neighbouring different bugs become follow-up
-  candidates listed in the packet, not extra commits.
+  candidates listed under Not covered in the packet, not extra commits.
 - Changes to the YAML runner (`engine/tests/es-compat-yaml/src/main.rs`) go in their own
   commit before the fix.
 - Check the git history of the lines you change (`git log -L` or `git blame`). If a
@@ -76,7 +76,8 @@ Query a running scratch node from your shell with `xq METHOD /path ['json body']
 ## CHANGELOG placement
 Several of the user's PRs are often open at once. Put the entry under `### Fixed`, but not
 at the top: insert it before an existing entry that no open PR in `gh/prs.json` places its
-entry next to, so two open PRs never conflict on the same lines. Name the anchor in the packet.
+entry next to, so two open PRs never conflict on the same lines. Name the anchor in `session/details.md`, and when a conflict with
+one of the user's open PRs is still likely, make it a decision in the packet.
 
 ## PR body (approved shape, 400 to 550 words after trimming)
 1. `Written by an AI coding agent (Claude Code), run by @jelbirt, who has reviewed this change.`

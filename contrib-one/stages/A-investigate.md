@@ -26,23 +26,10 @@ confirm them from the code before relying on them.
 6. **Decide scope.** The smallest change that matches the reference fully for the reported
    case and its direct siblings. If the right fix is larger than the profile allows, or
    changes behaviour a maintainer chose on purpose, end with `needs-you`.
-7. **Write `session/packet.md` sections 1 to 3** (see Packet below) and `session/plan.md`: the approach, the
-   files, the tests, and what is out of scope.
+7. **Write the packet** (`session/packet.md`, stage A's part, as the packet rules above
+   describe), start `session/details.md` with the source, base SHA, reference
+   citations, the reproduction result and the critic's full answer, and write
+   `session/plan.md`: the approach, the files, the tests, and what is out of scope.
 
 End with `stage-done` once the failing test is recorded (`met: true` with expect fail) and the
 packet and plan are written.
-
-## Packet (shared by stages A to C; the user reads this in the morning)
-`packet.md`, in this order:
-1. Header: title, source (issue link or ratchet line), branch, base SHA, status line.
-2. **Problem, explained:** two or three plain sentences, then a Mermaid flowchart
-   (```` ```mermaid ````, `flowchart TD` or `LR`, at most 8 nodes, real function and endpoint
-   names) of today's path next to the reference's.
-3. **Approaches considered:** the options, the critic's view, and the choice with its reason.
-4. **Fix, explained:** two or three sentences plus a Mermaid flowchart of the changed path,
-   with the new step marked. (Stage B.)
-5. **Proof:** before and after test runs, YAML results, numbers, each pointing at its file
-   in `results/` or `session/evidence/`. (Stages B and C.)
-6. **Decisions made without you:** every choice the user might have made differently.
-7. **Not covered:** what is left, and whether it deserves its own PR.
-8. **Review:** the reviewer's findings and what was done with each. (Stage C.)
