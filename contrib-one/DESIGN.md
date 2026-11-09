@@ -460,3 +460,43 @@ Changes since:
   before it), runs a real jail against a swapped `.git` (with a control that shows the old
   bind leaking), and checks git still works on the bound copy. All three unit files work in a
   temp folder they remove at exit, and exit non-zero on a failure.
+
+## Background gc (2026-11-08, found by the smoke suite)
+
+- **What happened.** A suite run failed in one case: `git clone` of the pipeline clone stopped
+  with "failed to copy file ... .tmp-...-pack ...: No such file or directory". The fetch just
+  before it had pushed the pipeline clone past git's limit of 50 packs, so git started
+  `gc --auto` in the background, and that gc was rewriting the packs while the clone copied
+  them. The same can happen in a real run: preflight fetches, then a candidate is cloned.
+  Every suite run adds about 7 packs to the pipeline clone, which is how it reached 51.
+- **No automatic gc from the driver.** `GIT_SAFE` now carries `gc.auto=0` and
+  `maintenance.auto=false`, so no driver git command (host or jail, pipeline clone, candidate
+  clone or ledger) starts one. A new candidate clone gets the same two settings in its own
+  config: a session's commit would otherwise start a background gc there that outlives the
+  session (gc detaches into its own session) and rewrites packs while the driver copies `.git`.
+  Clones also inherited all 51 packs, so the first session commit would have started one.
+- **gc runs in preflight instead** (`repo_gc`), for the pipeline clone and the ledger: in the
+  foreground, before the run reads either, with git's default limits (6700 loose objects, 50
+  packs). A failed gc is logged and the run goes on.
+- **Review of this change** found that the first `repo_gc` still let a pack rewrite overlap the
+  run in two ways, both reproduced. (1) On its time limit only `git gc` was killed; its
+  `repack` and `pack-objects` children kept rewriting packs while the run cloned. gc now runs
+  through `run_tracked` in its own process group, so a time limit or a hard stop ends all of
+  it, and a time limit stops the run. (2) `gc --auto` returns at once when another gc holds
+  `gc.pid`, and other tools (`contrib-check`'s fetches, a fetch by hand) still started
+  background gc in the pipeline clone. `repo_gc` now writes `gc.auto 0` and
+  `maintenance.auto false` into the pipeline clone's and the ledger's own config, and stops the
+  run when `gc.pid` names a live gc on this host (one older than 12 hours is stale, as in git).
+- **Why that gc failed.** The pipeline clone was made from a copy of a `blob:none` partial
+  clone without its partial-clone settings: 12 `.promisor` packs, 8528 history blobs missing
+  (none in the base tree, so builds worked). `gc` could never finish, and a session running
+  `git log -p` or `git blame` on old history would have hit read errors. Repaired by hand with
+  `git fetch --refetch --tags upstream` (26 s, 0 objects missing after), deleting the failed
+  gc's 170 MB temp pack and `gc.log`, removing the stale `.promisor` marker, and a foreground
+  gc: 2 packs, 258 MiB, fsck clean.
+- **Tests:** `unit_gc.py` shows a plain fetch starting gc in a repository over its limit and
+  the driver's fetch starting neither gc nor maintenance, each `GIT_SAFE` setting on its own,
+  `repo_gc` packing a repository over the limit before it returns even when the repository
+  asks for a detached gc, only logging on a repository with missing objects, refusing a live
+  `gc.pid` and ignoring a stale one, stopping a gc that runs out of time with its child, and a
+  new clone's settings. Each check fails on a copy of the driver with its fix removed.

@@ -11,7 +11,7 @@ it runs on its own can push, open a pull request or post anywhere.
 | `contrib-one/` | The driver skill. `bin/contrib-run` runs the loop (scout, stages A, B, C, final gate); `bin/contrib-check` checks a branch for overlap and base drift; `bin/xq` lets sessions reach their scratch node; `rules/`, `stages/` and `profiles/` are what the sessions read. |
 | `contrib-publish/` | The interactive skill for the morning: explain each packet, check what changed, retest only when needed, and push on an explicit go. |
 | `tools/guarded.sh` | The build guard: `-j 4`, disk and memory floors, one build at a time. |
-| `tests/` | `smoke/suite.sh` runs the driver against a stub Claude; `smoke/unit.py` and `exploit/` are targeted checks. |
+| `tests/` | `smoke/suite.sh` runs the driver against a stub Claude; `smoke/unit*.py` and `exploit/` are targeted checks. |
 | `notes/` | Findings from the first real run and the whole-pipeline review. |
 
 `contrib-one/DESIGN.md` is the full design and the record of every review round.

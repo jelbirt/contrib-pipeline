@@ -53,7 +53,11 @@ JAIL_PORT = 19200               # the scratch node's port inside its own network
 SETTING_SOURCES = ""            # sessions load no user, project or local settings
 EM_DASH, EN_DASH = chr(0x2014), chr(0x2013)
 GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "credential.helper=",
-            "-c", "core.pager=cat"]
+            "-c", "core.pager=cat",
+            # No automatic gc or maintenance: git starts it in the background, where it rewrites
+            # the packs a clone or a .git copy is reading at that moment. Preflight runs gc in the
+            # foreground instead (repo_gc).
+            "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
 # What the driver copies from a session's folder into the ledger's record/ (the session folder
 # itself is ignored by the ledger's git, so nothing a session plants there reaches git).
 RECORD_TOP = ("packet.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json")
@@ -230,6 +234,26 @@ def alive(pid):
         return False
     except PermissionError:
         return True
+
+
+def gc_running(path):
+    """The pid in .git/gc.pid while that gc is alive on this host, else None. git itself treats
+    a gc.pid older than 12 hours as stale, and so does this."""
+    f = Path(path) / ".git" / "gc.pid"
+    try:
+        pid, host = f.read_text().split()[:2]
+        pid = int(pid)
+        if time.time() - f.stat().st_mtime > 12 * 3600 or host != socket.gethostname():
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    return pid
 
 
 def stop_group(pgid, first=signal.SIGTERM, grace=30, log=None, proc=None):
@@ -956,6 +980,8 @@ class Driver:
         for rem in self.git("remote", check=False).split():
             if self.git("remote", "get-url", "--push", rem) != "no_push":
                 raise RuntimeError(f"remote {rem} of {self.repo_dir} can push; set its push URL to no_push")
+        self.repo_gc(self.repo_dir)
+        self.repo_gc(LEDGER)
         if self.args.stub:
             self.log("preflight ok (stub)")
             return
@@ -981,6 +1007,34 @@ class Driver:
         if r.returncode or '"is_error":true' in r.stdout.replace(" ", ""):
             raise RuntimeError("claude cannot start a sandboxed session: " + (r.stdout + r.stderr).strip()[-300:])
         self.log("preflight ok")
+
+    def repo_gc(self, path, timeout=1800):
+        """Automatic gc is off for every driver git command (GIT_SAFE) and, from the first run on,
+        in the pipeline clone's and the ledger's own config, so other tools (contrib-check, a fetch
+        by hand) do not start one there either. gc runs here instead: in the foreground, in its own
+        process group (a time limit or a hard stop ends all of it, children included), before this
+        run reads the repository, and only when git's own limits say it is due. A gc that fails is
+        logged and the run goes on; one already running, or one that runs out of time, stops it."""
+        path = Path(path)
+        if not (path / ".git").is_dir():
+            return
+        self.git("config", "gc.auto", "0", cwd=path)
+        self.git("config", "maintenance.auto", "false", cwd=path)
+        live = gc_running(path)
+        if live:
+            raise RuntimeError(f"a git gc is running in {path} (pid {live}); start the run once it has finished")
+        out = self.run_dir / f"gc-{path.name}.log"
+        rc = self.run_tracked("gc", ["git", *GIT_SAFE, "-C", str(path), "-c", "gc.auto=6700",
+                                     "-c", "gc.autoPackLimit=50", "-c", "gc.autoDetach=false",
+                                     "gc", "--auto", "--quiet"],
+                              env=self.git_env(), timeout=timeout, out=out)
+        if self.last_timed_out:
+            raise RuntimeError(f"git gc in {path} did not finish in {timeout} s and was stopped")
+        tail = out.read_text(errors="replace").strip()[-300:] if out.exists() else ""
+        out.unlink(missing_ok=True)
+        if rc:
+            self.log(f"git gc in {path} failed (exit {rc}); the run goes on, but the repository "
+                     f"needs a look: {tail}")
 
     def open_count(self):
         if self.args.stub:
@@ -1676,6 +1730,10 @@ class Driver:
         self.git("clone", "--quiet", "--no-hardlinks", "--no-checkout", "--origin", "pipeline", str(self.repo_dir),
                  str(dst))
         self.git("remote", "set-url", "--push", "pipeline", "no_push", cwd=dst)
+        # A session's own git runs with the clone's config, and a commit there could start a
+        # background gc that outlives the session and rewrites packs while the driver copies .git.
+        self.git("config", "gc.auto", "0", cwd=dst)
+        self.git("config", "maintenance.auto", "false", cwd=dst)
         # Inside the session sandbox, Claude Code masks shell and git startup files in the
         # working folder with /dev/null devices; git would list them as untracked and fail to
         # add them. info/ is not writable from a session, so this list holds.
