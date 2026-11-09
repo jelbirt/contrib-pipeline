@@ -458,6 +458,7 @@ class Driver:
 
     guard_blocked = False     # set when the build guard refuses to start: no request can run
     survived = False          # set when a stopped process group was still there after SIGKILL
+    cut_note = ""             # names the requests run_requests skipped, for the session's next prompt
 
     def check_stop(self, between=False):
         if between:
@@ -1505,14 +1506,25 @@ class Driver:
         index = res_dir / "index.jsonl"
         if not isinstance(reqs, list):
             reqs = []
-        extra = len(reqs) - MAX_REQUESTS_PER_TURN
+        # A session is told this limit in rules/common.md; the cut is also named at the top of its
+        # next prompt (cut_note), kept in state.json across a stop or a resume: in the 2026-11-09 run
+        # a line in index.jsonl alone was missed.
+        left = reqs[MAX_REQUESTS_PER_TURN:]
         reqs = reqs[:MAX_REQUESTS_PER_TURN]
-        if extra > 0:
+        self.cut_note = ""
+        if left:
+            total, first = len(reqs) + len(left), MAX_REQUESTS_PER_TURN + 1
+            # Named as they would run (the rid rule below), so a session's own words never reach the prompt.
+            ids = [re.sub(r"[^A-Za-z0-9_.-]", "_", str(r["id"]))[:60] if isinstance(r, dict) and r.get("id")
+                   else "(no id)" for r in left]
+            shown = ", ".join(ids[:12]) + (f", and {len(ids) - 12} more" if len(ids) > 12 else "")
+            which = (f"request {first} did not run and has no result" if len(left) == 1 else
+                     f"requests {first} to {total} did not run and have no result")
+            self.cut_note = (f"Only the first {MAX_REQUESTS_PER_TURN} of your {total} requests ran; {which} "
+                             f"(ids: {shown}). Ask again for any you still need.")
             with open(index, "a") as f:
                 f.write(json.dumps({"at": now(), "id": "too-many", "kind": "invalid", "exit": 2, "expect": "any", "met": False,
-                                    "infra": False, "secs": 0, "log": "", "note":
-                                    f"{extra} requests past the first {MAX_REQUESTS_PER_TURN} were not run; "
-                                    "ask again next turn"}) + "\n")
+                                    "infra": False, "secs": 0, "log": "", "note": self.cut_note}) + "\n")
         for n, req in enumerate(reqs):
             self.check_stop()
             if self.guard_blocked:
@@ -1528,52 +1540,49 @@ class Driver:
             kind = req.get("kind")
             t0 = time.time()
             rc, note, out = 0, "", res_dir / f"{rid}.log"
-            if n >= MAX_REQUESTS_PER_TURN:
-                rc, note = 2, f"more than {MAX_REQUESTS_PER_TURN} requests in one turn; ask again next turn"
-            else:
-                try:
-                    if kind == "test":
-                        rc, out, note = self.req_test(rid, req)
-                    elif kind == "fmt":
-                        rc = self.ensure_fetched(rid)
-                        if not rc:
-                            rc, out = self.guarded(rid, self.cargo_jail(
-                                "cargo fmt --all --check" if req.get("check") is True else "cargo fmt --all"), retries=0)
-                        note = self.cgit("diff", "--no-ext-diff", "--stat", check=False)
-                    elif kind == "clippy":
-                        crates = [c for c in req.get("crates", []) if isinstance(c, str) and re.fullmatch(r"[\w-]{1,60}", c)]
-                        rc = self.ensure_fetched(rid)
-                        if not rc:
-                            if req.get("workspace") is True and driver:
-                                # What CI's lint job runs (the dev profile, every crate and target).
-                                # No incremental data or debuginfo: neither changes a lint, both cost GBs.
-                                try:
-                                    rc, out = self.guarded(rid, self.cargo_jail(
-                                        "cargo clippy --workspace --all-targets -- -D warnings",
-                                        env={"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_DEV_DEBUG": "0"}))
-                                finally:
-                                    shutil.rmtree(self.target_dir() / "debug", ignore_errors=True)
-                            else:
-                                sel = " ".join(f"-p {c}" for c in crates)
+            try:
+                if kind == "test":
+                    rc, out, note = self.req_test(rid, req)
+                elif kind == "fmt":
+                    rc = self.ensure_fetched(rid)
+                    if not rc:
+                        rc, out = self.guarded(rid, self.cargo_jail(
+                            "cargo fmt --all --check" if req.get("check") is True else "cargo fmt --all"), retries=0)
+                    note = self.cgit("diff", "--no-ext-diff", "--stat", check=False)
+                elif kind == "clippy":
+                    crates = [c for c in req.get("crates", []) if isinstance(c, str) and re.fullmatch(r"[\w-]{1,60}", c)]
+                    rc = self.ensure_fetched(rid)
+                    if not rc:
+                        if req.get("workspace") is True and driver:
+                            # What CI's lint job runs (the dev profile, every crate and target).
+                            # No incremental data or debuginfo: neither changes a lint, both cost GBs.
+                            try:
                                 rc, out = self.guarded(rid, self.cargo_jail(
-                                    f"cargo clippy --profile ci-test {sel} --tests -- -D warnings"))
-                    elif kind == "build":
-                        b, rc = self.binary_for("runner" if req.get("what") == "runner" else "server", rid)
-                        note = f"binary {b.name if b else 'none'}"
-                    elif kind == "node-start":
-                        rc, note = self.node_start(rid)
-                    elif kind == "node-stop":
-                        rc = 0 if self.node_stop() else 1
-                    elif kind == "yaml":
-                        rc, out, note = self.req_yaml(rid, req)
-                    elif kind == "gh":
-                        rc, note = self.req_gh(req, out)
-                    else:
-                        rc, note = 2, f"unknown request kind {kind!r}"
-                except StopRun:
-                    raise
-                except Exception as e:
-                    rc, note = 1, f"driver error: {e}"
+                                    "cargo clippy --workspace --all-targets -- -D warnings",
+                                    env={"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_DEV_DEBUG": "0"}))
+                            finally:
+                                shutil.rmtree(self.target_dir() / "debug", ignore_errors=True)
+                        else:
+                            sel = " ".join(f"-p {c}" for c in crates)
+                            rc, out = self.guarded(rid, self.cargo_jail(
+                                f"cargo clippy --profile ci-test {sel} --tests -- -D warnings"))
+                elif kind == "build":
+                    b, rc = self.binary_for("runner" if req.get("what") == "runner" else "server", rid)
+                    note = f"binary {b.name if b else 'none'}"
+                elif kind == "node-start":
+                    rc, note = self.node_start(rid)
+                elif kind == "node-stop":
+                    rc = 0 if self.node_stop() else 1
+                elif kind == "yaml":
+                    rc, out, note = self.req_yaml(rid, req)
+                elif kind == "gh":
+                    rc, note = self.req_gh(req, out)
+                else:
+                    rc, note = 2, f"unknown request kind {kind!r}"
+            except StopRun:
+                raise
+            except Exception as e:
+                rc, note = 1, f"driver error: {e}"
             if not Path(out).exists():
                 Path(out).write_text(note + "\n")
             expect = req.get("expect", "pass" if kind in ("test", "clippy", "yaml", "fmt", "build") else "any")
@@ -1859,6 +1868,9 @@ class Driver:
             else:
                 prompt = (f"The driver ran your requests. New lines are at the end of {self.cand}/results/index.jsonl; "
                           f"each line names its log file. Continue stage {stage}, then write {nxt}.")
+            cut = self.st().get("cut_note")
+            if isinstance(cut, str) and cut and cut not in prompt:   # a retry resends the prompt that has it
+                prompt = cut + "\n\n" + prompt
             last_prompt = prompt
             res = self.session(stage, self.clone(), prompt, self.system_text(stage_file), model,
                                [self.clone(), self.sdir], self.clone(), self.cand)
@@ -1883,11 +1895,15 @@ class Driver:
                 continue
             errors = 0
             turns += 1
+            if self.st().get("cut_note"):
+                self.state(cut_note="")         # this turn's prompt carried it
             a = act.get("action") if act else None
             if a == "run":
                 bad_next = 0
                 self.state(stage=stage, last_request=now())
                 self.run_requests(act.get("requests"))
+                if self.cut_note:
+                    self.state(cut_note=self.cut_note)
                 continue
             if a in ("stage-done", "needs-you", "abandon"):
                 return act
@@ -2456,9 +2472,15 @@ class Driver:
                 if act and act.get("action") == "run":
                     self.cand = home          # the scout may only ask for gh reads
                     reqs = act.get("requests") if isinstance(act.get("requests"), list) else []
-                    self.run_requests([r for r in reqs if isinstance(r, dict) and r.get("kind") == "gh"])
+                    gh = [r for r in reqs if isinstance(r, dict) and r.get("kind") == "gh"]
+                    self.run_requests(gh)
                     self.cand = None
                     prompt = f"Your gh reads are done; see {home}/results/index.jsonl. Finish and write {nxt}."
+                    if self.cut_note:
+                        prompt = self.cut_note + "\n\n" + prompt
+                    if len(gh) < len(reqs):
+                        prompt = (f"{len(reqs) - len(gh)} of your requests were not gh reads and did not run: "
+                                  "the scout may only ask for gh reads.\n\n" + prompt)
                     continue
                 break
         finally:

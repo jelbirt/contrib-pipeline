@@ -520,3 +520,34 @@ suite's copy of the profile at it; the driver is unchanged.
   gc ran on the copy. These check the suite's own work rather than a snapshot of the whole real
   clone, which a real run or a fetch by hand at the same time would also change. env.sh refuses
   a suite folder whose path the profile rewrite cannot carry, and checks the rewrite.
+
+## The request limit, told to sessions (2026-11-09, found in the first ready run)
+
+In run 2026-11-09-070714, stage B asked for 15 requests in one turn. The driver ran the first 12
+(`MAX_REQUESTS_PER_TURN`) and wrote one `too-many` line into `results/index.jsonl`. The session
+never saw it: the rules did not mention a limit, and the line sat among the turn's new results.
+It asked for the 3 missing runs again, but its packet said they "produced no result lines", which
+reads as a failure of the requests rather than a choice of the driver.
+
+- **The rules** (`rules/common.md`) now state the limit, that skipped requests have no result,
+  and to put the most needed requests first.
+- **The next prompt** starts with the cut: how many ran, the positions that did not (13 to N), and
+  their ids, written the way a run id is (only letters, digits, `_`, `.` and `-`, at most 60 each,
+  at most 12 listed and then a count), so a session's own words never reach a driver prompt. The
+  `too-many` line in `index.jsonl` carries the same text.
+- **Across a stop or a resume** the note is kept in `state.json` (`cut_note`) and put first on any
+  prompt that does not already hold it, including a resumed stage's first prompt; a turn that read
+  it clears it. That covers a stage whose last turn was a cut, a hard stop right after the
+  requests, and a retry after a session error (which resends the prompt that has it). The scout,
+  which has no `state.json`, keeps it in memory, and also names how many of its requests were not
+  gh reads.
+- **The old `n >= MAX_REQUESTS_PER_TURN` branch** in the request loop is gone: the list is cut
+  before the loop, so it could never run.
+- **Tests:** `unit.py` drives `stage_loop` with a stub session. It checks that only the first 12
+  run, that the cut is named in `index.jsonl` and first in the next prompt, that a turn within the
+  limit leaves it out, that a stage ending on a cut opens the resumed stage's prompt with it, that
+  ids are normalized and a long list is capped, and that the rules give the driver's number. The
+  old driver fails the cut checks, a driver that does not store the note fails the two
+  prompt checks, and the old rules fail the last.
+- **Review:** one pass. It found the lost note after a stop or a resume (important), and raw ids,
+  an uncapped list, the scout's count, the dead branch and test gaps (minor); all fixed here.

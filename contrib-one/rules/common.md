@@ -45,9 +45,14 @@ Write `next.json` in `session/`, then end your turn. `session/` is the only part
 ```
 
 Request kinds are listed in the repo profile. The driver runs them in order, writes each to
-`results/<id>.log` plus a line in `results/index.jsonl` (id, kind, exit, expect, met, infra, log, note). `infra: true` means the guard stopped the run for memory, disk or time: that is not a test result, so do not read it as a pass or a fail, and
-starts your next turn. Give every request a unique `id`. Use `"expect": "fail"` for a test
-that must fail before the fix; the driver records whether the expectation was met.
+`results/<id>.log` plus a line in `results/index.jsonl` (id, kind, exit, expect, met, infra, log, note),
+and starts your next turn. `infra: true` means the guard stopped the run for memory, disk or time: that
+is not a test result, so do not read it as a pass or a fail. Give every request a unique `id`. Use
+`"expect": "fail"` for a test that must fail before the fix; the driver records whether the expectation was met.
+
+At most 12 requests run per turn. The driver runs the first 12 and skips the rest; your next prompt
+starts by naming the skipped ids. A skipped request has no result: it did not pass or fail, so ask
+for it again if you still need it. Put the requests you need most first.
 
 ## Ending a stage
 - `stage-done` only when the stage's own checklist is complete and its outputs are written.
