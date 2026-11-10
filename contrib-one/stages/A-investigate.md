@@ -13,7 +13,9 @@ confirm them from the code before relying on them.
    `git log` for those files: if a maintainer chose the current behaviour on purpose, note the
    commit and weigh that.
 3. **Pin the reference behaviour.** For ES-compat work, read the Elasticsearch 8.13.4 source
-   (raw.githubusercontent.com, approach only, never copy) and cite path:line.
+   (raw.githubusercontent.com, approach only, never copy) and cite path:line in details.md.
+   Those citations are for the user only: commits, code comments and the PR body describe what
+   ES does (version, request, response, at most a class name), never an ES file or line.
 4. **Reproduce.** Write the failing test first (the profile names the patterns), commit it
    alone on the branch, and ask the driver to run it with `"expect": "fail"`. Where a live
    check helps, ask for `node-start` and use `xq`. A candidate that does not reproduce is

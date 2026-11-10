@@ -574,3 +574,60 @@ decide. The full record moves to `session/details.md`.
   so does a driver without the pointer check, the word limit or the needs-you lines. The
   stub writes a packet in the new shape and a details.md, so the suite runs the shape check
   on every ready candidate.
+
+## The review gate and ES citations (2026-11-09, found while publishing the first ready candidate)
+
+**What happened.** Stage C launched its code-reviewer with `run_in_background: true`. The tool result
+was only a launch notice, and the reviewer's real report arrived later as a separate message. The
+driver still counted the review as usable. Claude Code also writes an `api-request-blob` line that
+repeats earlier tool calls and results with no `toolUseResult`, and review_check read every line
+type, so that later copy replaced the real result (status `async_launched`) and passed the checks.
+The result: `results/review-transcript.md` held a launch notice, `review.usable` said 1, and the two
+commits stage C made after the review had never been reviewed. The user's publish pass caught it.
+
+**Fix.**
+- review_check reads only `user` and `assistant` lines, keeps the first result for each tool call
+  and counts each call once, so the copies can neither replace a result nor double the "changes
+  after the review" count.
+- A reviewer call with `run_in_background`, or whose result says `isAsync` or `async_launched`, is
+  not usable; the reason tells the session to run it again in the foreground.
+- C-finish.md step 1 now says to run the reviewer in the foreground and wait for it.
+
+**ES citations.** Run 2's commit message cited ES Java files with line numbers, which the profile
+asked for. AGENTS.md says ES is read for wire semantics only, and the user's merged PRs describe ES's
+behaviour without citing its files, so the user had them removed at publish. Upstream commits do
+name Java files (87 of the last 3000, mostly Lucene, a few ES paths by the maintainer), so this is
+the user's own style, not a project rule. Now:
+- A-investigate.md and the profile say: ES path:line goes in details.md, for the user; commits,
+  code comments and the PR body state ES's behaviour (version, request, response, at most a class
+  name).
+- The profile key `PUBLIC_FORBID_RE` (xerj: a `.java` file name, not a host such as
+  `jdk.java.net`) is checked by final_checks against the commit messages and PR_BODY.md as they
+  are. Lucene files are caught too, since a bare class file cannot be told apart; sessions name the
+  class without `.java`.
+- In the diff only a name the change brings in is refused: not one the same change removes (a
+  reworded line) and not one already in the base tree (`git grep -F` at the base), because xerj's
+  own code and test data already name Java files (index.rs alone has 46). The refusal names the
+  file. At most 50 different names are looked up; past that the rest is reported, not passed.
+
+**Review of this change** (one code-reviewer pass; all findings confirmed and fixed):
+- Important: the diff check as first written refused Java names already in xerj, which would
+  have stopped any change near them. Fixed as above.
+- The pattern now starts with `\b`, so a long run of word characters is scanned once, not once
+  per position (a 1 MB word takes about 0.2 s).
+- A background agent or task started before the review, and a reviewer refused for running in
+  the background, count as changes after the review: either can still be working when it ends.
+- A reviewer that hands its report back as a message leaves only a short pointer in the result;
+  the report is in `handbackReport.text` (63 such results on this machine had that shape), so
+  review_check reads it there instead of refusing the review as too short.
+- `tests/smoke/suite.sh`'s STOP case waited for "stage C" and "smks" anywhere in the stub log,
+  which every case shares, so it could stop the run before stage C (it failed once that way). It
+  now waits for the stub's own line for smks in stage C.
+
+**Tests.** `tests/smoke/unit_review.py` builds stage C transcripts: run 2's shape (background launch
+plus a later copy), a launch notice without the flag, a finished foreground review, a copy after a
+real result, an edit repeated by a copy, a handed-back report, and background agents before the
+review; then the citation check on each place, on moved and existing names, a host name, a line
+that looks like a file header, the cap, a 1 MB word and a broken pattern, and that final_checks
+runs it. Each guard has its own check: removing any one of them fails exactly that check. The
+driver before this change fails 5 of the 7 original review checks and has no citation check.

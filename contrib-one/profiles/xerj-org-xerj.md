@@ -16,7 +16,13 @@ say so in the packet (a decision for the user when it matters).
 - Elasticsearch is read for wire semantics only, never copied (AGPL/SSPL/Elastic licence).
   The reference is ES 8.13.4 source: fetch the file you need from
   `https://raw.githubusercontent.com/elastic/elasticsearch/v8.13.4/<path>` with the WebFetch tool
-  and cite path:line. curl and wget are denied in your shell; do not try them.
+  and cite path:line in details.md, for the user. AGENTS.md says ES is read for wire-protocol
+  semantics, never for implementation, and the user's merged PRs never cite an ES file: in
+  commits, code comments and the PR body, state ES's observable behaviour (ES 8.13, the
+  request and the response, at most a class name) and never a `.java` file or line. The driver
+  refuses any `.java` file name there (PUBLIC_FORBID_RE), Lucene's too, since a bare class
+  file cannot be told apart; name a Lucene class without the `.java`. curl and wget are
+  denied in your shell; do not try them.
 - Honest claims only: every number from a command that ran, Verified vs Assumed split.
 - No `Co-Authored-By`. The PR's first line discloses the agent. CLA: jelbirt is already in
   `.contributors`.
@@ -32,8 +38,9 @@ say so in the packet (a decision for the user when it matters).
 - Changes to the YAML runner (`engine/tests/es-compat-yaml/src/main.rs`) go in their own
   commit before the fix.
 - Check the git history of the lines you change (`git log -L` or `git blame`). If a
-  maintainer chose the current behaviour on purpose, either cite ES source proving it wrong
-  (and say so in the commit and PR) or stop with `needs-you`.
+  maintainer chose the current behaviour on purpose, either show from ES source that it is
+  wrong (state ES's behaviour in the commit and PR, the path:line in details.md) or stop with
+  `needs-you`.
 - Overlap: before writing code and again at the end, compare against every open PR (titles,
   bodies, files touched) in `gh/prs.json`. Same lines or same YAML/ratchet entries as an
   open PR by someone else means `abandon`, unless the overlap is only a CHANGELOG line.
@@ -83,8 +90,8 @@ one of the user's open PRs is still likely, make it a decision in the packet.
 1. `Written by an AI coding agent (Claude Code), run by @jelbirt, who has reviewed this change.`
 2. `Fixes #N`, or `No issue: <one line on where it came from>`.
 3. `## What this changes and why`: a table `Request | ES 8.13 | XERJ before | XERJ now`, then
-   **Decisions:** bullets, each a decision plus its reason (cite ES source path:line when it
-   settles a semantics question).
+   **Decisions:** bullets, each a decision plus its reason (when ES's behaviour settles it,
+   state that behaviour; no ES file or line).
 4. `## Evidence`: each test file, what failed with the fix reverted, what passes now; one line
    on the review pass (counts, what was fixed); the ES-YAML result with the SHA.
 5. `## Checks`: the commands, as checked items.

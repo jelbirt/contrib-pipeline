@@ -2056,7 +2056,52 @@ class Driver:
             problems.append("the diff adds a line with an em or en dash")
         if self.cgit("status", "--porcelain", check=False):
             problems.append("uncommitted changes left in the clone")
+        problems += self.citation_problems(log, texts.get("PR_BODY.md", ""), diff, base)
         return problems
+
+    CITATION_NAMES_CHECKED = 50
+
+    def citation_problems(self, log, body, diff, base):
+        """The profile's PUBLIC_FORBID_RE names reference-source citations that must stay out of
+        what goes public; details.md may keep them. Commit messages and the PR body are checked
+        as they are. In the diff only a name the change brings in counts: one the same change
+        removes (a line it rewords) or one already in the base tree (test data, an existing
+        comment) is the project's own, not a new citation."""
+        pat = self.prof.get("PUBLIC_FORBID_RE", "")
+        if not pat:
+            return []
+        try:
+            rx = re.compile(pat)
+        except re.error as e:
+            return [f"the profile's PUBLIC_FORBID_RE is not a valid pattern ({e}); tell the user"]
+        fix = "state the reference's behaviour instead and keep file and line citations in details.md"
+        out = []
+        for where, text in (("a commit message", log), ("session/PR_BODY.md", body)):
+            m = rx.search(text)
+            if m:
+                out.append(f"{where} cites reference source ({one_line(m.group(0), 80)!r}); {fix}")
+        removed, added, path, header = set(), {}, "?", False
+        for l in diff.splitlines():
+            if l.startswith("diff --git "):
+                header = True
+            elif header:  # file headers run from "diff --git" to the first hunk
+                if l.startswith("+++ "):
+                    path = l[6:] if l.startswith("+++ b/") else l[4:]
+                header = not l.startswith("@@")
+            elif l.startswith("-"):
+                removed.update(m.group(0) for m in rx.finditer(l[1:]))
+            elif l.startswith("+"):
+                for m in rx.finditer(l[1:]):
+                    added.setdefault(m.group(0), path)
+        new = [(n, p) for n, p in added.items() if n not in removed]
+        for n, p in new[:self.CITATION_NAMES_CHECKED]:
+            if not self.cgit("grep", "-F", "-l", "-e", n, base, "--", ".", check=False):
+                out.append(f"{one_line(p, 120)} adds a citation of reference source "
+                           f"({one_line(n, 80)!r}); {fix}")
+        if len(new) > self.CITATION_NAMES_CHECKED:
+            out.append(f"the diff adds {len(new)} different names that look like reference-source "
+                       f"citations; only {self.CITATION_NAMES_CHECKED} were checked, so tell the user")
+        return out
 
     def review_check(self):
         """'' when stage C's own transcript (under ~/.claude, which sessions can neither read nor
@@ -2067,7 +2112,7 @@ class Driver:
         sid = read_json(self.cand / "sessions.json", {}).get("C")
         if not isinstance(sid, str) or not re.fullmatch(r"[0-9a-f-]{36}", sid):
             return "stage C has no session id"
-        uses, results, calls = {}, {}, []
+        uses, results, calls, seen = {}, {}, [], set()
         pos = 0
         for t in self.transcripts(sid):
             with open(t, encoding="utf-8", errors="replace") as f:
@@ -2076,7 +2121,13 @@ class Driver:
                         o = json.loads(line)
                     except ValueError:
                         continue
-                    msg = o.get("message") if isinstance(o, dict) else None
+                    # Only the conversation itself: Claude Code also writes other line types (an
+                    # api-request copy of the messages, for one) that repeat earlier tool calls
+                    # without their toolUseResult, and a later copy must not stand in for the
+                    # real result or move a call's place.
+                    if not isinstance(o, dict) or o.get("type") not in ("user", "assistant"):
+                        continue
+                    msg = o.get("message")
                     content = msg.get("content") if isinstance(msg, dict) else None
                     for part in content if isinstance(content, list) else []:
                         if not isinstance(part, dict):
@@ -2084,12 +2135,16 @@ class Driver:
                         pos += 1
                         inp = part.get("input") if isinstance(part.get("input"), dict) else {}
                         if part.get("type") == "tool_use":
+                            uid = str(part.get("id"))
+                            if uid in seen:
+                                continue
+                            seen.add(uid)
                             if part.get("name") in ("Agent", "Task") and inp.get("subagent_type") == "code-reviewer":
-                                uses[str(part.get("id"))] = (pos, inp)
+                                uses[uid] = (pos, inp)
                             else:
-                                calls.append((pos, str(part.get("name")), inp))
+                                calls.append((pos, str(part.get("name")), inp, uid))
                         elif part.get("type") == "tool_result" and part.get("tool_use_id"):
-                            results[str(part["tool_use_id"])] = (part, o.get("toolUseResult"))
+                            results.setdefault(str(part["tool_use_id"]), (part, o.get("toolUseResult")))
         if not uses:
             return ("no code-reviewer subagent call is in the stage C transcript; spawn it with the Agent "
                     "tool, subagent_type code-reviewer, in the foreground")
@@ -2103,6 +2158,11 @@ class Driver:
                 text = tool_text(part.get("content"))
                 if part.get("is_error"):
                     why = "the code-reviewer call ended in an error"
+                elif inp.get("run_in_background") or (isinstance(tur, dict) and (
+                        tur.get("isAsync") or tur.get("status") == "async_launched")):
+                    why = ("the code-reviewer ran in the background, so its result here is only a launch "
+                           "notice and the code may have changed while it worked; run it again in the "
+                           "foreground (no run_in_background)")
                 elif isinstance(tur, dict) and (tur.get("status") not in (None, "completed")
                                                 or tur.get("agentType") not in (None, "code-reviewer")):
                     why = f"the code-reviewer call did not complete (status {tur.get('status')!r})"
@@ -2111,7 +2171,11 @@ class Driver:
                     why = "the code-reviewer read nothing (no tool calls); give it the diff to review"
                 else:
                     if isinstance(tur, dict):
-                        text = tool_text(tur.get("content")) or text
+                        # A subagent can hand its report back as a message; the result's content
+                        # is then a short pointer and the report itself is in handbackReport.
+                        hb = tur.get("handbackReport")
+                        hb = hb.get("text") if isinstance(hb, dict) else None
+                        text = (hb if isinstance(hb, str) else "") or tool_text(tur.get("content")) or text
                     if len(text.strip()) < 200:
                         why = "the code-reviewer's report is too short to be a review"
             verdicts.append((uid, at, inp, why, text))
@@ -2131,9 +2195,18 @@ class Driver:
 
         # A reviewer call can itself run commands, and a background command started before the
         # review can finish after it: both count as changes the review may not have seen.
-        after = [(n, i) for at, n, i in calls if at > last_at and may_change_code(n, i)]
+        # A background agent is the same: a reviewer refused for running in the background, or
+        # any other agent or task started that way, can still be working after the review.
+        def background(uid, inp):
+            tur = results.get(uid, (None, None))[1]
+            return bool(inp.get("run_in_background")) or (isinstance(tur, dict) and bool(
+                tur.get("isAsync") or tur.get("status") == "async_launched"))
+
+        after = [(n, i) for at, n, i, _ in calls if at > last_at and may_change_code(n, i)]
         after += [("Agent", i) for at, i in uses.values() if at > last_at]
-        after += [(n, i) for at, n, i in calls if at <= last_at and n == "Bash" and i.get("run_in_background")]
+        after += [(n, i) for at, n, i, u in calls
+                  if at <= last_at and n in ("Bash", "Agent", "Task") and background(u, i)]
+        after += [("Agent", i) for u, (at, i) in uses.items() if at < last_at and background(u, i)]
         out = [f"# Code review, copied by the driver from stage C's transcript\n\nSession {sid}: "
                f"{len(verdicts)} reviewer call(s), {len(good)} usable. All of them follow, in order.\n"]
         for k, (uid, at, inp, why, text) in enumerate(verdicts, 1):

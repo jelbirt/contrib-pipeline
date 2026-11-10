@@ -3,7 +3,9 @@
 Get an independent review, act on it, and write the PR body.
 
 ## Checklist
-1. **Review.** Spawn one `Agent` with `subagent_type` `code-reviewer` (pre-approved). Brief
+1. **Review.** Spawn one `Agent` with `subagent_type` `code-reviewer` (pre-approved), in the
+   foreground: do not set `run_in_background`, because the driver only counts a review whose
+   report came back in that call, and wait for it before you change anything. Brief
    it with: the repo, the branch, the base SHA, the command to see the diff
    (`git diff <base>..HEAD`), the reference behaviour, and the standing rules it must apply
    (no em dashes, no attribution, the repo's review protocol). Do not give it your
