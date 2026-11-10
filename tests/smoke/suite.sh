@@ -32,8 +32,10 @@ want asked_by "$(field smkc-0 asked_by)" driver
 run --answer smkc-0 "carry on"; want "answer rc" $rc 0; want status "$(field smkc-0 status)" ready
 case_ "STOP file during stage C"
 ( STUB_PREFIX=smks STUB_SLEEP_STAGE=C STUB_SLEEP=8 run --limit 1; echo $rc > $SMOKE/stop-rc ) &
-for i in $(seq 1 60); do grep -q 'stage C\|C cwd=' $STUB_LOG 2>/dev/null && grep -q smks $STUB_LOG && break; sleep 0.5; done
-sleep 2; touch $CONTRIB_LEDGER/STOP; wait
+# Wait for the stub's own line for smks in stage C (the log is shared by every case, so the
+# stage and the candidate must be on one line), then stop while stage C sleeps.
+for i in $(seq 1 60); do grep -q 'clones/smks-0", "stage": "C"' $STUB_LOG 2>/dev/null && break; sleep 0.5; done
+sleep 1; touch $CONTRIB_LEDGER/STOP; wait
 want rc "$(cat $SMOKE/stop-rc)" 10; want status "$(field smks-0 status)" stopped
 want "C done, gate left for resume" "$(field smks-0 stages_done)" "['A', 'B', 'C']"
 run --resume --limit 1; want "resume rc" $rc 0; want status "$(field smks-0 status)" ready
