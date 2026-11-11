@@ -715,3 +715,28 @@ An independent review found no way around the approval gate, and these gaps, all
 - **Messages.** A learn that fails after writing says what it wrote. Approving says when the hand
   profile still wins. repos/<repo>/profile.md is written only for approved rules.
 
+
+### Step 3, the xerj split (2026-11-11)
+
+The hand profile is split three ways, and stays in place (it still wins) until the switch at step 7.
+`tests/learn/xerj-baseline.md` lists its 39 rules as the acceptance yardstick: 21 the learn should
+find in xerj's guides or merged PRs, 8 the user's own (kept in `profiles/xerj-org-xerj.overrides.md`),
+2 driver checks and 8 pipeline mechanics (kept in `profiles/xerj-org-xerj.mechanics.md`). The `.env`
+gains `FORBID_PATHS`, `PR_WORDS`, `PR_FIRST_LINE` and `REF_HOST`, which step 5 starts reading.
+
+Review of this step: `.cargo/` was narrowed to `engine/.cargo/`, but cargo reads `.cargo/` from
+every parent folder, so the root one is listed too. The overrides named the disclosure check but
+not the sentence, and sessions never read the `.env`, so the sentence is now in the overrides. Three
+rules tagged learnable had no source a learn can use (no new dependencies, the multi-node ring, the
+runner's own commit) and are retagged; five tagged as the user's own are written in xerj's guides
+and now count as learnable with the user's part kept in the overrides. The hand profile's "upstream
+wins" line is replaced by SPEC's order; the overrides say which differences from the guides are
+settled, so they do not come back as a decision in every packet.
+
+For step 5: a check of a template's required headings must follow the overrides where they set the
+shape (xerj's template has `## What this changes, and why` and a bold `**Not run:**`; the user's
+approved shape has no comma and a `## Not run` heading). Open, for the user: whether
+`FORBID_PATHS` should also hold what xerj's AGENTS.md forbids (`landing/answers/`,
+`landing/compare/`) and the user's own `.contributors` and `user-feedback/`, and whether the xerj
+learn should also read `engine/tests/es-compat-yaml/catch-lenient.txt`, the only place the
+ratchet rule is written. Both are `.env` changes, which SPEC asks about first.
