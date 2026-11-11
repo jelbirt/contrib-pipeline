@@ -217,5 +217,11 @@ refused.
    own; changes backed only by PRs or comments are held as proposed until you approve them,
    because those are the easy way for anyone to plant a rule. This narrows the earlier
    "approve the first learn only" choice.
+   *Clarified 2026-11-11 (step 1 review):* a guide quote only has to exist in the guide, so
+   any boilerplate sentence (a code of conduct's "feel free to ask the maintainers") could back
+   any rule, and a refresh session reads new outside PRs, the injection channel. So a refresh
+   change counts as guide-backed, and applies on its own, only when its quote lies in text that
+   changed in that guide since the last approved learn (the blob differs and the quote is not
+   in the previous text). Every other change is held as proposed. Step 6 builds it this way.
 2. **Acceptance bar.** 90% of the hand profile's upstream rules found with a source that
    states them, and zero mis-sourced required rules.

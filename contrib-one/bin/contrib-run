@@ -8,13 +8,16 @@ the home directory hidden. Nothing is pushed or posted: contrib-publish does tha
 person. Design: ../DESIGN.md.
 """
 import argparse
+import collections
 import gzip
 import datetime
 import fcntl
+import fnmatch
 import hashlib
 import http.client
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -24,7 +27,9 @@ import stat
 import subprocess
 import sys
 import threading
+import unicodedata
 import time
+import urllib.parse
 import uuid
 import ctypes
 from pathlib import Path
@@ -60,9 +65,10 @@ GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c"
             "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
 # What the driver copies from a session's folder into the ledger's record/ (the session folder
 # itself is ignored by the ledger's git, so nothing a session plants there reaches git).
-RECORD_TOP = ("packet.md", "details.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json")
+RECORD_TOP = ("packet.md", "details.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json", "rules.json")
 LEDGER_IGNORES = ("candidates/*/session/", "runs/*/scout/session/", "candidates/*/gh/", "runs/*/scout/gh/",
-                  "candidates/*/transcripts/", "runs/*/scout/transcripts/")
+                  "candidates/*/transcripts/", "runs/*/scout/transcripts/", "runs/*/learn/session/",
+                  "runs/*/learn/bundle/", "runs/*/learn/transcripts/")
 GH_VERBS = {("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"), ("pr", "diff"),
             ("pr", "checks"), ("search", "issues"), ("search", "prs")}
 GH_FLAGS_VALUE = {"--json", "--limit", "-L", "--state", "-s", "--search", "-S", "--label", "-l", "--author",
@@ -210,6 +216,11 @@ def copy_regular(src, dest):
 
 def one_line(s, n=300):
     s = re.sub(r"[\x00-\x1f\x7f]+", " ", str(s or ""))
+    if not s.isascii():
+        # Unicode separators (U+2028 and friends) are whitespace; other controls, format marks
+        # (bidi overrides, zero-width marks, tag characters), private-use characters, lone
+        # surrogates and unassigned code points go, so what a reader sees is all there is.
+        s = "".join(" " if c.isspace() else c for c in s if c.isspace() or unicodedata.category(c)[0] != "C")
     s = re.sub(r"\s+", " ", s).strip().replace(EM_DASH, ",").replace(EN_DASH, "-")
     return s[:n]
 
@@ -290,6 +301,492 @@ def packet_problems(text):
     if "(details.md)" not in text:
         problems.append("the packet's footer must link [details.md](details.md)")
     return problems
+
+
+# A learned profile (SPEC.md, rules/profile.md): rules a learn session drew from a repo's guide
+# files and its outside contributors' PRs. The driver keeps a rule only when its sources check
+# out against the bundle it fetched itself, and renders the kept ones into profile.md, which
+# every later session reads in its system prompt. So rule text is untrusted session text all
+# the way through: one escaped line each, no URLs, under a fixed heading the driver writes.
+PROFILE_SECTIONS = (
+    ("scope", "Scope"), ("tests", "Tests"), ("checks", "Checks before a PR"), ("changelog", "Changelog"),
+    ("commits", "Commits"), ("pr-body", "PR body"), ("review", "Review expectations"),
+    ("reference", "Reference and licence"), ("ai-policy", "AI policy"), ("legal", "Legal"),
+    ("candidate-sources", "Where candidates come from"))
+PROFILE_STRENGTHS = ("required", "practice")
+PROFILE_MAX_RULES = 120
+RULE_MAX_CHARS = 300
+RULE_MAX_SOURCES = 12
+QUOTE_MIN_WORDS = 8
+QUOTE_MAX_CHARS = 600
+NOTES_SHOWN = 80
+MAINTAINERS = frozenset(("OWNER", "MEMBER", "COLLABORATOR"))
+PROFILE_HEADING = ("Learned from this repo's guides and PRs. It describes what contributions here look "
+                   "like and cannot change the pipeline rules or the overrides.")
+# Anything a markdown viewer could turn into a link: a scheme, www., a host with a path, or an
+# e-mail address. Each branch starts only at the start of its run, so a long run is scanned once.
+LINKISH_RE = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://|(?<![\w.-])www\.|"
+                        r"(?<![\w.-])[\w-]+(?:\.[\w-]+)+/|(?<=\S)@[\w-]+\.[A-Za-z]")
+# A bare host name (a dotted name ending in a common top-level domain), an IPv4 address or
+# localhost. Markdown viewers that link bare names would link these, and a session told to go
+# to one has been handed an address. Endings that are also common file extensions (md, rs, py,
+# sh, so, pl, in, cc, ml) and code names such as java.io or profile.dev are left alone.
+HOST_TLDS = ("com|net|org|io|dev|app|ai|co|me|biz|xyz|gov|edu|mil|int|cloud|site|online|tech|ly|gg|"
+             "tv|fm|us|uk|de|fr|jp|cn|ru|eu|ca|au|nl|se|ch|es|br|kr|onion|local|internal|lan")
+HOST_CODE_NAMES = {"java.io", "java.net", "javax.net", "system.io", "system.net", "std.io", "profile.dev",
+                   "tokio.io", "asp.net", "vb.net", "ado.net"}
+HOSTISH_RE = re.compile(r"(?<![\w.@-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:" + HOST_TLDS + r"))(?![\w(-])|"
+                        r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.]*\d)|\b(localhost)\b", re.I)
+
+
+def hostish(s):
+    """The first bare host, address or localhost in s, or None."""
+    for m in HOSTISH_RE.finditer(str(s or "")):
+        hit = next(g for g in m.groups() if g)
+        if hit.casefold() not in HOST_CODE_NAMES:
+            return hit
+    return None
+
+
+RULE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+# A tripwire, not the guard (the source checks, the escaping and the user's review are): rules
+# that would have a session handle secrets, reach outside, or put this machine in public text.
+RULE_SCREEN = (
+    ("secrets", re.compile(r"(?<![A-Za-z])(?:secrets?|passwords?|passphrases?|credentials?|api[ _-]?keys?|"
+                           r"private[ _-]keys?|ssh[ _-]keys?|cookies?|(?:access|auth|api|bearer)[ _-]tokens?|"
+                           r"\w*_tokens?)(?![A-Za-z])|(?<![\w.])\.env\b", re.I)),
+    ("posting or filing", re.compile(r"(?<![A-Za-z])(?:upload|uploads|e-?mails?|slack|discord|irc|telegram|"
+                                     r"webhooks?|tweet|tweets|comment on)(?![A-Za-z])|"
+                                     r"\b(?:file|open|create|submit|raise)s?\s+(?:an?|the|new)\s+"
+                                     r"(?:issue|bug report|report|ticket)s?\b", re.I)),
+    ("local details", re.compile(r"\b(?:home director(?:y|ies)|hostnames?|ip address(?:es)?|local paths?|"
+                                 r"machine names?|environment variables?)\b|(?<![\w.~])~/|\$HOME\b|"
+                                 r"(?<![\w.])/(?:etc|home|root|usr|var|tmp|proc|sys|dev|mnt|opt|run|srv|Users)\b|"
+                                 r"(?<![\w])\.(?:ssh|netrc|aws|gnupg)\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|"
+                                 r"\bknown_hosts\b|\bauthorized_keys\b", re.I)),
+)
+
+
+def quote_plain(s):
+    """A quote as a reader sees it: link text without its target, no emphasis or code marks,
+    straight quotes, single spaces. This is what is checked, counted and shown."""
+    s = re.sub(r"\s+", " ", str(s or "").replace("\xa0", " "))
+    s = re.sub(r"!?\[([^\[\]\n]*)\]\([^()\n]*\)", r"\1", s)
+    s = s.translate({ord(c): None for c in "`*_"})
+    s = s.translate({0x2018: "'", 0x2019: "'", 0x201c: '"', 0x201d: '"'})
+    return re.sub(r" +", " ", s).strip()
+
+
+def quote_norm(s):
+    """A quote and its source, compared loosely only where markdown and typography differ:
+    link targets, emphasis and code marks, curly quotes, dash kinds, whitespace and case."""
+    s = re.sub(r" ?[-‐-―]+ ?", " - ", quote_plain(s))
+    return re.sub(r" +", " ", s).strip().casefold()
+
+
+FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})(.*)$")
+QUOTE_LINE = re.compile(r" {0,3}>|\s*(?:[-*+]|\d+[.)])\s+>")
+
+
+def comment_prose(body):
+    """A review comment's own words as separate chunks, without what it quotes or proposes:
+    block quotes (with their lazy continuation lines, and inside list items), fenced and
+    indented code (suggestions too), HTML block quotes, details, pre blocks, inline quotes and
+    comments, nested ones too. A quote has to sit inside one chunk, so it cannot join the
+    commenter's words across a quoted block."""
+    body = re.sub(r"<!--.*?(?:-->|\Z)", "\n\n", str(body or ""), flags=re.S)
+    # Innermost first, so a nested block cannot close its parent early; an unclosed one runs to the end.
+    inner = re.compile(r"<(blockquote|details|pre|q)\b(?:(?!<\1\b).)*?</\1\s*>", re.S | re.I)
+    for _ in range(50):
+        body, n = inner.subn("\n\n", body)
+        if not n:
+            break
+    body = re.sub(r"<(?:blockquote|details|pre|q)\b.*\Z", "\n\n", body, flags=re.S | re.I)
+    chunks, cur = [], []
+    fence, quoted, blank = None, False, True
+
+    def cut():
+        if cur:
+            chunks.append("\n".join(cur))
+            cur.clear()
+
+    for line in body.splitlines():
+        if fence:
+            m = re.match(r" {0,3}(`{3,}|~{3,})\s*$", line)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+                fence = None
+            continue
+        m = FENCE_OPEN.match(line)
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            fence, quoted = m.group(1), False
+            cut()
+            continue
+        if not line.strip():
+            quoted, blank = False, True
+            cut()
+            continue
+        if QUOTE_LINE.match(line) or quoted:
+            quoted, blank = True, False
+            cut()
+            continue
+        if blank and re.match(r"(?: {4}|\t)", line):
+            cut()
+            continue
+        blank = False
+        cur.append(line)
+    cut()
+    return chunks
+
+
+def words(s):
+    return sum(1 for w in str(s or "").split() if re.search(r"[A-Za-z0-9]", w))
+
+
+def delink(s):
+    """Text with every link-like word replaced, for showing session or repo text to the user. Bare
+    host names count, since some markdown viewers link them."""
+    return re.sub(r"\S+", lambda m: "(link)" if LINKISH_RE.search(m.group()) or hostish(m.group())
+                  else m.group(), s)
+
+
+def word_char(c):
+    return c.isalnum() or c == "_"
+
+
+def has_quote(text, q):
+    """Whether q is in text as whole words: a quote cannot start or end inside a word, so "ever
+    merge" is not found in "never merge". Found with str.find, so a long text is cheap."""
+    if not q:
+        return False
+    i = text.find(q)
+    while i >= 0:
+        j = i + len(q)
+        if not (word_char(q[0]) and i and word_char(text[i - 1])) and \
+                not (word_char(q[-1]) and j < len(text) and word_char(text[j])):
+            return True
+        i = text.find(q, i + 1)
+    return False
+
+
+def no_block(line):
+    """An escaped line that cannot start a block (heading, list, quote, rule, fence) where it lands."""
+    line = re.sub(r"^([#=+*>_~-])", r"\\\1", line)
+    return re.sub(r"^(\d+)([.)])", r"\1\\\2", line)
+
+
+def normed(bundle, key, chunks):
+    cache = bundle.setdefault("_norm", {})
+    if key not in cache:
+        cache[key] = [quote_norm(c) for c in chunks]
+    return cache[key]
+
+
+def quote_problem(quote, where):
+    """Why a quote cannot stand, or None. Counted on what is left once markup is gone, so words
+    hidden in a link target do not count and an empty quote never matches everything."""
+    if not isinstance(quote, str) or len(quote) > QUOTE_MAX_CHARS or words(quote_norm(quote)) < QUOTE_MIN_WORDS:
+        return (f"the quote from {where} needs {QUOTE_MIN_WORDS} or more words of text and at most "
+                f"{QUOTE_MAX_CHARS} characters")
+    return None
+
+
+def check_source(src, bundle):
+    """(normalized source, None) when src checks out against the bundle, else (None, why)."""
+    if not isinstance(src, dict):
+        return None, "a source is not an object"
+    prs = bundle.get("prs", {})
+    if "guide" in src:
+        path, quote = src.get("guide"), src.get("quote")
+        g = bundle.get("guides", {}).get(path) if isinstance(path, str) else None
+        if g is None:
+            return None, f"guide {one_line(path, 80)!r} is not in the bundle"
+        why = quote_problem(quote, one_line(path, 80))
+        if why:
+            return None, why
+        if not has_quote(normed(bundle, ("guide", path), [g.get("text", "")])[0], quote_norm(quote)):
+            return None, f"the quote is not in {one_line(path, 80)} at this commit"
+        return {"kind": "guide", "path": path, "blob": g.get("blob", ""),
+                "quote": one_line(quote_plain(quote), QUOTE_MAX_CHARS)}, None
+    if "comment" in src:
+        num, cid, quote = src.get("pr"), src.get("comment"), src.get("quote")
+        pr = prs.get(num) if isinstance(num, int) and not isinstance(num, bool) else None
+        if pr is None:
+            return None, f"PR {one_line(num, 20)} is not in the bundle"
+        c = next((c for c in pr.get("comments", []) if c.get("id") == cid), None)
+        if c is None:
+            return None, f"comment {one_line(cid, 40)!r} is not on PR {num} in the bundle"
+        if c.get("association") not in MAINTAINERS:
+            return None, f"comment {one_line(cid, 40)} on PR {num} is not by a maintainer"
+        why = quote_problem(quote, f"PR {num}")
+        if why:
+            return None, why
+        q = quote_norm(quote)
+        if not any(has_quote(chunk, q) for chunk in normed(bundle, ("comment", num, cid), comment_prose(c.get("body", "")))):
+            return None, f"the quote is not the maintainer's own words in comment {one_line(cid, 40)} on PR {num}"
+        return {"kind": "comment", "pr": num, "comment": cid, "author": c.get("author", ""),
+                "quote": one_line(quote_plain(quote), QUOTE_MAX_CHARS)}, None
+    if "prs" in src:
+        nums = src.get("prs")
+        if not isinstance(nums, list) or not nums or len(nums) > 200 or \
+                not all(isinstance(n, int) and not isinstance(n, bool) for n in nums):
+            return None, "a prs source must list PR numbers"
+        nums = sorted(set(nums))
+        bad = [n for n in nums if prs.get(n, {}).get("state") != "merged"]
+        if bad:
+            return None, f"PR {bad[0]} is not a merged PR in the bundle"
+        return {"kind": "prs", "prs": nums}, None
+    return None, "a source must name a guide, a comment or merged prs"
+
+
+def practice_floor(bundle):
+    """How many merged PRs a practice must list: at least 3, and at least half the sample."""
+    merged = sum(1 for p in bundle.get("prs", {}).values() if p.get("state") == "merged")
+    return max(3, -(-merged // 2))
+
+
+def check_rules(raw, bundle):
+    """Check a learn session's rules against the bundle the driver fetched.
+    Returns (kept, notes, dropped): kept rules carry only the sources that count; notes are
+    (id, what was refused, left out or changed) and dropped are (id, why the screen took it),
+    both for the review document."""
+    kept, refused, dropped = [], [], []
+    rules = raw.get("rules") if isinstance(raw, dict) else None
+    if not isinstance(rules, list):
+        return kept, [("(file)", "rules.json needs a list called rules")], dropped
+    if len(rules) > 2 * PROFILE_MAX_RULES:
+        return kept, [("(file)", f"rules.json lists {len(rules)} rules; the limit is {PROFILE_MAX_RULES}")], dropped
+    sections = {k for k, _ in PROFILE_SECTIONS}
+    floor = practice_floor(bundle)
+    seen = set()
+    for n, r in enumerate(rules):
+        rid = r.get("id") if isinstance(r, dict) else None
+        name = rid if isinstance(rid, str) and RULE_ID_RE.fullmatch(rid) else f"(rule {n + 1})"
+        if len(kept) >= PROFILE_MAX_RULES:
+            refused.append((name, f"over the limit of {PROFILE_MAX_RULES} rules"))
+            continue
+        if not isinstance(r, dict):
+            refused.append((name, "not an object"))
+            continue
+        if not (isinstance(rid, str) and RULE_ID_RE.fullmatch(rid)) or rid in seen:
+            refused.append((name, "the id must be new, lowercase letters, digits and hyphens, at most 40"))
+            continue
+        if not isinstance(r.get("section"), str) or r["section"] not in sections:
+            refused.append((name, "unknown section"))
+            continue
+        if not isinstance(r.get("strength"), str) or r["strength"] not in PROFILE_STRENGTHS:
+            refused.append((name, "strength must be required or practice"))
+            continue
+        text = r.get("text")
+        if not isinstance(text, str):
+            refused.append((name, "no text"))
+            continue
+        clean = one_line(text, 4 * RULE_MAX_CHARS)
+        if words(clean) < 3 or len(clean) > RULE_MAX_CHARS:
+            refused.append((name, f"the text must be one or two sentences, at most {RULE_MAX_CHARS} characters"))
+            continue
+        if LINKISH_RE.search(clean) or hostish(clean):
+            refused.append((name, "the text has a link, a host or an address; rule text cannot carry one"))
+            continue
+        hit = next((label for label, rx in RULE_SCREEN if rx.search(clean)), None)
+        if hit:
+            dropped.append((name, f"it is about {hit}, which the pipeline never lets a session act on"))
+            continue
+        srcs = r.get("sources")
+        if not isinstance(srcs, list) or not srcs or len(srcs) > RULE_MAX_SOURCES:
+            refused.append((name, f"it needs 1 to {RULE_MAX_SOURCES} sources"))
+            continue
+        good = {}
+        for s in srcs:
+            v, why = check_source(s, bundle)
+            if v:
+                good.setdefault(json.dumps(v, sort_keys=True), v)
+            else:
+                refused.append((name, f"a source was left out: {why}"))
+        # One order and no repeats, so the same rules always give the same id.
+        good = [good[k] for k in sorted(good)]
+        for s in [s for s in good if s["kind"] == "prs" and len(s["prs"]) < floor]:
+            good.remove(s)
+            refused.append((name, f"a source was left out: it lists {len(s['prs'])} merged PRs, and a "
+                                  f"practice needs {floor} or more"))
+        guides = [s for s in good if s["kind"] == "guide"]
+        comment_prs = {s["pr"] for s in good if s["kind"] == "comment"}
+        wide = [s for s in good if s["kind"] == "prs"]
+        strength = r["strength"]
+        if strength == "required" and not guides and len(comment_prs) < 2:
+            if comment_prs or wide:
+                strength = "practice"
+                refused.append((name, "kept as practice: required needs a guide quote or maintainers "
+                                      "saying it on 2 or more PRs"))
+            else:
+                refused.append((name, "no source that checks out"))
+                continue
+        if strength == "practice" and not good:
+            refused.append((name, f"no source that checks out (a practice needs {floor} or more merged "
+                                  "PRs, a maintainer's comment or a guide quote)"))
+            continue
+        seen.add(rid)
+        kept.append({"id": rid, "section": r["section"], "strength": strength, "text": clean,
+                     "sources": good})
+    return kept, refused, dropped
+
+
+def profile_id(rules):
+    """The id the user approves: the first 12 hex digits of the rules' SHA-256."""
+    canon = json.dumps(sorted(rules, key=lambda r: r["id"]), sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False)
+    return hashlib.sha256(canon.encode()).hexdigest()[:12]
+
+
+def source_ref(s):
+    """A source as a short plain reference (no link): what a session sees next to a rule."""
+    if s["kind"] == "guide":
+        return md_text(s["path"], 120)
+    if s["kind"] == "comment":
+        return f"maintainer on #{s['pr']}"
+    nums = s["prs"]
+    more = f" and {len(nums) - 5} more" if len(nums) > 5 else ""
+    return "merged " + ", ".join(f"#{n}" for n in nums[:5]) + more
+
+
+def rule_order(rules):
+    order = {k: i for i, (k, _) in enumerate(PROFILE_SECTIONS)}
+    return sorted(rules, key=lambda r: (order[r["section"]], PROFILE_STRENGTHS.index(r["strength"]), r["id"]))
+
+
+def render_profile(repo, rules, base, learned_at):
+    """profile.md: the learned rules as sessions read them, under the driver's own heading."""
+    pid = profile_id(rules)
+    out = [f"## Contribution rules learned from {md_text(repo, 100)}", "", PROFILE_HEADING, "",
+           f"Rules id {pid}, learned at base {md_text(base, 12)} on {md_text(learned_at, 10)}. "
+           "A required rule is stated by a guide file or by maintainers on 2 or more PRs; a practice is "
+           "what merged PRs show.", ""]
+    last = None
+    for r in rule_order(rules):
+        if r["section"] != last:
+            if last is not None:
+                out.append("")
+            last = r["section"]
+            out += [f"### {dict(PROFILE_SECTIONS)[last]}", ""]
+        refs = "; ".join(source_ref(s) for s in r["sources"])
+        out.append(f"- {r['strength']}: {md_text(r['text'], RULE_MAX_CHARS)} ({refs})")
+    return "\n".join(out) + "\n"
+
+
+def source_link(repo, base, s):
+    """A source as a markdown link for the user's review document. The driver builds every URL
+    from the repo, the base and a checked path or number; nothing a session wrote becomes one."""
+    quote = urllib.parse.quote
+    site = f"https://github.com/{repo}"
+    if s["kind"] == "guide":
+        return f"[{md_text(s['path'], 120)}]({site}/blob/{base}/{quote(s['path'])})"
+    if s["kind"] == "comment":
+        return f"[maintainer {md_text(s['author'], 40)} on #{s['pr']}]({site}/pull/{s['pr']})"
+    nums = s["prs"]
+    shown = ", ".join(f"[#{n}]({site}/pull/{n})" for n in nums[:8])
+    return f"merged PRs {shown}" + (f" and {len(nums) - 8} more" if len(nums) > 8 else "")
+
+
+def render_review(repo, rules, notes, dropped, summary, meta):
+    """PROFILE-REVIEW.md: what the user reads before approving a learned profile."""
+    pid = profile_id(rules)
+    base = str(meta.get("base", ""))
+    req = sum(1 for r in rules if r["strength"] == "required")
+    guides, merged, closed = (int(meta.get(k, 0)) for k in ("guides", "merged", "closed"))
+    out = [f"# What {md_text(repo, 100)} expects from a contribution", "",
+           f"**Learned, not yet approved.** Rules id `{pid}`. Runs on this repo refuse until you approve "
+           "this id; to correct a rule, write the correction in the repo's overrides file.", "",
+           "| | |", "|---|---|",
+           f"| **Read** | {guides} guide files at base `{md_text(base, 12)}`, {merged} merged PRs by outside "
+           f"contributors, {closed} closed without merging |",
+           f"| **Rules** | {len(rules)} kept ({req} required, {len(rules) - req} practice); "
+           f"{len(notes)} notes on what was left out or changed; {len(dropped)} dropped by the screen |"]
+    if guides <= 1 or merged < 6:
+        out.append("| **Little to learn from** | Few guide files or merged outside PRs, so most of what this "
+                   "repo expects is not here; expect to add overrides. |")
+    out += ["", "## What the project cares about", ""]
+    lines = [md_text(delink(one_line(l, RULE_MAX_CHARS)), RULE_MAX_CHARS)
+             for l in str(summary or "").splitlines() if one_line(l)][:6]
+    out += [f"- {no_block(l)}" for l in lines] or ["(The learn session wrote no summary.)"]
+    out += ["", "## Rules"]
+    last = None
+    for r in rule_order(rules):
+        if r["section"] != last:
+            last = r["section"]
+            out += ["", f"### {dict(PROFILE_SECTIONS)[last]}", ""]
+        out.append(f"- **{r['strength']}**: {md_text(r['text'], RULE_MAX_CHARS)}")
+        for s in r["sources"]:
+            q = f": \"{md_text(delink(s['quote']), QUOTE_MAX_CHARS)}\"" if s.get("quote") else ""
+            out.append(f"  - {source_link(repo, base, s)}{q}")
+    if notes:
+        shown = NOTES_SHOWN
+        out += ["", "## Left out or changed", ""]
+        out += [f"- {md_text(i, 40)}: {md_text(delink(one_line(w)), 300)}" for i, w in notes[:shown]]
+        if len(notes) > shown:
+            out.append(f"- and {len(notes) - shown} more")
+    if dropped:
+        out += ["", "## Dropped by the screen", "",
+                "The screen takes rules about secrets, posting or filing anything, and local details. "
+                "If one of these matters, add it to the overrides yourself.", ""]
+        out += [f"- {md_text(i, 40)}: {md_text(delink(one_line(w)), 300)}" for i, w in dropped[:NOTES_SHOWN]]
+        if len(dropped) > NOTES_SHOWN:
+            out.append(f"- and {len(dropped) - NOTES_SHOWN} more")
+    return "\n".join(out) + "\n"
+
+
+# ----- what a learn fetches -------------------------------------------------------------
+# Guide files, matched per path segment ('*' stays inside one folder), case-insensitively.
+GUIDE_GLOBS = ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING*", "CODE_OF_CONDUCT*", "CLA*", ".contributors", "CODEOWNERS",
+               ".github/*TEMPLATE*", ".github/*TEMPLATE*/*", ".github/*CONTRIBUT*", ".github/AI*",
+               ".github/CODEOWNERS", "docs/*CONTRIBUT*", "docs/*REVIEW*", "docs/CODEOWNERS")
+GUIDE_TEXT = (".md", ".markdown", ".rst", ".txt")
+GUIDE_MAX_FILES = 40
+GUIDE_MAX_BYTES = 200_000
+GUIDE_TOTAL_BYTES = 1_500_000   # all guides together, so PRs keep at least half the bundle
+LEARN_MERGED, LEARN_CLOSED = 30, 15
+LEARN_SEARCH_PAGES = 3
+LEARN_BODY_MAX, LEARN_COMMENT_MAX, LEARN_BUNDLE_MAX = 20_000, 5_000, 3_000_000
+LEARN_MAX_TURNS = 60
+LEARN_TIMEOUT = 40 * 60
+LEARN_TOOLS = ("Read", "Glob", "Grep", "Edit", "Write")
+CLA_FILE = re.compile(r"(?:^|/)(?:\.contributors|CLA[^/]*)(?:/|$)", re.I)
+LINK_RE = re.compile(r"\]\(\s*<?([^)\s>]+)")
+
+
+def guide_match(path):
+    """True when a repo path is one of the guide files a learn reads."""
+    segs = path.lower().split("/")
+    for g in GUIDE_GLOBS:
+        gs = g.lower().split("/")
+        if len(gs) == len(segs) and all(fnmatch.fnmatchcase(s, q) for s, q in zip(segs, gs)):
+            return True
+    return False
+
+
+def guide_links(path, text):
+    """Repo paths a guide's markdown links point to (relative, or from the root), without anchors."""
+    out = []
+    for t in LINK_RE.findall(text):
+        t = t.split("#", 1)[0].split("?", 1)[0]
+        if not t or re.match(r"[a-z][a-z0-9+.-]*:", t, re.I):
+            continue
+        q = posixpath.normpath(t.lstrip("/") if t.startswith("/") else posixpath.join(posixpath.dirname(path), t))
+        if q not in out and q not in (".", "..") and not q.startswith("../"):
+            out.append(q)
+    return out
+
+
+def rule_changes(prev, rules):
+    """Plain lines saying how the rules changed from a previous profile.json."""
+    old = {r.get("id"): r for r in ((prev or {}).get("rules") or []) if isinstance(r, dict) and isinstance(r.get("id"), str)}
+    new = {r["id"]: r for r in rules}
+    out = [f"added {i} ({new[i]['strength']}): {new[i]['text']}" for i in sorted(new.keys() - old.keys())]
+    out += [f"removed {i}" for i in sorted(old.keys() - new.keys())]
+    for i in sorted(new.keys() & old.keys()):
+        a, b = old[i], new[i]
+        what = [k for k in ("section", "strength", "text", "sources") if a.get(k) != b.get(k)]
+        if what:
+            out.append(f"changed {i}: its {', '.join(what)}")
+    return out
 
 
 def inside(path, root):
@@ -452,7 +949,12 @@ class Driver:
         self.repo = args.repo
         pdir = Path(os.environ.get("CONTRIB_PROFILE_DIR", SKILL / "profiles"))
         self.prof = load_env(pdir / f"{self.repo.replace('/', '-')}.env")
-        self.prof_md = (pdir / f"{self.repo.replace('/', '-')}.md").read_text()
+        self.prof_md, self.rules_from = self.load_profile(pdir)
+        if self.prof_md is None and not (getattr(args, "learn", False) or getattr(args, "approve_profile", None)
+                                         or args.commit_ledger):
+            print(f"no profile for {self.repo}: run --learn, read its PROFILE-REVIEW.md, then --approve-profile ID",
+                  file=sys.stderr)
+            sys.exit(2)
         self.repo_dir = Path(self.prof["REPO_DIR"])
         self.upstream = f"{self.prof['UPSTREAM_REMOTE']}/{self.prof['BASE_BRANCH']}"
         for d in (LEDGER / "candidates", LEDGER / "runs", WORK / "bins", WORK / "clones", WORK / "bin", WORK / "nodes", WORK / "tmp",
@@ -464,8 +966,11 @@ class Driver:
         try:
             fcntl.flock(self.lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("another contrib-run holds the ledger lock; not starting", file=sys.stderr)
-            sys.exit(EXIT_BUSY)
+            if not getattr(args, "approve_profile", None):
+                print("another contrib-run holds the ledger lock; not starting", file=sys.stderr)
+                sys.exit(EXIT_BUSY)
+            print("a run holds the ledger lock; waiting for it to finish before approving", file=sys.stderr, flush=True)
+            fcntl.flock(self.lockf, fcntl.LOCK_EX)
         self.run_id = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
         self.run_dir = LEDGER / "runs" / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,11 +1541,12 @@ class Driver:
     def preflight(self):
         self.log(f"run {self.run_id}: repo {self.repo}, limit {self.args.limit}, "
                  f"deadline {datetime.datetime.fromtimestamp(self.deadline).isoformat(timespec='minutes')}")
+        self.log(f"profile: {self.rules_from}")
         self.recover_stale()
         # Session scratch folders left by a run that did not finish (the run lock means none is
         # in use); a resumed session needs only its transcript, not its scratch files.
         for d in (WORK / "tmp").glob("*"):
-            if d.is_dir() and not d.is_symlink() and re.fullmatch(r"(scout|cand|session)-[\w.-]+", d.name):
+            if d.is_dir() and not d.is_symlink() and re.fullmatch(r"(scout|cand|session|learn)-[\w.-]+", d.name):
                 shutil.rmtree(d, ignore_errors=True)
         # Build folders are kept only for candidates that will continue (needs-you, stopped).
         keep = {Path(st["_dir"]).name for st in self.all_states()
@@ -1177,6 +1683,7 @@ class Driver:
     def session_homes(self):
         homes = [d for d in sorted((LEDGER / "candidates").glob("*")) if d.is_dir() and not d.is_symlink()]
         homes += [d / "scout" for d in sorted((LEDGER / "runs").glob("*")) if (d / "scout").is_dir()]
+        homes += [d / "learn" for d in sorted((LEDGER / "runs").glob("*")) if (d / "learn").is_dir()]
         return homes
 
     def record_sessions(self):
@@ -1232,7 +1739,7 @@ class Driver:
             path = rest.split("\t", 1)[-1]
             if mode == "160000":
                 return f"a nested repository is tracked at {path}"
-            if re.match(r"(candidates/[^/]+|runs/[^/]+/scout)/session/", path):
+            if re.match(r"(candidates/[^/]+|runs/[^/]+/(?:scout|learn))/session/", path):
                 return f"a session-written file is still tracked: {path}"
         return None
 
@@ -1304,6 +1811,373 @@ class Driver:
         with open(LEDGER / "rejects.md", "a") as f:
             f.write(f"- {datetime.date.today()} {self.repo} {slug}: {one_line(reason)}\n")
 
+    # ----- a repo's contribution rules: the hand profile, or learned ones you approved ---------
+    def rules_dir(self):
+        return LEDGER / "repos" / self.repo.replace("/", "-")
+
+    def rules_file(self, name):
+        """profile.json (the latest learn) or approved.json (the rules runs use), only when its
+        rules still hash to the id it names."""
+        f = read_json(self.rules_dir() / name, None)
+        if not isinstance(f, dict) or not isinstance(f.get("rules"), list):
+            return None
+        try:
+            return f if profile_id(f["rules"]) == f.get("id") else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def learned(self):
+        """(the latest learned rules, the approved rules). Runs use the approved ones, so a newer
+        learn changes nothing until you approve its id."""
+        return self.rules_file("profile.json"), self.rules_file("approved.json")
+
+    def load_profile(self, pdir):
+        """(the profile text sessions read, where it came from). A hand profile wins while there
+        is one; otherwise the learned rules, only once you approved their id."""
+        name = self.repo.replace("/", "-")
+        hand = pdir / f"{name}.md"
+        if hand.exists():
+            return hand.read_text(), "hand profile"
+        latest, appr = self.learned()
+        if appr is None:
+            return None, None
+        try:
+            text = render_profile(self.repo, appr["rules"], str(appr.get("base", "")), str(appr.get("learned_at", "")))
+        except (KeyError, TypeError):
+            return None, None
+        over = pdir / f"{name}.overrides.md"
+        if over.exists():
+            text = ("## Your overrides (these win over the learned rules)\n\n" + over.read_text().strip()
+                    + "\n\n" + text)
+        frm = f"learned rules {appr['id']}"
+        if latest and latest["id"] != appr["id"]:
+            frm += f"; newer learned rules {latest['id']} wait for your approval"
+        return text, frm
+
+    def git_blob(self, sha):
+        r = subprocess.run(["git", *GIT_SAFE, "-C", str(self.repo_dir), "cat-file", "blob", sha],
+                           capture_output=True, env=self.git_env(), timeout=120)
+        if r.returncode:
+            raise RuntimeError(f"git cat-file {sha[:12]}: {one_line(r.stderr.decode(errors='replace'), 200)}")
+        return r.stdout
+
+    def gh_json(self, *a):
+        out = self.gh(*a)
+        try:
+            return json.loads(out) if out.strip() else None
+        except ValueError:
+            raise RuntimeError(f"gh {' '.join(a[:3])}: the answer was not JSON")
+
+    def fetch_guides(self, base, also=()):
+        """The guide files at base, the in-repo text files they link to, and any file a current
+        rule cites: ({path: {"text", "blob"}}, notes on what was left out)."""
+        tree, links = {}, {}
+        for ent in self.git("ls-tree", "-r", "-z", "--full-tree", base).split("\0"):
+            meta, _, path = ent.partition("\t")
+            parts = meta.split()
+            if path and len(parts) == 3 and parts[1] == "blob" and parts[0] in ("100644", "100755"):
+                tree[path] = parts[2]
+            elif path and len(parts) == 3 and parts[1] == "blob" and parts[0] == "120000":
+                links[path] = parts[2]
+        guides, notes, total = {}, [], [0]
+
+        def add(path):
+            if path in guides:
+                return
+            if len(guides) >= GUIDE_MAX_FILES:
+                notes.append(f"{path}: past the limit of {GUIDE_MAX_FILES} files")
+                return
+            data = self.git_blob(tree[path])
+            if len(data) > GUIDE_MAX_BYTES:
+                notes.append(f"{path}: {len(data)} bytes, over the limit of {GUIDE_MAX_BYTES}")
+            elif b"\0" in data:
+                notes.append(f"{path}: not a text file")
+            elif total[0] + len(data) > GUIDE_TOTAL_BYTES:
+                notes.append(f"{path}: past the total of {GUIDE_TOTAL_BYTES} bytes for all guides")
+            else:
+                total[0] += len(data)
+                guides[path] = {"text": data.decode("utf-8", errors="replace"), "blob": tree[path]}
+
+        # A guide that is a symbolic link (CONTRIBUTING.md -> docs/contributing.md, say) is read
+        # as the file it points to, when that file is in the tree.
+        for q in sorted(x for x in links if guide_match(x)):
+            target = self.git_blob(links[q]).decode("utf-8", errors="replace")
+            to = posixpath.normpath(posixpath.join(posixpath.dirname(q), target))
+            if target.startswith("/") or to.startswith("../") or to not in tree:
+                notes.append(f"{q}: a link to {one_line(target, 120)}, which is not a file in the tree")
+            else:
+                notes.append(f"{q}: a link, read as {to}")
+                add(to)
+        first = sorted(q for q in tree if guide_match(q)) + [q for q in also if q in tree and not guide_match(q)]
+        for q in first:
+            add(q)
+        linked = []
+        for q in list(guides):
+            if q.lower().endswith(GUIDE_TEXT):
+                linked += [x for x in guide_links(q, guides[q]["text"])
+                           if x in tree and x not in guides and x not in linked and x.lower().endswith(GUIDE_TEXT)]
+        for q in linked:
+            add(q)
+        return guides, notes
+
+    def fetch_pr(self, n, item, merged):
+        """One PR as the learn bundle keeps it, or None when it only touches CLA files."""
+        api = f"repos/{self.repo}"
+        files = self.gh_json("api", f"{api}/pulls/{n}/files?per_page=100") or []
+        names = [str(f.get("filename", "")) for f in files if isinstance(f, dict)]
+        if names and all(CLA_FILE.search(x) for x in names):
+            return None
+        # One page of each list is read; a full page means there was more, which the index says.
+        cut = ["files"] if isinstance(files, list) and len(files) >= 100 else []
+        comments = []
+        for kind, path, prefix in (("comment", f"{api}/issues/{n}/comments?per_page=100", "ic"),
+                                   ("review", f"{api}/pulls/{n}/reviews?per_page=100", "rv"),
+                                   ("review comment", f"{api}/pulls/{n}/comments?per_page=100", "rc")):
+            got = self.gh_json("api", path) or []
+            if isinstance(got, list) and len(got) >= 100:
+                cut.append(kind + "s")
+            for c in got if isinstance(got, list) else []:
+                if not isinstance(c, dict) or not str(c.get("body") or "").strip():
+                    continue
+                comments.append({"id": f"{prefix}-{c.get('id')}", "kind": kind,
+                                 "author": one_line((c.get("user") or {}).get("login", ""), 60),
+                                 "association": one_line(c.get("author_association", ""), 30),
+                                 "path": one_line(c.get("path", ""), 200) if prefix == "rc" else "",
+                                 "body": str(c.get("body"))[:LEARN_COMMENT_MAX]})
+        return {"number": n, "title": one_line(item.get("title"), 200), "state": "merged" if merged else "closed",
+                "author": one_line((item.get("user") or {}).get("login", ""), 60),
+                "association": one_line(item.get("author_association", ""), 30), "files": names[:100],
+                "body": str(item.get("body") or "")[:LEARN_BODY_MAX], "comments": comments, "cut": cut}
+
+    def fetch_prs(self, merged, want, budget):
+        """Up to `want` PRs by outside contributors (not maintainers, bots or you), newest first,
+        merged or closed without merging. budget is a one-item list: the bundle's bytes left."""
+        q = f"repo:{self.repo} is:pr " + ("is:merged" if merged else "is:closed is:unmerged")
+        me = str(self.prof.get("CONTRIBUTOR") or "").lower()
+        prs, skipped = {}, collections.Counter()
+        for page in range(1, LEARN_SEARCH_PAGES + 1):
+            res = self.gh_json("api", "-X", "GET", "search/issues", "-f", f"q={q}", "-f", "sort=updated",
+                               "-f", "order=desc", "-f", "per_page=100", "-f", f"page={page}")
+            items = res.get("items") if isinstance(res, dict) and isinstance(res.get("items"), list) else []
+            for it in items:
+                if len(prs) >= want:
+                    break
+                if not isinstance(it, dict) or not isinstance(it.get("number"), int):
+                    continue
+                if budget[0] <= 0:
+                    skipped["left out, the bundle was full"] += 1
+                    continue
+                user = it.get("user") or {}
+                login = str(user.get("login", ""))
+                if it.get("author_association") in MAINTAINERS:
+                    skipped["passed over, by maintainers"] += 1
+                elif user.get("type") == "Bot" or login.endswith("[bot]"):
+                    skipped["passed over, by bots"] += 1
+                elif me and login.lower() == me:
+                    skipped["passed over, yours"] += 1
+                else:
+                    pr = self.fetch_pr(it["number"], it, merged)
+                    if pr is None:
+                        skipped["passed over, only CLA files"] += 1
+                        continue
+                    size = len(json.dumps(pr))
+                    if size > budget[0]:
+                        # One huge PR is skipped, not allowed to end the fetch for the rest.
+                        skipped["left out, too big for what was left of the bundle"] += 1
+                        continue
+                    budget[0] -= size
+                    if pr.get("cut"):
+                        skipped["read in part, more than 100 " + " or ".join(pr["cut"])] += 1
+                    prs[it["number"]] = pr
+            if len(prs) >= want or budget[0] <= 0 or len(items) < 100:
+                break
+        return prs, skipped
+
+    def write_bundle(self, bdir, base, guides, prs, subjects, labels, notes, current):
+        """The learn session's reading: guides/, prs/<N>.md, subjects, labels and an index."""
+        shutil.rmtree(bdir, ignore_errors=True)
+        gdir = bdir / "guides"
+        gdir.mkdir(parents=True)
+        for path, g in guides.items():
+            dst = gdir / path
+            if not inside(dst.parent, gdir) and dst.parent != gdir:
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(g["text"])
+        (bdir / "prs").mkdir()
+        for n, pr in sorted(prs.items()):
+            out = [f"# PR #{n}: {pr['title']}", "",
+                   f"State: {'merged' if pr['state'] == 'merged' else 'closed without merging'}",
+                   f"Author: {pr['author']} ({pr['association']})",
+                   f"Files changed ({len(pr['files'])}): " + ", ".join(pr["files"][:60]), "", "## Body", "",
+                   pr["body"] or "(empty)", "", "## Reviews and comments", ""]
+            for c in pr["comments"]:
+                where = f" on {c['path']}" if c.get("path") else ""
+                out += [f"### {c['kind']}, id {c['id']}, by {c['author']} ({c['association']}){where}", "", c["body"], ""]
+            if not pr["comments"]:
+                out.append("(none)")
+            (bdir / "prs" / f"{n}.md").write_text("\n".join(out) + "\n")
+        (bdir / "subjects.txt").write_text("\n".join(subjects) + "\n")
+        (bdir / "labels.txt").write_text("\n".join(labels) + "\n")
+        if current is not None:
+            write_json(bdir / "current.json", current)
+        merged = sorted(n for n, p in prs.items() if p["state"] == "merged")
+        closed = sorted(n for n, p in prs.items() if p["state"] != "merged")
+        idx = [f"# Bundle for {self.repo}", "", f"Base commit: {base}", "",
+               f"## Guide files ({len(guides)})", ""] + [f"- guides/{q}" for q in sorted(guides)]
+        idx += ["", f"## Merged PRs by outside contributors ({len(merged)})", "",
+                ", ".join(map(str, merged)) or "(none)", "", f"## Closed without merging ({len(closed)})", "",
+                ", ".join(map(str, closed)) or "(none)"]
+        if notes:
+            idx += ["", "## Left out", ""] + [f"- {x}" for x in notes]
+        (bdir / "index.md").write_text("\n".join(idx) + "\n")
+
+    def changes_entry(self, rdir, title, lines, raw=()):
+        f = rdir / "CHANGES.md"
+        head = "" if f.exists() else f"# Rule changes for {md_text(self.repo, 100)}\n"
+        body = [f"- {md_text(x, 400)}" for x in lines] + list(raw)
+        with open(f, "a") as fh:
+            fh.write(f"{head}\n## {datetime.date.today().isoformat()}: {title} (run {self.run_id})\n\n"
+                     + "\n".join(body or ["- no rule changed"]) + "\n")
+
+    def learn(self):
+        """--learn: fetch the bundle, let one session write rules.json, keep the rules whose
+        sources check out, and write the profile and its review. Approves nothing."""
+        home = self.run_dir / "learn"
+        sdir, bdir = home / "session", home / "bundle"
+        self.learn_written = []   # what a failure part way through has left, for its message
+        sdir.mkdir(parents=True, exist_ok=True)
+        self.log(f"learn {self.repo}: fetching the bundle")
+        if not self.args.stub:
+            self.git("fetch", "-q", "--no-tags", self.prof["UPSTREAM_REMOTE"], timeout=900)
+        base = self.git("rev-parse", "--verify", self.upstream + "^{commit}")
+        rdir = self.rules_dir()
+        latest, appr = self.learned()
+        # A refresh is compared with the rules runs use now, and keeps their ids.
+        prev = appr or latest
+        cited = sorted({s["path"] for r in (prev or {}).get("rules", []) if isinstance(r, dict)
+                        for s in r.get("sources", []) if isinstance(s, dict) and s.get("kind") == "guide"
+                        and isinstance(s.get("path"), str)})
+        guides, notes = self.fetch_guides(base, cited)
+        prs, skipped, labels = {}, collections.Counter(), []
+        if not self.args.stub:
+            budget = [LEARN_BUNDLE_MAX - sum(len(g["text"]) for g in guides.values())]
+            for merged, want in ((True, LEARN_MERGED), (False, LEARN_CLOSED)):
+                got, sk = self.fetch_prs(merged, want, budget)
+                prs.update(got)
+                skipped.update(sk)
+            for lb in self.gh_json("api", f"repos/{self.repo}/labels?per_page=100") or []:
+                if isinstance(lb, dict):
+                    labels.append(one_line(f"{lb.get('name', '')}: {lb.get('description') or ''}", 200))
+        subjects = [one_line(s, 200) for s in self.git("log", "--format=%s", "-n", "200", base).splitlines()]
+        notes += [f"PRs {k}: {v}" for k, v in sorted(skipped.items())]
+        current = {"id": prev.get("id"), "rules": prev.get("rules")} if prev else None
+        self.write_bundle(bdir, base, guides, prs, subjects, labels, notes, current)
+        n_merged = sum(1 for x in prs.values() if x["state"] == "merged")
+        self.log(f"learn: base {base[:12]}, {len(guides)} guide files, {n_merged} merged and "
+                 f"{len(prs) - n_merged} closed PRs by outside contributors")
+        prompt = (f"{'Refresh' if prev else 'Learn'} the contribution rules of {self.repo}. Your bundle is "
+                  f"in {bdir}; start with {bdir}/index.md. Write {sdir}/rules.json, then {sdir}/next.json.")
+        system = "\n\n---\n\n".join((SKILL / f).read_text()
+                                     for f in ("rules/common.md", "rules/profile.md", "stages/learn.md"))
+        try:
+            res = self.session("learn", home, prompt, system, self.args.learn_model, [sdir], None, home, learn=True)
+        finally:
+            self.archive_transcripts(home)
+            shutil.rmtree(self.session_tmp(home, make=False), ignore_errors=True)
+        if res.get("is_error") or res.get("_rc"):
+            raise RuntimeError(f"the learn session ended with an error: {one_line(res.get('result'), 200)}")
+        raw = read_session_json(sdir / "rules.json")
+        if raw is None:
+            raise RuntimeError("the learn session wrote no readable rules.json")
+        kept, rnotes, dropped = check_rules(raw, {"guides": guides, "prs": prs})
+        summary = raw.get("summary") if isinstance(raw.get("summary"), str) else ""
+        meta = {"base": base, "guides": len(guides), "merged": n_merged, "closed": len(prs) - n_merged}
+        review = render_review(self.repo, kept, rnotes, dropped, summary, meta)
+        cost = res.get("total_cost_usd")
+        used = (f"| **Learn session** | {res.get('num_turns', '?')} turns, "
+                f"{round((res.get('duration_ms') or 0) / 60000, 1)} min"
+                + (f", about ${cost:.2f} API-equivalent" if isinstance(cost, (int, float)) else "") + " |")
+        review = review.replace("\n\n## What the project cares about", f"\n{used}\n\n## What the project cares about", 1)
+        if not kept:
+            (home / "PROFILE-REVIEW.md").write_text(review)
+            raise RuntimeError(f"no rule's sources checked out; what was refused is in {home / 'PROFILE-REVIEW.md'}")
+        pid = profile_id(kept)
+        learned_at = datetime.date.today().isoformat()
+        prof = {"repo": self.repo, "id": pid, "base": base, "learned_at": learned_at, "run": self.run_id,
+                "summary": summary[:2000], "rules": kept, "notes": rnotes, "dropped": dropped, "meta": meta}
+        same = appr is not None and appr["id"] == pid
+        if same:
+            review = "\n".join(f"**Approved** (the same rules as the id you approved). Rules id `{pid}`. To correct "
+                               "a rule, write the correction in the repo's overrides file."
+                               if x.startswith("**Learned, not yet approved.**") else x for x in review.split("\n"))
+        (rdir / "history").mkdir(parents=True, exist_ok=True)
+        self.learn_written.append("profile.json")
+        write_json(rdir / "profile.json", prof)
+        self.learn_written.append(f"history/{self.run_id}-{pid}.json")
+        write_json(rdir / "history" / f"{self.run_id}-{pid}.json", prof)
+        if same:
+            # profile.md is the approved rules as runs see them; unapproved rules never get that heading.
+            (rdir / "profile.md").write_text(render_profile(self.repo, kept, base, learned_at))
+        self.learn_written.append("PROFILE-REVIEW.md")
+        (rdir / "PROFILE-REVIEW.md").write_text(review)
+        self.learn_written.append("CHANGES.md")
+        hint = [] if same else [f"- Approve with `contrib-run --repo {self.repo} --approve-profile {pid}` "
+                                "after reading PROFILE-REVIEW.md"
+                                + (f"; until then runs keep using {appr['id']}" if appr else "")]
+        self.changes_entry(rdir, f"learned {pid}" + ("" if same else ", not approved"), rule_changes(prev, kept), hint)
+        self.ledger_commit(f"learn {self.repo} rules {pid}")
+        self.log(f"learn: {len(kept)} rules kept, {len(rnotes)} notes, {len(dropped)} dropped; rules id {pid}; "
+                 f"read {rdir / 'PROFILE-REVIEW.md'}" + ("" if same else ", then approve it"))
+        return EXIT_DONE
+
+    def learn_failure(self, e):
+        """The log line for a learn that failed: what it left behind, if anything."""
+        left = getattr(self, "learn_written", [])
+        what = (f"after writing {', '.join(left)} under {self.rules_dir()}; nothing was approved, and runs "
+                "keep the rules they had" if left else "nothing was written")
+        return f"learn failed, {what}: {type(e).__name__}: {one_line(str(e), 300)}"
+
+    def approve_profile(self, want):
+        """--approve-profile ID: approve the learned rules, only under the id they hash to now."""
+        rdir = self.rules_dir()
+        if not (rdir / "profile.json").exists():
+            print(f"no learned rules for {self.repo}; run --learn first", file=sys.stderr)
+            return 2
+        prof, appr = self.learned()
+        if prof is None:
+            print("profile.json does not match its own id; run --learn again", file=sys.stderr)
+            return 2
+        pid = prof["id"]
+        if want != pid:
+            print(f"the learned rules' id is {pid}, not {one_line(want, 20)}; read PROFILE-REVIEW.md for {pid} first",
+                  file=sys.stderr)
+            return 2
+        if appr is not None and appr["id"] == pid:
+            print(f"rules {pid} for {self.repo} are already approved")
+            return EXIT_DONE
+        # approved.json holds the rules themselves, so a later learn cannot change what runs use.
+        write_json(rdir / "approved.json", {"id": pid, "approved_at": now(), "base": prof.get("base"),
+                                            "learned_at": prof.get("learned_at"), "run": prof.get("run"),
+                                            "rules": prof["rules"]})
+        (rdir / "profile.md").write_text(render_profile(self.repo, prof["rules"], prof.get("base", ""),
+                                                        prof.get("learned_at", "")))
+        rv = rdir / "PROFILE-REVIEW.md"
+        if rv.exists():
+            day = datetime.date.today().isoformat()
+            rv.write_text("\n".join(f"**Approved on {day}.** Rules id `{pid}`. To correct a rule, write the "
+                                    "correction in the repo's overrides file."
+                                    if x.startswith("**Learned, not yet approved.**") else x
+                                    for x in rv.read_text().split("\n")))
+        hand = Path(os.environ.get("CONTRIB_PROFILE_DIR", SKILL / "profiles")) / f"{self.repo.replace('/', '-')}.md"
+        use = (f"approved, but the hand profile {hand.name} still wins until it is removed" if hand.exists()
+               else "runs on this repo use these rules from now on")
+        self.changes_entry(rdir, f"approved {pid}", [use] + ([f"they replace {appr['id']}"] if appr else []))
+        self.ledger_commit(f"approve {self.repo} rules {pid}")
+        print(f"approved rules {pid} for {self.repo}" + (f"; the hand profile {hand.name} still wins until it is removed"
+                                                          if hand.exists() else ""))
+        return EXIT_DONE
+
     # ----- GitHub snapshots (driver only; sessions never hold a token) ------------------
     def snapshot(self, dest):
         dest.mkdir(parents=True, exist_ok=True)
@@ -1323,7 +2197,7 @@ class Driver:
         (dest / "fetched.txt").write_text(now() + "\n")
 
     # ----- sandboxed Claude sessions -------------------------------------------------
-    def settings_for(self, write_dirs, clone):
+    def settings_for(self, write_dirs, clone, only=None):
         """Session settings. Sandboxed Bash may write only write_dirs; the file tools only those too."""
         h = str(HOME)
         # Reads are closed by default: every entry in the home directory is hidden except the
@@ -1340,13 +2214,30 @@ class Driver:
             q = Path(h) / e
             if not any(k == q or q in k.parents for k in keep):
                 secret_files.append(str(q))
+        if only is not None:
+            # A learn session reads its own folders only. Claude Code lets the file tools read
+            # outside the working folder without asking, so an allow rule cannot narrow them; deny
+            # rules can, and they win over any allow. Everything is hidden from the filesystem root
+            # down, level by level, except the path to each allowed folder.
+            allow = [Path(os.path.realpath(p)) for p in only]
+            stack = [Path("/")]
+            while stack:
+                d = stack.pop()
+                if d in allow or not d.is_dir() or d.is_symlink():
+                    continue
+                for e in sorted(os.listdir(d)):
+                    q = d / e
+                    if any(a == q or q in a.parents for a in allow):
+                        stack.append(q)
+                    else:
+                        secret_files.append(str(q))
         deny_write = [f"{h}/.claude", str(SKILL), str(LEDGER / "QUEUE.md"), str(LEDGER / "rejects.md")]
         deny_edit = [f"Edit(/{h}/.claude/**)", f"Edit(/{SKILL}/**)"]
         if clone:
             g = Path(clone) / ".git"
             deny_write += [str(g / "config"), str(g / "hooks"), str(g / "info")]
             deny_edit += [f"Edit(/{g}/config)", f"Edit(/{g}/hooks/**)", f"Edit(/{g}/info/**)"]
-        domains = ["raw.githubusercontent.com"]
+        domains = [] if only is not None else ["raw.githubusercontent.com"]
         node = self.st().get("node")
         if node and node.get("port"):
             # The sandbox's own localhost is private; the proxy runs on the host and may reach
@@ -1377,13 +2268,17 @@ class Driver:
             },
         }
 
-    def claude_cmd(self, prompt, model, settings, write_dirs, system_text, session_arg):
+    def claude_cmd(self, prompt, model, settings, write_dirs, system_text, session_arg, learn=False):
+        tools = ["Read", "Glob", "Grep"] if learn else \
+            ["Read", "Glob", "Grep", "Bash", "Agent", "WebFetch(domain:raw.githubusercontent.com)"]
         cmd = [self.args.claude, "-p", prompt, "--output-format", "json", "--model", model,
                "--permission-mode", "dontAsk", "--settings", str(settings),
                "--setting-sources", SETTING_SOURCES, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-               "--allowedTools", "Read", "Glob", "Grep", "Bash", "Agent",
-               "WebFetch(domain:raw.githubusercontent.com)", *[f"Edit(/{d}/**)" for d in write_dirs]]
-        agents = agent_defs()
+               "--allowedTools", *tools, *[f"Edit(/{d}/**)" for d in write_dirs]]
+        if learn:
+            # A learn session has the file tools and nothing else: no shell, web, agents or MCP.
+            cmd += ["--tools", ",".join(LEARN_TOOLS), "--max-turns", str(LEARN_MAX_TURNS)]
+        agents = None if learn else agent_defs()
         if agents:
             cmd += ["--agents", json.dumps(agents)]
         if system_text:
@@ -1402,12 +2297,13 @@ class Driver:
         """The session's scratch folder: its own, outside the shared /tmp/claude-<uid> (which is
         hidden from it), removed when the candidate or the scout finishes and swept at start."""
         scout = self.run_dir / "scout"
-        d = WORK / "tmp" / (f"scout-{self.run_id}" if home == scout else f"cand-{home.name}")
+        d = WORK / "tmp" / (f"scout-{self.run_id}" if home == scout else f"learn-{self.run_id}"
+                            if home == self.run_dir / "learn" else f"cand-{home.name}")
         if make:
             d.mkdir(mode=0o700, parents=True, exist_ok=True)
         return d
 
-    def session(self, stage, cwd, prompt, system_text, model, write_dirs, clone, home, _fresh=False):
+    def session(self, stage, cwd, prompt, system_text, model, write_dirs, clone, home, _fresh=False, learn=False):
         """One turn of a sandboxed headless session. home is a driver-owned folder for its records.
         A session id is recorded only once the session exists (its result names it, or its
         transcript is on disk), so a launch that failed is never 'resumed'."""
@@ -1415,7 +2311,7 @@ class Driver:
         known = read_json(sess, {})
         settings = self.run_dir / f"settings-{home.name}-{stage}.json"
         stmp = self.session_tmp(home)
-        write_json(settings, self.settings_for([*write_dirs, stmp], clone))
+        write_json(settings, self.settings_for([*write_dirs, stmp], clone, only=[home, stmp] if learn else None))
         new_sid = None
         pend = known.get(f"{stage}.pending")
         if stage not in known and isinstance(pend, str) and self.transcripts(pend):
@@ -1429,7 +2325,7 @@ class Driver:
             known[f"{stage}.pending"] = new_sid
             arg = ["--session-id", new_sid]
         write_json(sess, known)
-        cmd = self.claude_cmd(prompt, model, settings, write_dirs, system_text, arg)
+        cmd = self.claude_cmd(prompt, model, settings, write_dirs, system_text, arg, learn=learn)
         stamp = int(time.time())
         out = home / "sessions" / f"{stage}-{stamp}.json"
         n = 1
@@ -1440,7 +2336,7 @@ class Driver:
         self.log(f"session {stage}: turn starts ({model})")
         env = self.claude_env()
         env["CLAUDE_CODE_TMPDIR"] = env["TMPDIR"] = str(stmp)
-        rc = self.run_tracked("session", cmd, cwd=str(cwd), env=env, timeout=TURN_TIMEOUT, out=out,
+        rc = self.run_tracked("session", cmd, cwd=str(cwd), env=env, timeout=LEARN_TIMEOUT if learn else TURN_TIMEOUT, out=out,
                               err_apart=True)
         text = out.read_text(errors="replace") if out.exists() else ""
         err = Path(str(out) + ".err").read_text(errors="replace")[-4000:] if Path(str(out) + ".err").exists() else ""
@@ -1466,7 +2362,7 @@ class Driver:
                     "packet.md) to see where the work stands, then carry on.\n\n")
             self.check_stop()
             return self.session(stage, cwd, note + prompt, system_text, model, write_dirs, clone, home,
-                                _fresh=True)
+                                _fresh=True, learn=learn)
         if res.get("is_error") or rc:
             low = (msg + " " + err).lower()
             if any(k in low for k in ("usage limit", "rate limit", "limit reached", "credit balance",
@@ -2768,6 +3664,17 @@ class Driver:
         if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
             signal.signal(signal.SIGHUP, self.on_signal)
         threading.Thread(target=self.watchdog, daemon=True).start()
+        if getattr(self.args, "approve_profile", None):
+            return self.approve_profile(self.args.approve_profile)
+        if getattr(self.args, "learn", False):
+            try:
+                return self.learn()
+            except StopRun as e:
+                print(f"learn stopped: {e}", file=sys.stderr)
+                return EXIT_HARD
+            except Exception as e:
+                self.log(self.learn_failure(e))
+                return 1
         if self.args.commit_ledger:
             try:
                 self.ledger_commit(self.args.commit_ledger)
@@ -3014,6 +3921,11 @@ def main():
     ap.add_argument("--answer", nargs=2, metavar=("SLUG", "TEXT"),
                     help="answer a needs-you candidate's question and continue it (runs only that candidate)")
     ap.add_argument("--merge", action="store_true", help="with --retest, test a trial merge with the current base")
+    ap.add_argument("--learn", action="store_true",
+                    help="learn the repo's contribution rules from its guides and PRs; writes PROFILE-REVIEW.md, "
+                         "approves nothing")
+    ap.add_argument("--approve-profile", metavar="ID", help="approve the learned rules with this id, then exit")
+    ap.add_argument("--learn-model", default="opus")
     sys.exit(Driver(ap.parse_args()).main())
 
 

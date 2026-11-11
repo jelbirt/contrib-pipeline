@@ -631,3 +631,87 @@ review; then the citation check on each place, on moved and existing names, a ho
 that looks like a file header, the cap, a 1 MB word and a broken pattern, and that final_checks
 runs it. Each guard has its own check: removing any one of them fails exactly that check. The
 driver before this change fails 5 of the 7 original review checks and has no citation check.
+
+## Learning each repo's rules, phase 1 steps 1 and 2 (2026-11-11, SPEC.md)
+
+What sessions are told about a repo used to come only from a hand-written profile
+(`profiles/<owner>-<name>.md`). Phase 1 lets the driver learn it instead, with a source for
+every rule, and nothing learned is used until you approve it. SPEC.md is the plan; this is what
+steps 1 and 2 built.
+
+- **`--learn`** fetches a bundle on the host, outside any session: the guide files at the
+  upstream base (fixed globs, matched one path segment at a time, plus in-repo text files they
+  link to and files current rules cite; at most 40 files of 200 KB), up to 30 merged and 15
+  closed PRs by outside contributors (found with the search API, which carries
+  `author_association`; maintainers, bots, you and PRs that only touch CLA files are passed
+  over), each PR's reviews and comments with ids, the label list and 200 commit subjects. The
+  whole bundle is capped at 3 MB. One session (Opus by default) reads it and writes
+  `rules.json`. That session has the file tools only (`--tools Read,Glob,Grep,Edit,Write`, no
+  shell, web, agents or MCP), no network, a turn cap and a timeout, and its sandbox hides the
+  rest of the ledger and the work dir level by level, so it reads its own bundle and nothing
+  else. Its system text is `rules/common.md`, `rules/profile.md` and `stages/learn.md`, never a
+  repo profile.
+- **The driver checks every rule** (`check_rules`), since the bundle is untrusted text written by
+  strangers. A guide quote must appear in that guide's text, HTML comments included since PR
+  templates keep guidance there (links reduced to their words, whole words at both ends, at
+  least 8 words, at most 600 characters). A comment quote must come from that comment's
+  own prose (quoted replies, code, HTML comments and details blocks do not count). A "required"
+  rule needs a guide quote or the same point from maintainers on 2 or more PRs, or it is
+  downgraded to practice; a practice rule needs at least max(3, half the sample) PRs. Rule text
+  with a link, host or email is refused, and so is anything that reads as an instruction to post,
+  file, comment, upload or handle a secret. The kept rules are rendered as escaped plain lines
+  under a fixed heading, so nothing in them can become markup or a link in a prompt.
+- **Ids and approval.** The rules id is the first 12 hex digits of the SHA-256 of the kept rules.
+  `--learn` writes `profile.json`, `profile.md`, `PROFILE-REVIEW.md` (the reader-style review),
+  a `CHANGES.md` entry and a copy under `history/`, in `~/contrib-queue/repos/<owner>-<name>/`,
+  and approves nothing. `--approve-profile ID` refuses any id but the one the latest rules hash
+  to now, and copies those rules into `approved.json`. Runs use the rules in `approved.json`
+  (checked against its own id), so a newer learn changes nothing until you approve it, and the
+  run log says which id it used and whether newer rules are waiting.
+- **Fail closed.** A repo with neither a hand profile nor approved learned rules is refused
+  (exit 2) with what to run. A learn whose session errs, writes no readable `rules.json` or keeps
+  no rule writes nothing under `repos/`. A hand profile still wins while it exists, so xerj is
+  unchanged until step 7 switches it.
+- **Ledger.** `runs/*/learn/{session,bundle,transcripts}/` are ignored and checked like the other
+  session folders; the files under `repos/` are written only by the driver and committed.
+
+**Review of step 1** (before step 2 was written) found one critical gap, which was reproduced and
+fixed: a quote made only of link syntax normalized to nothing, and an empty quote "appeared" in
+every guide, so a forged required rule was kept. Quotes are now counted on their visible words.
+Its other findings were fixed too: invisible and control characters are dropped, the comment
+filter knows every block form that is not the author's own prose, sources are deduplicated and
+ordered, wrong field types and oversize lists are refused rather than crashing, the screen no
+longer drops ordinary rules ("post-merge", "tokenizer") and catches more real ones, and the
+review document cannot be broken by what a session writes. `quote_norm` is linear.
+
+**Tests.** `tests/smoke/unit_learn.py` covers the checks, the screen, rendering, ids, guide
+matching, links, rule changes, profile loading (hand, none, unapproved, approved, newer learn,
+edited approval, overrides), approval, the learn session's tools, reads and network. Before the review
+fixes, thirteen mutants of the step 1 checks each failed their own test; the pre-fix driver
+fails every step 1 review test. The stub suite learns a second repo that has no hand profile: refused, then
+learned, the wrong id refused, approved, and a run whose every session read the learned rules.
+
+### Review of steps 1 and 2 (2026-11-11)
+
+An independent review found no way around the approval gate, and these gaps, all fixed:
+
+- **Reads.** Claude Code lets the file tools read outside the working folder without asking, so
+  a learn session could read /etc, /usr, other users' folders and /tmp. An allow rule cannot
+  narrow that; deny rules can, and they win. A learn session's settings now deny everything from
+  the filesystem root down except the path to its own folders. What is created after the session
+  starts in a folder on that path (the home folder, the ledger) is not covered; the session would
+  have to guess its name, and it has no shell or network to use it.
+- **Hosts in rule text.** A bare host (evil.example.com, raw.githubusercontent.com), an IPv4
+  address or localhost is refused, as a link is; endings that are also file extensions and code
+  names such as java.io are left alone. Home and system paths, ssh keys and similar are dropped
+  as local details. Bare hosts are also replaced in review text, since some viewers link them.
+- **Quotes on whole words.** "ever merge" no longer matches "never merge".
+- **HTML in comments.** Nested details and block quotes are taken out innermost first, and pre
+  blocks and inline quotes are not the commenter's words.
+- **Fetch notes.** All guides together are capped at 1.5 MB, so PRs keep at least half the
+  bundle. One oversized PR is skipped instead of ending the fetch, a full bundle counts what it
+  left out, a PR with a full page of comments, reviews or files is noted as read in part, and a
+  guide that is a symbolic link is read as its target when that is in the tree.
+- **Messages.** A learn that fails after writing says what it wrote. Approving says when the hand
+  profile still wins. repos/<repo>/profile.md is written only for approved rules.
+
