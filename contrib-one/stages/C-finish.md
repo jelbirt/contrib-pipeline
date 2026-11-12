@@ -14,9 +14,9 @@ Get an independent review, act on it, and write the PR body.
 2. **Act on the findings.** Verify each one yourself. Fix the confirmed ones in new commits
    (never amend), with a test where a test can show it. Re-run what the fix touches through
    the driver. Note findings you judge not worth fixing, with the reason.
-3. **Final runs on HEAD.** Ask for the new tests, the touched files' tests, `fmt`, `clippy`,
-   and (for engine or API changes) `yaml` full. Every one must be `met: true` on the final
-   commit. Copy the decisive logs into `session/evidence/`.
+3. **Final runs on HEAD.** Ask for the new tests, the touched files' tests, and every format,
+   lint and wider check the profile requires for this change. Every one must be `met: true`
+   on the final commit. Copy the decisive logs into `session/evidence/`.
 4. **PR body.** Write `session/PR_BODY.md` in the profile's shape. Then trim it: cut every sentence
    that repeats another, every filler phrase, every claim without evidence. Target the
    profile's word range. Check: no em or en dashes, no attribution, every number traceable
@@ -29,7 +29,7 @@ Get an independent review, act on it, and write the PR body.
    choice and each decision without opening `details.md`. Cut it to the word limit.
 6. **Overlap, one last time.** The driver refreshed `gh/` just before this stage. Read
    `gh/prs.json` (and any `gh/search-*.json`) for an open PR that is not the user's and
-   touches the same behaviour, issue or ratchet line. If one appeared since stage A, stop
+   touches the same behaviour, issue or listed gap. If one appeared since stage A, stop
    with `needs-you` and name it; do not finish a duplicate.
 7. Leave the worktree clean: everything committed.
 

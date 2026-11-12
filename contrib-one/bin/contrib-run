@@ -940,7 +940,150 @@ class StopRun(Exception):
     pass
 
 
+# Keys a profile's .env must set. A profile is in commands mode when it names TEST_CMD: the
+# repo's own commands run its tests and checks. Otherwise it is in cargo mode (xerj).
+BASE_KEYS = ("REPO_DIR", "UPSTREAM_REMOTE", "BASE_BRANCH", "CONTRIBUTOR")
+CARGO_KEYS = ("GUARD", "YAML_DIR", "SERVER_BUILD", "SERVER_BIN", "RUNNER_BUILD", "RUNNER_BIN")
+COMMAND_KEYS = ("GUARD", "SETUP_CMD", "SETUP_KEY", "TEST_CMD", "TEST_EXIT_PASS", "TEST_EXIT_FAIL")
+CMD_SLOTS = {"env", "cache", "paths", "junit"}
+
+
+def profile_problems(prof, base_only=False):
+    """What is missing or malformed in a profile's .env, as sentences; empty when it is usable."""
+    cmd = bool(prof.get("TEST_CMD", "").strip())
+    need = list(BASE_KEYS) if base_only else [*BASE_KEYS, *(COMMAND_KEYS if cmd else CARGO_KEYS)]
+    checks = prof.get("CHECKS", "").split()
+    if cmd and not base_only:
+        need += [f"CHECK_{n}" for n in checks]
+    out = [f"{k} is missing or empty" for k in dict.fromkeys(need) if not prof.get(k, "").strip()]
+    if not cmd or base_only:
+        return out
+    for k in ("TEST_EXIT_PASS", "TEST_EXIT_FAIL", "TEST_EXIT_NONE"):
+        v = prof.get(k, "").strip()
+        if v and not re.fullmatch(r"\d{1,3}", v):
+            out.append(f"{k} is not an exit code: {v!r}")
+    for n in checks:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,30}", n):
+            out.append(f"CHECKS names {n!r}: a check name is capital letters, digits and _")
+    for n in prof.get("GATE_CHECKS", "").split():
+        if n not in checks:
+            out.append(f"GATE_CHECKS names {n}, which is not in CHECKS")
+    if "{paths}" not in shlex.split(prof.get("TEST_CMD", "")):
+        out.append("TEST_CMD has no {paths} word")
+    for p in prof.get("TOOLS", "").split():
+        if not os.path.isabs(p):
+            out.append(f"TOOLS names {p!r}, which is not an absolute path")
+    for k in ("SETUP_CMD", "TEST_CMD", "JAIL_ENV", *[f"CHECK_{n}" for n in checks]):
+        try:
+            for w in shlex.split(prof.get(k, "")):
+                bad = set(re.findall(r"\{(\w+)\}", w)) - CMD_SLOTS
+                if bad:
+                    out.append(f"{k} uses an unknown slot {{{sorted(bad)[0]}}}")
+        except ValueError as e:
+            out.append(f"{k} does not split into words: {e}")
+    return out
+
+
+def render_cmd(tpl, values, lists=None):
+    """A profile command as argv. The template is split into words as a shell would, then a word
+    that is exactly `{name}` for a list becomes that list's items, one argument each, and other
+    `{name}` slots are filled with one string. Nothing runs it through a shell, so a value from a
+    session is always data and never code."""
+    lists = lists or {}
+    argv = []
+    for w in shlex.split(tpl):
+        m = re.fullmatch(r"\{(\w+)\}", w)
+        if m and m.group(1) in lists:
+            argv += [str(x) for x in lists[m.group(1)]]
+            continue
+
+        def fill(x):
+            if x.group(1) not in values:
+                raise RuntimeError(f"command slot {{{x.group(1)}}} has no value here")
+            return str(values[x.group(1)])
+        argv.append(re.sub(r"\{(\w+)\}", fill, w))
+    return argv
+
+
+def junit_counts(path):
+    """tests, failures, errors and skipped from a JUnit XML report, summed over its suites; None
+    when there is no readable report. These are counts the runner wrote, read as facts."""
+    import xml.etree.ElementTree as ET
+    try:
+        if os.path.getsize(path) > 50_000_000:
+            return None
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    c = dict.fromkeys(("tests", "failures", "errors", "skipped"), 0)
+    for s in suites:
+        for k in c:
+            try:
+                c[k] += int(s.get(k, "0"))
+            except ValueError:
+                return None
+    return c if suites else None
+
+
+def has_report(prof):
+    """Whether the profile's TEST_CMD writes a report the driver reads: {junit} in any word."""
+    return any("{junit}" in w for w in shlex.split(prof.get("TEST_CMD", "")))
+
+
+def gone_note(note):
+    """A gate test whose note says no test matched (renamed or removed since it passed). Not a
+    run whose tests were all skipped: that is a test switched off, never 'gone'."""
+    return "no test ran" in str(note or "")
+
+
+def issue_number(x):
+    """The issue number a scout wrote, as an int; None when it wrote none; -1 when it wrote
+    something that is not an issue number."""
+    if x is None or x == "":
+        return None
+    if isinstance(x, bool):
+        return -1
+    if isinstance(x, int):
+        return x if 0 < x < 10 ** 9 else -1
+    m = re.fullmatch(r"#?(\d{1,9})", x.strip()) if isinstance(x, str) else None
+    return int(m.group(1)) if m and int(m.group(1)) > 0 else -1
+
+
+def judge_test(rc, counts, expect, prof, report=True):
+    """Whether a commands-mode test run met its expectation, and why not. Facts only: the exit code
+    against the profile's codes, then the report's counts when the command writes one
+    (report=True); counts is None when it should have and did not."""
+    ok_rc, fail_rc = int(prof["TEST_EXIT_PASS"]), int(prof["TEST_EXIT_FAIL"])
+    none_rc = int(prof["TEST_EXIT_NONE"]) if prof.get("TEST_EXIT_NONE", "").strip() else None
+    if expect == "any":
+        return True, ""
+    if none_rc is not None and rc == none_rc:
+        return False, "no test ran: none was found; check the paths and the filter"
+    if rc not in (ok_rc, fail_rc):
+        return False, f"exit {rc} is neither the pass nor the fail code: an import, collection or usage error; read the log"
+    if report and counts is None:
+        return False, "the runner wrote no readable report, so the driver cannot count the tests"
+    if expect == "pass":
+        if rc != ok_rc:
+            return False, "a test failed"
+        if counts is not None and counts["tests"] - counts["skipped"] <= 0:
+            return False, "every test it found was skipped, so nothing passed"
+        return True, ""
+    if rc != fail_rc:
+        return False, "every test passed; nothing failed"
+    if counts is not None and (counts["failures"] == 0 or counts["errors"] > 0):
+        return False, "the run failed, but not by a test failing (errors in the report, or no failures)"
+    return True, ""
+
+
 class Driver:
+    # Defaults for drivers built without __init__ (unit checks); __init__ sets them from the profile.
+    commands = False
+    assign_first = False
+    env_dir = None
+    last_counts = None
+
     def __init__(self, args):
         self.args = args
         self.t_start = time.time()
@@ -954,6 +1097,16 @@ class Driver:
             print(f"no profile for {self.repo}: run --learn, read its PROFILE-REVIEW.md, then --approve-profile ID",
                   file=sys.stderr)
             sys.exit(2)
+        probs = profile_problems(self.prof, base_only=bool(getattr(args, "learn", False) or getattr(args, "approve_profile", None)
+                                                           or args.commit_ledger))
+        if probs:
+            print(f"profile {pdir / (self.repo.replace('/', '-') + '.env')} is not usable: " + "; ".join(probs),
+                  file=sys.stderr)
+            sys.exit(2)
+        self.commands = bool(self.prof.get("TEST_CMD", "").strip())
+        self.assign_first = self.prof.get("ASSIGN_FIRST", "").strip() == "1"
+        self.env_dir = None
+        self.last_counts = None
         self.repo_dir = Path(self.prof["REPO_DIR"])
         self.upstream = f"{self.prof['UPSTREAM_REMOTE']}/{self.prof['BASE_BRANCH']}"
         for d in (LEDGER / "candidates", LEDGER / "runs", WORK / "bins", WORK / "clones", WORK / "bin", WORK / "nodes", WORK / "tmp",
@@ -1570,6 +1723,7 @@ class Driver:
         for rem in self.git("remote", check=False).split():
             if self.git("remote", "get-url", "--push", rem) != "no_push":
                 raise RuntimeError(f"remote {rem} of {self.repo_dir} can push; set its push URL to no_push")
+        self.refuse_shallow()
         self.repo_gc(self.repo_dir)
         self.repo_gc(LEDGER)
         if self.args.stub:
@@ -2308,7 +2462,7 @@ class Driver:
             g = Path(clone) / ".git"
             deny_write += [str(g / "config"), str(g / "hooks"), str(g / "info")]
             deny_edit += [f"Edit(/{g}/config)", f"Edit(/{g}/hooks/**)", f"Edit(/{g}/info/**)"]
-        domains = [] if only is not None else ["raw.githubusercontent.com"]
+        domains = [] if only is not None else self.prof.get("REF_HOST", "").split()
         node = self.st().get("node")
         if node and node.get("port"):
             # The sandbox's own localhost is private; the proxy runs on the host and may reach
@@ -2335,13 +2489,14 @@ class Driver:
                 "deny": [f"Read(/{p})" for p in secret_files] + [f"Read(/{p}/**)" for p in secret_files]
                 + ["Read(//proc/**)", "Read(//sys/**)", f"Read(/{tmp_root})", f"Read(/{tmp_root}/**)"] + deny_edit
                 + ["Bash(git push:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(xerj:*)",
-                   "Bash(cargo:*)", "Bash(sudo:*)", "WebFetch(domain:api.github.com)", "WebSearch"],
+                   "Bash(cargo:*)", "Bash(sudo:*)", "WebFetch(domain:api.github.com)", "WebSearch"]
+                + [f"Bash({w}:*)" for w in self.prof.get("SESSION_DENY", "").split()],
             },
         }
 
     def claude_cmd(self, prompt, model, settings, write_dirs, system_text, session_arg, learn=False):
         tools = ["Read", "Glob", "Grep"] if learn else \
-            ["Read", "Glob", "Grep", "Bash", "Agent", "WebFetch(domain:raw.githubusercontent.com)"]
+            ["Read", "Glob", "Grep", "Bash", "Agent"] + [f"WebFetch(domain:{h})" for h in self.prof.get("REF_HOST", "").split()]
         cmd = [self.args.claude, "-p", prompt, "--output-format", "json", "--model", model,
                "--permission-mode", "dontAsk", "--settings", str(settings),
                "--setting-sources", SETTING_SOURCES, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
@@ -2448,7 +2603,8 @@ class Driver:
         packet = (SKILL / "rules" / "packet.md").read_text()
         if stage_file[:1] in ("A", "C"):
             packet += "\n" + (SKILL / "examples" / "packet.md").read_text()
-        parts = [(SKILL / "rules" / "common.md").read_text(), self.prof_md, packet,
+        parts = [(SKILL / "rules" / "common.md").read_text(), self.prof_md,
+                 *([self.requests_text()] if self.commands else []), packet,
                  (SKILL / "stages" / stage_file).read_text()]
         return "\n\n---\n\n".join(parts)
 
@@ -2607,8 +2763,15 @@ class Driver:
             kind = req.get("kind")
             t0 = time.time()
             rc, note, out = 0, "", res_dir / f"{rid}.log"
+            self.last_counts = None
             try:
-                if kind == "test":
+                if self.commands and kind not in ("test", "check", "gh"):
+                    rc, note = 2, f"unknown request kind {kind!r}: this repo's kinds are test, check and gh"
+                elif self.commands and kind == "test":
+                    rc, out, note = self.req_cmd_test(rid, req)
+                elif self.commands and kind == "check":
+                    rc, out, note = self.req_check(rid, req)
+                elif kind == "test":
                     rc, out, note = self.req_test(rid, req)
                 elif kind == "fmt":
                     rc = self.ensure_fetched(rid)
@@ -2652,26 +2815,19 @@ class Driver:
                 rc, note = 1, f"driver error: {e}"
             if not Path(out).exists():
                 Path(out).write_text(note + "\n")
-            expect = req.get("expect", "pass" if kind in ("test", "clippy", "yaml", "fmt", "build") else "any")
+            expect = req.get("expect", "pass" if kind in ("test", "check", "clippy", "yaml", "fmt", "build") else "any")
             if expect not in ("pass", "fail", "any"):
                 expect = "pass"
             infra = rc in INFRA_EXITS
-            met = (not infra) and ((expect == "any") or (expect == "pass" and rc == 0) or (expect == "fail" and rc != 0))
-            if met and kind == "test" and expect == "fail":
-                log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
-                if re.search(r"^error\[E\d+\]:|^error: could not compile", log, re.M) or "test result: FAILED" not in log:
-                    met, note = False, (note + "; " if note else "") + "it did not compile or no test failed"
-            if met and kind == "test" and expect == "pass":
-                log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
-                ran = sum(int(x) for x in re.findall(r"^test result: ok\. (\d+) passed", log, re.M))
-                ignored = sum(int(x) for x in re.findall(r"^test result: \w+\. \d+ passed; \d+ failed; (\d+) ignored", log, re.M))
-                if ran == 0 and ignored and not log.startswith("[stub]"):
-                    met, note = False, (note + "; " if note else "") + f"the test is ignored ({ignored} ignored), not run"
-                elif ran == 0 and not log.startswith("[stub]"):
-                    met, note = False, (note + "; " if note else "") + "no test ran: check the target and filter"
+            met, note = self.judge_result(kind, expect, rc, out, note)
             rec = {"id": rid, "at": now(), "kind": kind, "exit": rc, "expect": expect, "met": met, "infra": infra,
                    "secs": int(time.time() - t0), "log": str(Path(out).relative_to(self.cand)), "note": one_line(note, 500)}
-            if kind == "test" and rc not in (2,) and not req.get("without"):
+            if self.commands and kind == "test" and not note.startswith("refused:") and not req.get("without"):
+                rec["req"] = {"paths": [p for p in req["paths"]] if isinstance(req.get("paths"), list) else [req.get("paths")],
+                              "filter": req.get("filter", "") if isinstance(req.get("filter"), str) else ""}
+                if self.last_counts is not None:
+                    rec["counts"] = self.last_counts
+            elif not self.commands and kind == "test" and rc not in (2,) and not req.get("without"):
                 rec["req"] = {k: req[k] for k in ("crate", "target", "filter") if isinstance(req.get(k), str)}
             with open(index, "a") as f:
                 f.write(json.dumps(rec) + "\n")
@@ -2696,7 +2852,9 @@ class Driver:
         sel = "--lib" if target == "lib" else f"--test {target}"
         inner = f"cargo test --profile ci-test -p {crate} {sel}" + (f" -- {filt}" if filt else "")
         without = req.get("without", [])
-        rels = without if isinstance(without, list) else []
+        if not isinstance(without, list):
+            return 2, out, "without must be a list of paths"
+        rels = without
         if any(self.clone_path(p) is None for p in rels) or len(rels) > 20:
             return 2, out, "a without path is not a plain file path inside the clone"
         if any(not os.path.lexists(self.clone() / p) for p in rels):
@@ -2734,6 +2892,254 @@ class Driver:
                     pass
         note = "reverted to base for this run: " + ", ".join(rels) if rels else ""
         return rc, out, note
+
+    def refuse_shallow(self):
+        """Sessions read history (git log, blame) to check claims; a shallow clone hides it."""
+        if self.git("rev-parse", "--is-shallow-repository", check=False) == "true":
+            raise RuntimeError(f"{self.repo_dir} is a shallow clone; run once: git -C {self.repo_dir} fetch "
+                               f"--unshallow {self.prof['UPSTREAM_REMOTE']}")
+
+    def judge_result(self, kind, expect, rc, out, note):
+        """Whether a finished request met its expectation, and the note to record. Facts only: the
+        exit code, then for tests the runner's own report counts (commands mode) or cargo's summary
+        lines (cargo mode). A run the driver refused never meets an expectation in commands mode."""
+        if rc in INFRA_EXITS:
+            return False, note
+        met = (expect == "any") or (expect == "pass" and rc == 0) or (expect == "fail" and rc != 0)
+        def add(why):
+            return (note + "; " if note else "") + why
+        if self.commands and note.startswith(("refused:", "unknown request kind", "driver error",
+                                              "the dependency setup failed")):
+            return False, note
+        if kind != "test":
+            return met, note
+        log = Path(out).read_text(errors="replace") if Path(out).exists() else ""
+        if self.commands:
+            if log.startswith("[stub]"):
+                return met, note
+            met, why = judge_test(rc, self.last_counts, expect, self.prof, report=has_report(self.prof))
+            return met, (add(why) if why else note)
+        if met and expect == "fail":
+            if re.search(r"^error\[E\d+\]:|^error: could not compile", log, re.M) or "test result: FAILED" not in log:
+                return False, add("it did not compile or no test failed")
+        if met and expect == "pass" and not log.startswith("[stub]"):
+            ran = sum(int(x) for x in re.findall(r"^test result: ok\. (\d+) passed", log, re.M))
+            ignored = sum(int(x) for x in re.findall(r"^test result: \w+\. \d+ passed; \d+ failed; (\d+) ignored", log, re.M))
+            if ran == 0 and ignored:
+                return False, add(f"the test is ignored ({ignored} ignored), not run")
+            if ran == 0:
+                return False, add("no test ran: check the target and filter")
+        return met, note
+
+    # ----- commands mode: the repo's own setup, tests and checks ---------------------------
+    def env_root(self):
+        return WORK / "envs" / self.repo.replace("/", "-")
+
+    def tool_dirs(self):
+        return [Path(p) for p in self.prof.get("TOOLS", "").split()]
+
+    def jail_env(self):
+        """The profile's JAIL_ENV, with {env} and {cache} filled, and TOOLS first on PATH."""
+        e = {}
+        if self.tool_dirs():
+            e["PATH"] = ":".join(map(str, self.tool_dirs())) + f":{HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+        vals = {"env": str(self.env_dir or ""), "cache": str(self.env_root() / "cache")}
+        for w in shlex.split(self.prof.get("JAIL_ENV", "")):
+            k, sep, v = w.partition("=")
+            if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+                e[k] = render_cmd(shlex.quote(v), vals)[0] if v else ""
+        return e
+
+    def cmd_values(self, junit=None):
+        v = {"env": str(self.env_dir), "cache": str(self.env_root() / "cache")}
+        if junit:
+            v["junit"] = str(junit)
+        return v
+
+    def ensure_setup(self, rid):
+        """Install the repo's dependencies for the base commit, once per change of the SETUP_KEY
+        paths. SETUP_CMD is the only command with network, so it runs on files exported from the
+        pipeline clone at the base, never on the session's clone, with only the new environment,
+        the export and the setup caches writable. Every later run gets the environment read-only."""
+        base = self.st()["base_sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", base or ""):
+            raise RuntimeError("state.json base_sha is not a commit id")
+        ids = [self.git("rev-parse", "--verify", "--quiet", f"{base}:{p}", check=False) or "-"
+               for p in self.prof["SETUP_KEY"].split()]
+        key = hashlib.sha256("\n".join([self.prof["SETUP_CMD"], self.prof.get("JAIL_ENV", ""),
+                                        self.prof.get("TOOLS", ""), *ids]).encode()).hexdigest()[:16]
+        root = self.env_root()
+        self.env_dir = root / key
+        if (self.env_dir / ".contrib-ready").is_file():
+            return 0
+        for p in self.tool_dirs():
+            if not p.is_dir():
+                raise RuntimeError(f"TOOLS names {p}, which is not a folder")
+        exp, tgt = WORK / "tmp" / f"setup-{key}", WORK / "tmp" / f"setup-{key}-target"
+        for d in (exp, tgt, self.env_dir):
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True)
+        for d in (root / "cache", root / "cargo"):
+            d.mkdir(parents=True, exist_ok=True)
+        self.log(f"setup: installing dependencies for base {base[:12]} into {self.env_dir}")
+        try:
+            if not (self.args.stub and not self.args.real_requests):
+                r = subprocess.run(f"git {shlex.join(GIT_SAFE)} -C {shlex.quote(str(self.repo_dir))} archive {base}"
+                                   f" | tar -x -C {shlex.quote(str(exp))}", shell=True, capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", env=self.git_env())
+                if r.returncode:
+                    self.log(f"export of {base[:12]} for setup failed: {one_line(r.stderr, 200)}")
+                    return 1
+            env = dict(self.jail_env(), CARGO_HOME=str(root / "cargo"), CARGO_TARGET_DIR=str(tgt))
+            argv = self.jail('exec "$@"', net=True, rw=(exp, tgt, self.env_dir, root / "cache", root / "cargo"),
+                             ro=self.tool_dirs(), chdir=exp, env=env,
+                             argv=render_cmd(self.prof["SETUP_CMD"], self.cmd_values()))
+            rc, _ = self.guarded(f"{rid}-setup", argv, retries=0)
+        finally:
+            shutil.rmtree(exp, ignore_errors=True)
+            shutil.rmtree(tgt, ignore_errors=True)
+        if rc:
+            shutil.rmtree(self.env_dir, ignore_errors=True)
+            return rc
+        (self.env_dir / ".contrib-ready").write_text(base + "\n")
+        kept = sorted((d for d in root.iterdir() if (d / ".contrib-ready").is_file()),
+                      key=lambda d: (d / ".contrib-ready").stat().st_mtime, reverse=True)
+        for d in kept[2:]:
+            if d != self.env_dir:
+                shutil.rmtree(d, ignore_errors=True)
+        for d in root.iterdir():        # a setup that failed or was cut off leaves a folder never marked ready
+            if d.is_dir() and d.name not in ("cache", "cargo") and d != self.env_dir and not (d / ".contrib-ready").is_file():
+                shutil.rmtree(d, ignore_errors=True)
+        return 0
+
+    def cmd_jail(self, argv, over=(), extra_rw=()):
+        """A profile command in the jail: no network, the clone writable, the environment and the
+        tools read-only, and the clone's .git a checked copy, as in cargo_jail."""
+        src = self.git_dir_check(keep="build")
+        return self.jail('exec "$@"', rw=(self.clone(), *extra_rw), ro=(self.env_dir, *self.tool_dirs()),
+                         over=((src, self.clone() / ".git"), *over), chdir=self.clone(), env=self.jail_env(),
+                         argv=argv)
+
+    def session_paths(self, paths, dirs=False):
+        """Paths a session named for a command: existing files (or folders, when dirs) inside the
+        clone, none starting with '-' or '@' (many runners read '@name' as a file of more options), so
+        each stays one argument naming one thing. None if any is not."""
+        if isinstance(paths, str):
+            paths = [paths]
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 40:
+            return None
+        for p in paths:
+            f = self.clone_path(p)
+            if f is None or p.startswith(("-", "@")) or any(c in p for c in "\n\r"):
+                return None
+            if not (f.is_file() or (dirs and f.is_dir())) or not inside(f, self.clone()):
+                return None
+        return list(paths)
+
+    def req_cmd_test(self, rid, req):
+        out = self.cand / "results" / f"{rid}.log"
+        paths = self.session_paths(req.get("paths"))
+        filt = req.get("filter", "")
+        if paths is None:
+            return 2, out, "refused: paths must be 1 to 40 test files that exist in the clone"
+        if not isinstance(filt, str) or len(filt) > 200 or filt.startswith(("-", "@")) or any(c in filt for c in "\n\r\x00"):
+            return 2, out, "refused: the filter must be one line of at most 200 characters, not starting with - or @"
+        if filt and not self.prof.get("TEST_FILTER_FLAG", "").strip():
+            return 2, out, "refused: this repo's profile has no TEST_FILTER_FLAG, so a filter cannot be passed"
+        without = req.get("without", [])
+        if not isinstance(without, list):
+            return 2, out, "refused: without must be a list of paths"
+        rels = without
+        if any(self.clone_path(p) is None for p in rels) or len(rels) > 20:
+            return 2, out, "refused: a without path is not a plain file path inside the clone"
+        if any(not os.path.lexists(self.clone() / p) for p in rels):
+            return 2, out, "refused: a without path does not exist in the clone; only files the fix changed or added can be reverted"
+        rc = self.ensure_setup(rid)
+        if rc:
+            return rc, out, "the dependency setup failed"
+        base = self.st()["base_sha"]
+        tmp = WORK / "tmp" / f"cmd-{self.cand.name}-{rid}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        (tmp / "report").mkdir(parents=True)
+        junit = tmp / "report" / "junit.xml"
+        try:
+            # As in req_test: base versions laid over the clone inside this run's jail only.
+            over = []
+            for i, rel in enumerate(rels):
+                r = subprocess.run(["git", *GIT_SAFE, "-C", str(self.repo_dir), "cat-file", "blob", f"{base}:{rel}"],
+                                   capture_output=True, env=self.git_env())
+                src = tmp / str(i)
+                src.write_bytes(r.stdout if r.returncode == 0 else b"")
+                over.append((src, self.clone() / rel))
+            argv = render_cmd(self.prof["TEST_CMD"], self.cmd_values(junit), {"paths": paths})
+            if filt:
+                argv += [self.prof["TEST_FILTER_FLAG"].strip(), filt]
+            rc, out = self.guarded(rid, self.cmd_jail(argv, over=over, extra_rw=(tmp / "report",)),
+                                   retries=0 if req.get("expect") == "fail" else None)
+            if junit.is_file() and not junit.is_symlink():
+                shutil.copyfile(junit, self.cand / "results" / f"{rid}.junit.xml")
+                self.last_counts = junit_counts(self.cand / "results" / f"{rid}.junit.xml")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        note = "reverted to base for this run: " + ", ".join(rels) if rels else ""
+        if self.last_counts:
+            c = self.last_counts
+            note = (note + "; " if note else "") + (f"{c['tests']} tests, {c['failures']} failed, "
+                                                    f"{c['errors']} errors, {c['skipped']} skipped")
+        return rc, out, note
+
+    def req_check(self, rid, req):
+        out = self.cand / "results" / f"{rid}.log"
+        names = self.prof.get("CHECKS", "").split()
+        name = req.get("name")
+        if name not in names:
+            return 2, out, f"refused: unknown check {name!r}; this repo's checks are {', '.join(names) or 'none'}"
+        if req.get("paths") in (None, "", []):
+            paths = shlex.split(self.prof.get("CHECK_PATHS", ""))
+        else:
+            paths = self.session_paths(req.get("paths"), dirs=True)
+            if paths is None:
+                return 2, out, "refused: paths must be 1 to 40 files or folders that exist in the clone"
+        rc = self.ensure_setup(rid)
+        if rc:
+            return rc, out, "the dependency setup failed"
+        argv = render_cmd(self.prof[f"CHECK_{name}"], self.cmd_values(), {"paths": paths})
+        rc, out = self.guarded(rid, self.cmd_jail(argv), retries=0)
+        note = self.cgit("diff", "--no-ext-diff", "--stat", check=False)
+        return rc, out, (f"files changed so far: {one_line(note, 300)}" if note else "")
+
+    def requests_text(self):
+        """Commands mode: the runs a stage session can ask for, written from the profile, so the
+        session sees the exact commands and how each result is judged."""
+        p = self.prof
+        flag = p.get("TEST_FILTER_FLAG", "").strip()
+        rows = [f"| `test` | `paths`: a list of test files in the clone; `filter` (optional"
+                + (f", passed as `{flag} <filter>`" if flag else ", not available here")
+                + "); `expect`: `fail`, `pass` or `any`; `without` (optional): files laid back to their base "
+                f"version for this run only | `{p['TEST_CMD']}` |"]
+        for n in p.get("CHECKS", "").split():
+            rows.append(f"| `check`, `name`: `{n}` | `paths` (optional; default: the profile's list) | `{p[f'CHECK_{n}']}` |")
+        rows.append("| `gh` | `args`: a read-only gh command | `gh <args>` |")
+        none = p.get("TEST_EXIT_NONE", "").strip()
+        gate = p.get("GATE_CHECKS", "").split()
+        return "\n".join([
+            "## Runs you can request", "",
+            "Each run is one item in next.json's `requests`, with an `id`, a `kind` and the fields below. "
+            "It runs in the driver's jail: no network, the clone writable, the dependencies read-only. The "
+            "dependencies are installed once from the base commit's files, so a change that needs a new or "
+            "different dependency cannot be tested here: say so in the packet instead. Every run uses the "
+            f"base version of {', '.join(f'`{k}`' for k in p['SETUP_KEY'].split())}, so a change there is "
+            "never tested, and the final gate refuses a branch that makes one.", "",
+            "| kind | fields | command |", "|---|---|---|", *rows, "",
+            f"A test result is read from facts only: exit {p['TEST_EXIT_PASS']} with at least one test run is a "
+            f"pass; exit {p['TEST_EXIT_FAIL']} with failing tests and no errors is a fail"
+            + (f"; exit {none} means no test was found" if none else "")
+            + "; any other exit is an error (an import, collection or usage problem): read the log. The driver "
+            "writes each result to `results/index.jsonl`.", "",
+            "The final gate, on a fresh clone of your branch, runs "
+            + (", ".join(f"the {n} check" for n in gate) + ", then " if gate else "")
+            + "every test you ran expecting pass (its last form), then the test files the branch changes.",
+        ])
 
     def req_yaml(self, rid, req):
         """Node and runner together in one jail with no network; a fresh node per request."""
@@ -3190,8 +3596,16 @@ class Driver:
         self.state(review={"calls": len(verdicts), "usable": len(good), "changes_after": len(after)})
         return ""
 
+    def test_key(self, r):
+        """What makes two test requests the same run: (crate, target, filter) in cargo mode,
+        (paths, filter) in commands mode. A list, as the gate stores it in state.json."""
+        if self.commands:
+            paths = r.get("paths") if isinstance(r.get("paths"), list) else []
+            return ["\n".join(str(p) for p in paths), r.get("filter", "")]
+        return [r.get("crate"), r.get("target", "lib"), r.get("filter", "")]
+
     def replay_tests(self, skip_gone=False):
-        """The candidate's passing test requests, each (crate, target, filter) once."""
+        """The candidate's passing test requests, each once (see test_key)."""
         tests, seen = [], set()
         idx = self.cand / "results" / "index.jsonl"
         for line in (idx.read_text(errors="replace").splitlines() if idx.is_file() else []):
@@ -3202,17 +3616,52 @@ class Driver:
             r = rec.get("req") if isinstance(rec, dict) else None
             if rec.get("kind") == "test" and rec.get("expect") == "pass" and rec.get("met") and isinstance(r, dict) \
                     and not str(rec.get("id", "")).startswith(("retest-", "gate-")):
-                key = (r.get("crate"), r.get("target", "lib"), r.get("filter", ""))
+                key = tuple(self.test_key(r))
                 if key not in seen:
                     seen.add(key)
-                    tests.append({"kind": "test", "crate": key[0], "target": key[1], "filter": key[2]})
+                    if self.commands:
+                        tests.append({"kind": "test", "paths": key[0].split("\n") if key[0] else [], "filter": key[1]})
+                    else:
+                        tests.append({"kind": "test", "crate": key[0], "target": key[1], "filter": key[2]})
         # Each final gate replays every test, so one that is still gone is reported again and one
         # the session restored counts again; contrib-publish shows the gate's list. Only a retest,
         # which comes after that gate, leaves the gone ones out.
         if not skip_gone:
             return tests
         gone = {tuple(g) for g in (self.st().get("gate") or {}).get("gone_reqs", []) if isinstance(g, list)}
-        return [t for t in tests if (t["crate"], t["target"], t["filter"]) not in gone]
+        return [t for t in tests if tuple(self.test_key(t)) not in gone]
+
+    def changed_test_files(self, base):
+        """Files the branch's own commits add or change that the profile's TEST_FILES globs call
+        tests, and that still exist: the gate runs them all, expecting pass."""
+        globs = self.prof.get("TEST_FILES", "").split()
+        out = []
+        for n in self.cgit("diff", "--name-only", "--no-renames", "--diff-filter=AM", "-z", f"{base}..HEAD",
+                           check=False).split("\0"):
+            if n and any(fnmatch.fnmatchcase(n, g) for g in globs) and self.session_paths([n]):
+                out.append(n)
+        if len(out) > 40:
+            self.log(f"candidate {self.cand.name}: gate runs 40 of the {len(out)} changed test files; "
+                     "left out: " + one_line(", ".join(out[40:]), 300))
+        return out[:40]
+
+    def setup_paths_touched(self, base):
+        """Files under the profile's SETUP_KEY paths that the branch changes. Every run used their
+        base version (the dependency setup installs from the base commit), so none was tested."""
+        keys = self.prof.get("SETUP_KEY", "").split()
+        if not keys:
+            return []
+        return [n for n in self.cgit("diff", "--name-only", "--no-renames", "-z", f"{base}..HEAD", "--", *keys,
+                                     check=False).split("\0") if n]
+
+    def replay_split(self, tests, stamp):
+        """Commands mode: the replayed tests whose files all still exist in the clone, to run, and
+        those with a file the branch removed or renamed since it passed, counted as gone."""
+        run, gone = [], []
+        for i, t in enumerate(tests):
+            r = dict(t, id=f"{stamp}-t{i}")
+            (run if all(os.path.lexists(self.clone() / p) for p in t.get("paths", [])) else gone).append(r)
+        return run, gone
 
     def changed_crates(self, base):
         """Package names of the crates the branch's own commits touch (nearest Cargo.toml)."""
@@ -3261,13 +3710,31 @@ class Driver:
         shutil.rmtree(self.bins(), ignore_errors=True)
         self.state(binaries={})
         stamp = "gate-" + time.strftime("%m%d-%H%M%S")
-        crates = sorted({t["crate"] for t in tests} | self.changed_crates(s["base_sha"]))
-        # The YAML suite and clippy run first, so nothing a session-chosen test build leaves in
-        # the target dir can feed them.
-        reqs = [{"kind": "fmt", "check": True, "id": f"{stamp}-fmt"},
-                {"kind": "yaml", "full": True, "id": f"{stamp}-yaml"},
-                {"kind": "clippy", "workspace": True, "crates": crates, "id": f"{stamp}-clippy"}]
-        reqs += [dict(t, id=f"{stamp}-t{i}") for i, t in enumerate(tests)]
+        if self.commands:
+            # The repo's own checks first, then every test the sessions saw pass, then the test
+            # files the branch changes, all on this fresh clone.
+            crates = []
+            touched = self.setup_paths_touched(s["base_sha"])
+            if touched:
+                return ("the branch changes files the dependency setup installs from the base commit ("
+                        + one_line(", ".join(touched), 200) + "), so no run tested that change")
+            reqs = [{"kind": "check", "name": n, "id": f"{stamp}-{n.lower()}"} for n in self.prof.get("GATE_CHECKS", "").split()]
+            replay, missing = self.replay_split(tests, stamp)
+            reqs += replay
+            # Test files the branch adds or changes, less those a replayed run already covers whole.
+            covered = {p for t in tests if not t.get("filter") for p in t.get("paths", [])}
+            changed = [p for p in self.changed_test_files(s["base_sha"]) if p not in covered]
+            if changed:
+                reqs.append({"kind": "test", "paths": changed, "filter": "", "id": f"{stamp}-changed"})
+        else:
+            missing = []
+            crates = sorted({t["crate"] for t in tests} | self.changed_crates(s["base_sha"]))
+            # The YAML suite and clippy run first, so nothing a session-chosen test build leaves in
+            # the target dir can feed them.
+            reqs = [{"kind": "fmt", "check": True, "id": f"{stamp}-fmt"},
+                    {"kind": "yaml", "full": True, "id": f"{stamp}-yaml"},
+                    {"kind": "clippy", "workspace": True, "crates": crates, "id": f"{stamp}-clippy"}]
+            reqs += [dict(t, id=f"{stamp}-t{i}") for i, t in enumerate(tests)]
         self.log(f"candidate {self.cand.name}: final gate on a fresh clone and build, {len(reqs)} runs")
         bad = []
 
@@ -3304,16 +3771,20 @@ class Driver:
         gone = []
         if not bad:
             def no_test_ran(rec):
-                return rec.get("kind") == "test" and "no test ran" in str(rec.get("note", ""))
+                return rec.get("kind") == "test" and gone_note(rec.get("note"))
             passed = [r["id"] for r in reqs if r.get("kind") == "test" and recs.get(r["id"], {}).get("met")]
-            gone = [r["id"] for r in reqs if no_test_ran(recs.get(r["id"], {}))] if passed else []
+            gone = ([r["id"] for r in reqs if no_test_ran(recs.get(r["id"], {}))] + [r["id"] for r in missing]
+                    if passed else [])
             bad = [f"not met: {r['id']}" for r in reqs
                    if not recs.get(r["id"], {}).get("met") and r["id"] not in gone]
+            bad += [f"not met: {r['id']} (its test files are gone, and no other test passed)"
+                    for r in missing if r["id"] not in gone]
             if gone:
                 self.log(f"candidate {self.cand.name}: gate: {', '.join(gone)} matched no test (renamed or "
                          "removed since it passed); not counted, shown at publish")
         self.state(gate={"at": now(), "head": head, "ok": not bad, "gone": gone,
-                               "gone_reqs": [[r["crate"], r["target"], r["filter"]] for r in reqs if r["id"] in gone], "ids": [r["id"] for r in reqs],
+                               "gone_reqs": [self.test_key(r) for r in reqs + missing if r["id"] in gone],
+                               "ids": [r["id"] for r in reqs + missing],
                          "crates": crates, "ignored_files": ignored})
         return "; ".join(bad)
 
@@ -3342,10 +3813,12 @@ class Driver:
             self.cand = LEDGER / "candidates" / slug
         for d in ("results", "gh", "sessions", "session"):
             (self.cand / d).mkdir(parents=True, exist_ok=True)
+        n = None
         if not resume_dir:
             base = self.git("rev-parse", self.upstream)
+            n = issue_number(c.get("issue"))
             self.state(slug=slug, repo=self.repo, title=one_line(c.get("title"), 200),
-                       source=one_line(c.get("source"), 200), issue=c.get("issue") if isinstance(c.get("issue"), int) else None,
+                       source=one_line(c.get("source"), 200), issue=n if n and n > 0 else None,
                        status="running", stage="A", stages_done=[], base_sha=base,
                        branch=self.prof.get("BRANCH_PREFIX", "fix/") + slug, clone=str(self.clone()),
                        search_terms=c.get("search_terms", []),
@@ -3353,6 +3826,15 @@ class Driver:
         else:
             self.state(status="running", run=self.run_id, stop_reason=None, stop_kind=None)
         s = self.st()
+        if self.assign_first and n == -1:
+            # Assignment first cannot be checked without the issue: never guess, drop it.
+            why = f"the scout's issue field {one_line(c.get('issue'), 40)!r} is not an issue number"
+            self.reject(self.cand.name, why)
+            return self.finish("abandoned", reason=why)
+        if self.assign_first and isinstance(s.get("issue"), int):
+            stop = self.assignment_stop(s["issue"], None if resume_dir else c)
+            if stop:
+                return stop
         self.snapshot(self.cand / "gh")
         self.make_clone(slug, s["branch"], s["base_sha"])
         self.log(f"candidate {slug}: {'resuming at stage ' + s.get('stage', 'A') if resume_dir else 'started'}")
@@ -3370,7 +3852,8 @@ class Driver:
                 who = pend.get("asked_by") or "session"
                 lead = {"session": " The user answered your needs-you question. Your question: ",
                         "gate": " The driver's final gate on a fresh build failed after your stage C. What it said: ",
-                        "driver": " The driver stopped this candidate with an error of its own. What it said: "
+                        "driver": " The driver stopped this candidate with an error of its own. What it said: ",
+                        "assign": " The issue is now assigned to the user, so the work can start. The driver's note: "
                         }.get(who, " The user answered a question about this candidate. The question: ")
                 extra += (f"{lead}{one_line(pend.get('question'), 400)} The user's answer: "
                           f"{one_line(pend.get('answer'), 2000)} Act on the answer and continue stage {stage} "
@@ -3409,12 +3892,58 @@ class Driver:
                                    context="answer to let the same session carry on, or reject the candidate")
             return self.finish("failed", reason=one_line(act.get("reason", f"stage {stage}: {a}"), 300))
         self.check_stop(between=True)
+        lost = self.assignment_recheck()
+        if lost:
+            return lost
         gate = self.final_gate()
         if gate:
             return self.finish("needs-you", asked_by="gate",
                                question="the driver's own final gate on a fresh build did not pass: "
                                + gate, context="see results/ for the gate-* logs")
         return self.finish("ready", summary=one_line(act.get("summary"), 300))
+
+    # ----- assignment first (ASSIGN_FIRST=1) ---------------------------------------------
+    def issue_assignees(self, n):
+        """Logins assigned to issue n, read from GitHub by the driver. Stub runs read STUB_ASSIGNEES."""
+        if self.args.stub:
+            return [x for x in os.environ.get("STUB_ASSIGNEES", "").split(",") if x]
+        data = json.loads(self.gh("issue", "view", str(int(n)), "-R", self.repo, "--json", "assignees"))
+        return [a["login"] for a in data.get("assignees", []) if isinstance(a, dict) and isinstance(a.get("login"), str)]
+
+    def is_assigned(self, n):
+        me = self.prof["CONTRIBUTOR"].lower()
+        return any(w.lower() == me for w in self.issue_assignees(n))
+
+    def assignment_recheck(self):
+        """Before the final gate: '' while the candidate's issue is still assigned to CONTRIBUTOR
+        (or the repo does not ask for that); otherwise the candidate stops for the user."""
+        n = self.st().get("issue")
+        if self.assign_first and isinstance(n, int) and not self.is_assigned(n):
+            return self.finish("needs-you", asked_by="driver",
+                               question=f"issue #{n} is no longer assigned to @{self.prof['CONTRIBUTOR']}, so the "
+                               "final gate did not run. Ask to be assigned again, then answer; or reject the candidate.")
+        return ""
+
+    def assignment_stop(self, n, c=None):
+        """'' when issue n is assigned to CONTRIBUTOR. Assigned to someone else: the candidate is
+        dropped. Unassigned: it stops before any fix work with the scout's draft of a comment
+        asking to be assigned, which the user posts; --answer continues it once assigned."""
+        me = self.prof["CONTRIBUTOR"]
+        who = self.issue_assignees(n)
+        if any(w.lower() == me.lower() for w in who):
+            return ""
+        if who:
+            why = f"issue #{n} is assigned to {', '.join(who)}"
+            self.reject(self.cand.name, why)
+            return self.finish("abandoned", reason=why)
+        draft = one_line((c or {}).get("assign_comment"), 1500)
+        f = self.cand / "session" / "assign-comment.md"
+        if draft or not f.exists():
+            f.write_text((draft or "(the scout drafted no comment: write one)") + "\n")
+        return self.finish("needs-you", asked_by="assign", context="session/assign-comment.md",
+                           question=f"issue #{n} is not assigned to @{me}, and this repo wants that before any fix "
+                           "work. Post the comment drafted in session/assign-comment.md on the issue yourself; "
+                           "once a maintainer assigns you, answer this candidate to start the work.")
 
     def archive_transcripts(self, home):
         """Copy the sessions' transcripts and their subagents' into the ledger, gzipped: Claude Code
@@ -3545,6 +4074,9 @@ class Driver:
                                "continue it with --resume")
         if st.get("status") != "needs-you":
             raise RuntimeError(f"{slug} is {st.get('status')!r}, not waiting on an answer")
+        if self.assign_first and isinstance(st.get("issue"), int) and not self.is_assigned(st["issue"]):
+            raise RuntimeError(f"issue #{st['issue']} is not assigned to @{self.prof['CONTRIBUTOR']} yet; post the "
+                               "comment in session/assign-comment.md and answer once a maintainer assigns you")
         if (st.get("repo") or "").lower() != self.repo.lower():
             raise RuntimeError(f"{slug} belongs to {st.get('repo')!r}; run --answer with --repo {st.get('repo')}")
         clone = st.get("clone")
@@ -3582,7 +4114,7 @@ class Driver:
         info.setdefault("asked_by", None)
         # A needs-you candidate continues with --answer, so its build folder stays (a cold build
         # is about 13 minutes); every other end drops it. Preflight drops orphans.
-        keep_build = status == "needs-you"
+        keep_build = status == "needs-you" and self.target_dir().is_dir()
         drop = [self.session_tmp(self.cand, make=False)] + ([] if keep_build else [self.target_dir(), self.bins()])
         for d in drop:
             if inside(d, WORK) and d not in (WORK, WORK / "targets", WORK / "bins", WORK / "tmp"):
@@ -3614,8 +4146,11 @@ class Driver:
         prompt = (f"Scout {self.repo} for contribution candidates. Topic: {topic}. Your folder is {home} (read-only "
                   f"except {sdir}): GitHub snapshots in gh/, slugs already in the ledger in known.txt, past rejects "
                   f"in rejects.md. The clone is {self.repo_dir}; read code with `git -C {self.repo_dir} show "
-                  f"{self.upstream}:<path>`. Write {sdir}/candidates.json, then {sdir}/next.json with action "
-                  f"stage-done.")
+                  f"{self.upstream}:<path>`. The contributor is @{self.prof['CONTRIBUTOR']}. Write "
+                  f"{sdir}/candidates.json, then {sdir}/next.json with action stage-done.")
+        if self.assign_first:
+            prompt += (" In this repo, work on an issue starts only once the issue is assigned to the contributor: "
+                       "add assign_comment to each issue candidate not assigned to them yet.")
         system = "\n\n---\n\n".join([(SKILL / "rules" / "common.md").read_text(), self.prof_md,
                                      (SKILL / "stages" / "scout.md").read_text()])
         nxt = sdir / "next.json"
@@ -3652,8 +4187,8 @@ class Driver:
         out = []
         for c in cands if isinstance(cands, list) else []:
             if isinstance(c, dict) and isinstance(c.get("slug"), str) and c["slug"] not in known:
-                out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "issue_less")
-                            if k in c})
+                out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "issue_less",
+                                              "assign_comment") if k in c})
                 terms = c.get("search_terms")
                 if isinstance(terms, list):
                     out[-1]["search_terms"] = [one_line(t, 60) for t in terms[:3] if isinstance(t, str) and t.strip()]
@@ -3666,6 +4201,9 @@ class Driver:
         a trial merge with the current base. Nothing is saved back: the clone is thrown away."""
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug or ""):
             raise RuntimeError(f"bad slug {slug!r}")
+        if self.commands:
+            raise RuntimeError("retest runs cargo profiles only for now; for this repo, rerun the final gate "
+                               "with --answer, or test by hand")
         self.cand = LEDGER / "candidates" / slug
         s = self.st()
         if not s.get("branch") or not s.get("base_sha"):
@@ -3840,7 +4378,7 @@ class Driver:
                 comm = (d / "comm").read_bytes().decode(errors="replace").strip()
             except OSError:
                 continue
-            if comm not in JAIL_TOOLS:
+            if comm not in JAIL_TOOLS and comm not in self.prof.get("JAIL_PROCS", "").split():
                 continue
             cl = cmdline(pid)
             if any(r in cl for r in roots):
@@ -3892,7 +4430,7 @@ class Driver:
         except Exception as e:
             leftovers.append(f"candidate cleanup error: {one_line(e, 200)}")
         try:
-            self.sweep([WORK / "nodes", WORK / "targets"])
+            self.sweep([WORK / "nodes", WORK / "targets", WORK / "envs"])
         except Exception as e:
             leftovers.append(f"leftover sweep error: {one_line(e, 200)}")
         for pid in list(self.started):

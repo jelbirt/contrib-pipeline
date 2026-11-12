@@ -67,12 +67,32 @@ STUB_PREFIX=smkl lrun --limit 1; want "run rc" $rc 0; want status "$(field smkl-
 want "every session read the learned rules" "$(grep 'clones/smkl-0' $STUB_LOG | python3 -c "import sys,json;print(sorted({json.loads(l)['profile'] for l in sys.stdin}))")" "['learned']"
 want "the run named the rules id" "$(grep -c "profile: learned rules $pid" $CONTRIB_LEDGER/runs/*.log | awk -F: '{s+=$NF} END{print s}')" 1
 want "rules tracked in the ledger" "$(git -C $CONTRIB_LEDGER ls-files "repos/stub-org-stub" | grep -cE '/(profile|approved)\.json$|/PROFILE-(REVIEW|RULES)\.md$|/CHANGES\.md$')" 5
+case_ "commands mode: assignment first, then a test and a check"
+# A repo whose profile runs its own commands (TEST_CMD and CHECKS) and wants assignment before any fix.
+sed 's#^REPO=.*#REPO=stub-org/cmd#' "$PROFILE" > "$CONTRIB_PROFILE_DIR/stub-org-cmd.env"
+printf '%s\n' ASSIGN_FIRST=1 'SETUP_CMD=true' SETUP_KEY=README.md 'TEST_CMD=python3 -m pytest {paths}' \
+  TEST_EXIT_PASS=0 TEST_EXIT_FAIL=1 TEST_EXIT_NONE=5 'TEST_FILES=*_test.py' CHECKS=FORMAT \
+  'CHECK_FORMAT=true {paths}' CHECK_PATHS=. GATE_CHECKS=FORMAT >> "$CONTRIB_PROFILE_DIR/stub-org-cmd.env"
+printf '# stub-org/cmd\n\nA stub profile for the commands-mode case.\n' > "$CONTRIB_PROFILE_DIR/stub-org-cmd.md"
+crun() { STUB_CMD=1 STUB_ISSUE=7 python3 $R --repo stub-org/cmd --hours 8 --tick 2 --stub --claude $STUB "$@" >/dev/null 2>&1; rc=$?; }
+STUB_PREFIX=smkq crun --limit 1; want rc $rc 0; want status "$(field smkq-0 status)" needs-you
+want asked_by "$(field smkq-0 asked_by)" assign
+want "no stage before assignment" "$(field smkq-0 stages_done)" "[]"
+want "no build folder kept" "$(field smkq-0 build_kept)" False
+want "assign comment drafted" "$(cat $CONTRIB_LEDGER/candidates/smkq-0/session/assign-comment.md)" "Stub: may I take this?"
+crun --answer smkq-0 "assigned now"; want "answer refused while unassigned" $rc 2; want status "$(field smkq-0 status)" needs-you
+STUB_ASSIGNEES=someone,jelbirt crun --answer smkq-0 "assigned now"; want "answer rc" $rc 0; want status "$(field smkq-0 status)" ready
+idx=$CONTRIB_LEDGER/candidates/smkq-0/results/index.jsonl
+kinds() { python3 -c "import sys,json;print(' '.join(r['kind'] for r in map(json.loads,open('$idx')) if r['id'].startswith('gate-')==$1))"; }
+want "session runs" "$(kinds False)" "test test check"
+want "gate runs" "$(kinds True)" "check test test"
+want "gate runs only the test file no replay covers" "$(python3 -c "import json;print([r['req']['paths'] for r in map(json.loads,open('$idx')) if r['id'].endswith('-changed')])")" "[['other_test.py']]"
 case_ "ledger"
 want "ledger clean" "$(git -C $CONTRIB_LEDGER status --porcelain | wc -l)" 0
 for d in session gh transcripts bundle; do want "$d files tracked" "$(git -C $CONTRIB_LEDGER ls-files | grep -c "/$d/")" 0; done
 want "record copies present" "$(git -C $CONTRIB_LEDGER ls-files candidates/smkh-0/record | grep -c 'packet.md')" 1
 case_ "pipeline clone"
-want "branches saved in the suite's copy" "$(git -C "$SMOKE_REPO" for-each-ref 'refs/heads/fix/smk*' | wc -l)" 8
+want "branches saved in the suite's copy" "$(git -C "$SMOKE_REPO" for-each-ref 'refs/heads/fix/smk*' | wc -l)" 9
 want "no smk refs in the real clone" "$(smk_refs "$REAL_REPO" | wc -l)" 0
 want "no smk commits in the real clone" "$(smk_refs "$SMOKE_REPO" | while read -r o _; do git -C "$REAL_REPO" cat-file -e "$o" 2>/dev/null && echo "$o"; done | wc -l)" 0
 want "real clone's config unchanged" "$([ "$(git -C "$REAL_REPO" config --list --local)" = "$real_cfg" ] && echo yes || echo no)" yes

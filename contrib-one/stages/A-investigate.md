@@ -12,13 +12,13 @@ confirm them from the code before relying on them.
 2. **Find the code.** Read the paths the candidate names and their callers. Read
    `git log` for those files: if a maintainer chose the current behaviour on purpose, note the
    commit and weigh that.
-3. **Pin the reference behaviour.** For ES-compat work, read the Elasticsearch 8.13.4 source
-   (raw.githubusercontent.com, approach only, never copy) and cite path:line in details.md.
-   Those citations are for the user only: commits, code comments and the PR body describe what
-   ES does (version, request, response, at most a class name), never an ES file or line.
+3. **Pin the reference behaviour.** Settle what correct looks like: the docs, the issue, the
+   tests that already pin nearby behaviour, and any reference the profile names (read it the
+   way the profile says, approach only, never copy). Cite what you relied on in details.md.
+   Those citations are for the user only unless the profile says otherwise.
 4. **Reproduce.** Write the failing test first (the profile names the patterns), commit it
-   alone on the branch, and ask the driver to run it with `"expect": "fail"`. Where a live
-   check helps, ask for `node-start` and use `xq`. A candidate that does not reproduce is
+   alone on the branch, and ask the driver to run it with `"expect": "fail"`. Use a live
+   check only where the profile offers one. A candidate that does not reproduce is
    abandoned, with the evidence.
 5. **Weigh approaches.** List two or three ways to fix it. For each: what changes, risk,
    cost on the hot path, how it matches the reference. Then spawn one `Agent` (the

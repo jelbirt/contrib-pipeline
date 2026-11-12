@@ -7,19 +7,19 @@ Implement the approach in `plan.md`, prove it, and keep the bar green.
 2. Implement the fix in the worktree. Match the surrounding code's style. Keep the change to
    what the plan names; anything extra goes under "Not covered".
 3. Ask the driver for, in one `run`:
-   - `fmt`;
+   - the format and lint runs the profile names (the format run first, so later runs see
+     its result);
    - each new test with `expect: pass`;
    - each new test again with `expect: fail` and `without` set to the production files you
      changed (this proves the test fails without the fix, on the same commit);
-   - the existing tests of the files you touched (by target, never a whole crate);
-   - `clippy` on the crates you touched.
+   - the existing tests of the files you touched, as narrow as the request kinds allow
+     (never a whole suite).
 4. Read every result. A `met: false` result is a real problem: fix and ask again. An
    `infra: true` result is the guard stopping for memory or disk: ask again once; if it
    repeats, end with `needs-you` and say so.
-5. When the change touches the engine or API (for XERJ: anything under `engine/crates/`),
-   ask for `yaml` with `full: true` and for the target YAML files by name. The bar is 0
-   failed. If the fix flips a ratchet line, delete that line in the same commit.
-6. Add the CHANGELOG entry (the profile says where).
+5. Run every wider check the profile requires for the kind of change you made, the way it
+   says, and meet its bar.
+6. Add a changelog entry only if the profile asks for one, where it says.
 7. Commit: the fix as its own commit with a full body; a runner or harness change as a
    separate commit before it. Never amend or rewrite stage A's test commit; if it needs
    changes, add a commit.

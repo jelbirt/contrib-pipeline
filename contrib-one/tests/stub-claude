@@ -8,7 +8,9 @@ STUB_BODY (PR body text), STUB_NO_TRANSCRIPT=1, STUB_SHORT_REVIEW=1, STUB_AFTER_
 (a Bash call after the review), STUB_DENIAL=1 (report one permission denial),
 STUB_ERROR=<stage>:<n> (end the first n turns of that stage with an error and no next.json),
 STUB_BADNEXT=<stage>:<n> (write an unreadable next.json on the first n turns of that stage),
-STUB_REVIEW_FAIL=1 (the learn review writes no rules.json)."""
+STUB_REVIEW_FAIL=1 (the learn review writes no rules.json), STUB_ISSUE=<n> (the scout's
+candidates name issue n and draft an assign_comment), STUB_CMD=1 (stages A and B ask for
+commands-mode runs: a test by paths, and a check)."""
 import json, os, re, subprocess, sys, time, uuid
 from pathlib import Path
 
@@ -75,8 +77,9 @@ if prompt.startswith("Scout") or prompt.startswith("Your gh reads"):
     say(stage="scout", checks=checks)
     n, pre = int(env.get("STUB_CANDS", "1")), env.get("STUB_PREFIX", "stub-cand")
     write(sdir / "candidates.json", json.dumps([{"slug": f"{pre}-{i}", "title": f"Stub candidate {i}",
-          "source": "stub", "issue": None, "why": "stub", "size": "S", "risk": "low",
-          "search_terms": ["stub term"]} for i in range(n)]))
+          "source": "stub", "issue": int(env["STUB_ISSUE"]) if env.get("STUB_ISSUE") else None, "why": "stub",
+          "size": "S", "risk": "low", "search_terms": ["stub term"],
+          **({"assign_comment": "Stub: may I take this?"} if env.get("STUB_ISSUE") else {})} for i in range(n)]))
     write(sdir / "next.json", json.dumps({"action": "stage-done", "summary": "scouted"}))
     done()
 
@@ -173,6 +176,13 @@ if stage == "A":
     write(sdir / "plan.md", "stub plan\n")
     write(sdir / "packet.md", "# Stub bug\n\n**In progress (stage A).** Nothing is posted.\n")
     write(sdir / "details.md", "# Stub bug: details\n\nstub source\n")
+    if turn == 1 and env.get("STUB_CMD") == "1":
+        Path("stub_test.py").write_text("def test_stub():\n    assert False\n")
+        subprocess.run(["git", "add", "stub_test.py"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "stub: failing test"], check=True, capture_output=True)
+        write(nxt, json.dumps({"action": "run", "requests": [
+            {"id": "a-fail", "kind": "test", "paths": ["stub_test.py"], "expect": "fail"}]}))
+        done()
     if turn == 1 and not answered:
         write(nxt, json.dumps({"action": "run", "requests": [
             {"id": "a-fail", "kind": "test", "crate": "xerj-api", "target": "stub_test", "expect": "fail"}]}))
@@ -183,9 +193,15 @@ if stage == "A":
 if stage == "B":
     if turn == 1:
         Path("stub_change.txt").write_text(f"change {time.time()}\n")
+        if env.get("STUB_CMD") == "1":
+            Path("other_test.py").write_text("def test_other():\n    pass\n")
+            subprocess.run(["git", "add", "other_test.py"], check=True, capture_output=True)
         subprocess.run(["git", "add", "stub_change.txt"], check=True, capture_output=True)
         subprocess.run(["git", "commit", "-qm", "stub: change"], check=True, capture_output=True)
         write(nxt, json.dumps({"action": "run", "requests": [
+            {"id": "b-pass", "kind": "test", "paths": ["stub_test.py"], "expect": "pass"},
+            {"id": "b-fmt", "kind": "check", "name": "FORMAT", "expect": "pass"}]} if env.get("STUB_CMD") == "1" else
+            {"action": "run", "requests": [
             {"id": "b-pass", "kind": "test", "crate": "xerj-api", "target": "stub_test", "expect": "pass"}]}))
         done()
     write(nxt, json.dumps({"action": "stage-done", "summary": "fixed"}))

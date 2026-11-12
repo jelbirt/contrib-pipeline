@@ -13,10 +13,13 @@ reasons behind every choice: `DESIGN.md` in this folder.
 ## Start a run
 
 Check first, in this order, and stop to tell the user if one fails:
-1. A profile exists for the repo: `profiles/<owner>-<repo>.env` and `.md`. Only
-   `xerj-org-xerj` exists today. A new repo needs a profile written with the user.
+1. A profile exists for the repo: `profiles/<owner>-<repo>.env`, plus either a hand-written
+   `.md` or learned rules the user approved (`--learn`, then `--approve-profile ID`). The
+   driver refuses a profile that lacks a key it needs and names the key. A new repo's `.env`
+   is written with the user.
 2. C: has at least 32 GB free (`df -BG /mnt/c`).
-3. No other run is going: `pgrep -f contrib-run`.
+3. No other run is going: `pgrep -f '^python3 [^ ]*/contrib-run '` prints nothing. (A
+   plain `pgrep -f contrib-run` also matches the shell that runs it.)
 
 Then start it in the background (it outlives the turn and logs to the ledger):
 

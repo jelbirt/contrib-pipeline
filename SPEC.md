@@ -234,3 +234,154 @@ refused.
    in the previous text). Every other change is held as proposed. Step 6 builds it this way.
 2. **Acceptance bar.** 90% of the hand profile's upstream rules found with a source that
    states them, and zero mis-sourced required rules.
+
+# SPEC: phase 2, the pipeline runs any repo's own test, lint and format commands
+
+**Proposed 2026-11-12, waiting for your approval.**
+
+## Objective
+
+The driver can only build and test Rust today. Its request kinds (`test`, `fmt`, `clippy`,
+`build`, `node-start`, `yaml`) are cargo and xerj commands written into the driver, and the
+stage prompts name them. Phase 2 lets a repo's profile name its own commands, so a Python repo
+(first: pydantic/pydantic) can be worked end to end. Repo facts live only in the profile files;
+the driver and the prompts stay generic. xerj keeps the cargo path it has today, unchanged.
+
+## Commands mode
+
+A profile is in **commands mode** when its `.env` has `TEST_CMD`; otherwise it is in cargo
+mode, as today. A command is a template: the driver splits it into words, fills each `{...}`
+with a value, and runs it without a shell, so a value from a session is always one argument
+and never code.
+
+| Key | What it is | pydantic (probed 2026-11-12) |
+|---|---|---|
+| `SETUP_CMD` | installs dependencies into `{env}`; the only command with network | `uv sync --frozen --no-install-project --no-editable --group dev --group linting` |
+| `SETUP_KEY` | paths whose git ids at the base name the environment; a new id means a new setup | `uv.lock pyproject.toml pydantic-core` |
+| `TEST_CMD` | runs tests; `{paths}` are test files, `{junit}` a report file | `{env}/bin/python -m pytest -p no:cacheprovider -q --junitxml={junit} {paths}` |
+| `TEST_FILTER_FLAG` | put before a session's filter | `-k` |
+| `TEST_EXIT_PASS`, `TEST_EXIT_FAIL`, `TEST_EXIT_NONE` | the runner's exit codes for all passed, some failed, none found | `0`, `1`, `5` |
+| `CHECKS` | names of the repo's other checks; each has `CHECK_<NAME>` | `FORMAT LINT` |
+| `CHECK_<NAME>` | one check; `{paths}` defaults to `CHECK_PATHS` | `{env}/bin/ruff format --check --diff {paths}` |
+| `CHECK_PATHS` | what a check covers when no paths are given | the Makefile's `sources` list |
+| `GATE_CHECKS` | checks the final gate runs | `FORMAT LINT` |
+| `TOOLS` | folders put first on `PATH`, read-only in the jail | the pipeline's own uv |
+| `JAIL_ENV` | variables set in the jail; `{env}` and `{cache}` are filled | `UV_PROJECT_ENVIRONMENT={env} UV_CACHE_DIR={cache} UV_PYTHON=/usr/bin/python3.12 UV_PYTHON_DOWNLOADS=never PYTHONDONTWRITEBYTECODE=1 RUFF_NO_CACHE=true`, plus two cargo settings that make the pydantic-core build faster |
+| `TEST_FILES` | which changed files the final gate runs as tests (globs) | `tests/*test_*.py` |
+| `ASSIGN_FIRST` | `1`: an issue must be assigned to `CONTRIBUTOR` before any fix work | `1` |
+| `JAIL_PROCS` | process names the driver may stop after a killed run | `python python3 uv ruff` |
+| `SESSION_DENY` | commands sessions may not run themselves | `uv pytest ruff` |
+
+### Setup, once per dependency change
+
+The environment lives outside every clone, in `~/contrib-work/envs/<owner>-<name>/<key>`,
+where the key is a hash of `SETUP_CMD`, `JAIL_ENV`, `TOOLS` and the `SETUP_KEY` paths' git ids
+at the base commit. When it is missing, the driver exports the base commit (`git archive`, as
+`ensure_fetched` does for cargo), runs `SETUP_CMD` in the jail with network and only the new
+environment, the export, a build folder and the repo's download caches writable, and marks
+the folder ready. Every other command runs with network off and the environment read-only.
+The driver keeps the two newest environments per repo, and removes any folder a failed or cut-off
+setup left behind.
+
+For pydantic, setup builds pydantic-core from the clone's own Rust source (maturin, about 90
+seconds), so tests run against the core on the base commit, not the released 2.50.0 wheel.
+The environment is about 110 MB, plus about 140 MB of uv cache and 75 MB of cargo downloads.
+
+### Requests
+
+| kind | fields | runs |
+|---|---|---|
+| `test` | `paths` (test files in the clone), `filter` (optional), `expect` (`fail`, `pass`, `any`), `without` (optional) | `TEST_CMD` in the jail |
+| `check` | `name` (one of `CHECKS`), `paths` (optional) | `CHECK_<NAME>` in the jail |
+| `gh` | as today | read-only `gh` |
+
+`without` works as today: the base version of those files is laid over the clone inside the
+jail, so a test can be shown to fail before the fix. Paths must be existing files inside the
+clone and may not start with `-` or `@`; a filter may not start with either or hold a newline.
+(pytest, like many runners built on Python's argparse, reads any word `@name` as a file of more
+options, so `@` would let a session pass options.) `without` must be a list.
+
+### How a test result is judged (facts only)
+
+The exit code says which case it is: `TEST_EXIT_PASS`, `TEST_EXIT_FAIL`, `TEST_EXIT_NONE`, or
+any other code, which is an error (an import or collection failure, the same as a compile
+error in cargo). With `{junit}` the driver also reads the report's counts (tests, failures,
+errors, skipped). `expect: pass` is met by the pass code with at least one test run;
+`expect: fail` by the fail code with failures and no errors. A refused request, an unknown
+kind, a driver error, a failed setup and an infrastructure stop are never met. A run whose tests
+were all skipped is not met either, and the gate never counts it as gone. Nothing reads the
+runner's text.
+
+### The final gate
+
+In a fresh clone of the branch: each of `GATE_CHECKS`, then every test the sessions ran with
+`expect: pass` (their last form), then the test files the branch adds or changes that match
+`TEST_FILES` (renames included) and that no replayed run already covered whole. A replayed test
+whose file the branch has since removed or renamed is counted as gone, as in cargo mode, and
+shown at publish. The gate refuses a branch that changes anything under `SETUP_KEY`: every run
+used the base version of those files, so that change was never tested. The full suite is not run
+in phase 2.
+
+### What sessions are told
+
+The driver writes a "Runs you can request" section from the profile into every stage
+session's system text: each kind, its fields and the exact command it runs. A hand profile
+(xerj) keeps its own table.
+
+### Jail and guard
+
+The same bwrap jail as cargo work: root read-only, `HOME` a tmpfs, the clone writable, network
+off except for setup. Commands go through `tools/guarded.sh` (one heavy job at a time, memory
+and disk limits). `JAIL_PROCS` joins `JAIL_TOOLS` in the sweep, which still stops only
+processes whose command line names one of our folders.
+
+## Other gaps closed in phase 2
+
+| Gap | Change |
+|---|---|
+| a missing `.env` key gives a Python traceback | the driver lists the keys each mode needs and refuses with exit 2, naming the key and the file |
+| the session's WebFetch host is hard-coded to `raw.githubusercontent.com` | read from `REF_HOST`; none when it is absent (xerj's `.env` has it) |
+| stage prompts, `common.md` and `scout.md` name cargo, the XERJ node, ES, the ratchet and catch-lenient | generic wording; the XERJ lines move into `xerj-org-xerj.md` under "Stage notes for this repo", which only xerj sessions read |
+| a repo that wants assignment first (`ASSIGN_FIRST=1`) | see below |
+| the pipeline clone of pydantic is shallow (300 commits) | preflight refuses a shallow `REPO_DIR`, with the one command that fixes it |
+| `contrib-one/SKILL.md` check 1 says only xerj exists and a `.md` is required | a profile needs a `.env` and either a hand `.md` or approved learned rules |
+
+**Assignment first.** With `ASSIGN_FIRST=1`, the driver reads the issue's assignees from
+GitHub (a fact) before any fix work. Assigned to someone else: the candidate is dropped.
+Assigned to `CONTRIBUTOR`: it runs as usual. Unassigned: it stops as `needs-you` with a drafted
+comment asking to be assigned, which you post; `--answer` continues it only once the
+assignees include `CONTRIBUTOR`, and the final gate checks again. A candidate with no issue
+is not affected.
+
+## Not in phase 2
+
+- Pyright and the docs build: Pyright needs node or network, and `make docs` needs network.
+  Packets list them under Not run; pydantic's CI runs them.
+- `contrib-check` and `contrib-publish` still assume xerj. Both run only at publish time, so
+  they become generic before the first pydantic publish, as a follow-up.
+- Moving xerj to commands mode.
+
+## Testing
+
+`tests/smoke/unit_commands.py` has a check for each guard, and each is shown to fail with its
+guard removed (a mutant of the driver's source): the key refusal; a session path that tries
+to become an option; exit code and report judging; the setup key, network only during setup
+and the environment read-only after it; the rendered requests section; the assignment stop,
+its recheck and the answer refusal; the shallow refusal; session settings and the sweep. Plain
+checks confirm the shared prompts no longer name xerj's tools and xerj's profile holds the
+moved lines. The stub suite has a commands-mode case (assignment stop, answer refused while
+unassigned, then a test and a check, and the gate's order). One real setup and a few real
+requests ran on pydantic before the real run.
+
+## Decisions (taken 2026-11-12)
+
+1A build pydantic-core from source at setup; 2A a pipeline-only uv 0.13.7 in
+`~/contrib-work/tools`; 3A an unassigned issue stops right after the scout, with a drafted
+comment the user posts; 4A unshallow the pipeline clone once, and preflight refuses a shallow
+one; 5A pydantic's `MAX_OPEN` is 2. The questions as they were asked:
+
+1. pydantic-core: build it from source at setup, or install the released 2.50.0 wheel.
+2. uv: pydantic needs uv 0.13 or later and 0.11.28 is installed.
+3. Assignment first: where an unassigned issue candidate stops.
+4. The shallow pipeline clone: unshallow it once.
+5. pydantic's `MAX_OPEN` is 10.

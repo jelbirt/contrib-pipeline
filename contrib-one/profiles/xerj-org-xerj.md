@@ -59,6 +59,21 @@ say so in the packet (a decision for the user when it matters).
 - Engine-level: `engine/crates/xerj-engine/tests/*.rs`.
 - Prove fail-before with a `test` request carrying `"without": [paths]` and `"expect": "fail"`.
 
+## Stage notes for this repo
+- Never run `xerj hub feedback` and never file an XERJ field report. Never touch the user's
+  own node on port 9200.
+- Scout: the issue-less gaps are the lines in `engine/tests/es-compat-yaml/catch-lenient.txt`
+  (the ratchet of known ES-YAML gaps); write the source as `catch-lenient: <line>`. A ratchet
+  line that an open PR deletes is taken.
+- Stage A: the reference is the ES 8.13.4 source (see above). Where a live check helps, ask
+  for `node-start` and query the node with `xq`.
+- Stage B: the format and lint runs are `fmt` and `clippy` on the crates you touched; run
+  existing tests by target, never a whole crate. When the change touches anything under
+  `engine/crates/`, ask for `yaml` with `full: true` and for the target YAML files by name;
+  the bar is 0 failed. If the fix flips a ratchet line, delete that line in the same commit.
+- Stage C: the final runs are the new and touched tests, `fmt`, `clippy`, and for changes
+  under `engine/crates/` `yaml` full. The last overlap check includes ratchet lines.
+
 ## Request kinds the driver accepts (put them in `next.json`)
 All cargo work runs in this candidate's worktree under `engine/`, through the build guard,
 with the `ci-test` profile.
