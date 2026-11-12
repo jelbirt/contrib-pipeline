@@ -96,8 +96,10 @@ data. The learned profile is different: it goes into every session's system prom
 ## Approval and visibility
 
 - **First learn:** `--learn` writes `PROFILE-REVIEW.md` in the packet's reader style: what
-  the project cares about, rules by section with links to their sources, what was dropped,
-  and a note when there was little to learn from. Its id is the first 12 characters of the
+  the project cares about, steps for you, the required rules one line each by section, a
+  practice count, the first notes to check, and a note when there was little to learn from.
+  `PROFILE-RULES.md` beside it lists every rule with its linked sources and everything
+  dropped or changed. Its id is the first 12 characters of the
   profile's SHA-256. Runs on that repo refuse until you approve that id in chat; the skill
   then runs `--approve-profile ID`, which refuses any other id. To correct a rule, put the
   correction in your overrides file; `profile.json` is never edited by hand.
@@ -148,7 +150,7 @@ REPO_DIR, UPSTREAM_REMOTE, FORK_REMOTE, BASE_BRANCH, CONTRIBUTOR, BRANCH_PREFIX)
 | `tests/learn/xerj-baseline.md` | the hand profile as a numbered list of rules, the acceptance yardstick |
 | `contrib-one/tests/stub-claude`, `tests/smoke/unit_learn.py`, `tests/smoke/suite.sh` | stub learn mode, new units, a learn case in the suite |
 | `contrib-publish/SKILL.md`, `contrib-one/SKILL.md`, `README.md`, `DESIGN.md` | onboarding flow; changes shown at publish; a DESIGN section per change |
-| `~/contrib-queue/repos/<owner>-<name>/` | written only by the driver, under the run lock: `profile.json`, `profile.md`, `approved.json`, `PROFILE-REVIEW.md`, `CHANGES.md`, `history/` |
+| `~/contrib-queue/repos/<owner>-<name>/` | written only by the driver, under the run lock: `profile.json`, `profile.md`, `approved.json`, `PROFILE-REVIEW.md` (short), `PROFILE-RULES.md` (every rule and source), `CHANGES.md`, `history/` |
 
 Learned profiles may add checks to `final_checks` (a template's required headings) but never
 remove one set in the `.env`. Until you switch xerj, a xerj run uses the hand profile

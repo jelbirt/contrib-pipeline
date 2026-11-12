@@ -60,7 +60,7 @@ want "review says approved" "$(grep -c '^\*\*Approved on ' "$RD/PROFILE-REVIEW.m
 STUB_PREFIX=smkl lrun --limit 1; want "run rc" $rc 0; want status "$(field smkl-0 status)" ready
 want "every session read the learned rules" "$(grep 'clones/smkl-0' $STUB_LOG | python3 -c "import sys,json;print(sorted({json.loads(l)['profile'] for l in sys.stdin}))")" "['learned']"
 want "the run named the rules id" "$(grep -c "profile: learned rules $pid" $CONTRIB_LEDGER/runs/*.log | awk -F: '{s+=$NF} END{print s}')" 1
-want "rules tracked in the ledger" "$(git -C $CONTRIB_LEDGER ls-files "repos/stub-org-stub" | grep -cE '/(profile|approved)\.json$|/PROFILE-REVIEW\.md$|/CHANGES\.md$')" 4
+want "rules tracked in the ledger" "$(git -C $CONTRIB_LEDGER ls-files "repos/stub-org-stub" | grep -cE '/(profile|approved)\.json$|/PROFILE-(REVIEW|RULES)\.md$|/CHANGES\.md$')" 5
 case_ "ledger"
 want "ledger clean" "$(git -C $CONTRIB_LEDGER status --porcelain | wc -l)" 0
 for d in session gh transcripts bundle; do want "$d files tracked" "$(git -C $CONTRIB_LEDGER ls-files | grep -c "/$d/")" 0; done

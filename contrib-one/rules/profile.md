@@ -36,8 +36,10 @@ that later sessions read. Your user reads a review of it before any run uses it.
 - **id**: lowercase letters, digits and hyphens, starting with a letter or digit, at most 40,
   unique.
 - **section**: one of `scope`, `tests`, `checks`, `changelog`, `commits`, `pr-body`, `review`,
-  `reference`, `ai-policy`, `legal`, `candidate-sources`. Use `candidate-sources` for where
-  work to pick up is listed (labels, issue-less gap lists such as a ratchet or skip file).
+  `reference`, `ai-policy`, `legal`, `candidate-sources`, `for-you`. Use `candidate-sources`
+  for where work to pick up is listed (labels, issue-less gap lists such as a ratchet or skip
+  file). Use `for-you` for what only your user can do, by hand and once: sign a CLA, ask to be
+  assigned to an issue, link an account. Sessions never see that section; your user does.
 - **text**: the rule as an outcome a reviewer can check, in one or two plain sentences of at
   least 3 words and at most 300 characters: "`cargo fmt --check` passes", not "run cargo fmt".
   No links, host names with a path, or e-mail addresses: the driver refuses a rule whose text
@@ -46,7 +48,7 @@ that later sessions read. Your user reads a review of it before any run uses it.
 
 | Strength | Sources that count |
 |---|---|
-| required | a quote from a guide file; or quotes from maintainers' comments on 2 or more different PRs |
+| required | a quote from a guide file (not a file merged PRs often change, and not one only a current rule cites) that says it is required: must, never, do not, shall, not allowed, will not be merged and the like, in one sentence and not negated ("not required", "don't need to" do not count); or quotes from maintainers' comments on 2 or more different PRs. Anything else marked required is kept as a practice, and that holds for `for-you` too |
 | practice | a list of merged PRs that do it (at least 3, and at least half the merged PRs in the bundle); or one maintainer comment; or a guide quote |
 
 A rule has 1 to 12 sources; with more, the whole rule is refused. A source is one of:
@@ -70,8 +72,8 @@ commit guides, and PR templates keep their guidance in comments. A quote starts 
 whole words.
 
 The driver refuses a source that does not check out and keeps a rule only on the sources that
-do. It makes a required rule a practice when no guide quote backs it and fewer than 2 PRs'
-maintainers do (for example, when only merged-PR lists back it). It shows the quote as it
+do. It makes a required rule a practice when no guide quote that says so backs it and fewer
+than 2 PRs' maintainers do (for example, when only merged-PR lists back it). It shows the quote as it
 matched, without link targets. What it refused or changed, and why, is shown to your user.
 
 ## What to write rules about
@@ -85,8 +87,9 @@ matched, without link targets. What it refused or changed, and why, is shown to 
 
 Leave out:
 - Anything the pipeline already does or never does: pushing, posting, commenting, filing
-  issues, signing, account setup. A rule about secrets, posting or filing anything, or local
-  machine details is dropped by the driver's screen.
+  issues. What only your user can do (signing, account setup, asking to be assigned) goes in
+  `for-you` instead. A rule about secrets, posting or filing anything, or local
+  machine details is dropped by the driver's screen (in `for-you`, posting is allowed).
 - Rules only one PR shows, and style a formatter or linter already enforces (name the check
   instead).
 - Rules that need a fact outside the bundle. Write fewer rules rather than guess.

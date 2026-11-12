@@ -312,9 +312,29 @@ PROFILE_SECTIONS = (
     ("scope", "Scope"), ("tests", "Tests"), ("checks", "Checks before a PR"), ("changelog", "Changelog"),
     ("commits", "Commits"), ("pr-body", "PR body"), ("review", "Review expectations"),
     ("reference", "Reference and licence"), ("ai-policy", "AI policy"), ("legal", "Legal"),
-    ("candidate-sources", "Where candidates come from"))
+    ("candidate-sources", "Where candidates come from"), ("for-you", "Steps for you, never given to sessions"))
 PROFILE_STRENGTHS = ("required", "practice")
-PROFILE_MAX_RULES = 120
+PROFILE_MAX_RULES = 60
+CHECK_SHOWN = 12   # notes in the short review; every note is in PROFILE-RULES.md
+# A required rule's guide quote has to say it is required. Advice ("prefer", "should",
+# "consider", "please") makes a practice: it is followed, but it does not get a PR sent back.
+OBLIGATION_RE = re.compile(r"\b(?:must(?:n't| not)?|required|requirement|mandatory|shall|needs? to|ha(?:ve|s) to|"
+                           r"do(?:es)? not|don't|doesn't|never|forbidden|prohibited|reject(?:s|ed)?|"
+                           r"(?:will not|won't|cannot|can't) be (?:accepted|merged|reviewed)|"
+                           r"not (?:be )?(?:accepted|merged|sufficient|enough|allowed)|only accept(?:s|ed)?|"
+                           r"will be closed|(?:is|are) expected to)\b", re.I)
+# "not required", "don't need to", "do not hesitate": a negated obligation is not one.
+NOT_OBLIGED_RE = re.compile(r"(?:\bnot|n't|\bnever|\bno longer)\s+(?:be\s+)?(?:required|mandatory|needed|necessary)\b|"
+                            r"\b(?:do|does|did)\s*(?:not|n't)\s+(?:need|have|hesitate|worry|mind)\b|\bno need\b", re.I)
+# A quote that runs past the end of a sentence cannot lend that sentence's "must" to another.
+SENTENCE_END_RE = re.compile(r"[.!?]\s+[\"'(\[`*_]*[A-Z]")
+
+
+def obliges(quote):
+    """True when a quote is one sentence that says something is required."""
+    q = quote_plain(quote)
+    return (not SENTENCE_END_RE.search(q) and bool(OBLIGATION_RE.search(q))
+            and not NOT_OBLIGED_RE.search(q))
 RULE_MAX_CHARS = 300
 RULE_MAX_SOURCES = 12
 QUOTE_MIN_WORDS = 8
@@ -587,7 +607,10 @@ def check_rules(raw, bundle):
         if LINKISH_RE.search(clean) or hostish(clean):
             refused.append((name, "the text has a link, a host or an address; rule text cannot carry one"))
             continue
-        hit = next((label for label, rx in RULE_SCREEN if rx.search(clean)), None)
+        # Steps for the user (sign the CLA, ask to be assigned) may be about posting: the user
+        # does those by hand, and sessions never see this section.
+        hit = next((label for label, rx in RULE_SCREEN if rx.search(clean)
+                    and not (r["section"] == "for-you" and label == "posting or filing")), None)
         if hit:
             dropped.append((name, f"it is about {hit}, which the pipeline never lets a session act on"))
             continue
@@ -612,18 +635,19 @@ def check_rules(raw, bundle):
         comment_prs = {s["pr"] for s in good if s["kind"] == "comment"}
         wide = [s for s in good if s["kind"] == "prs"]
         strength = r["strength"]
-        if strength == "required" and not guides and len(comment_prs) < 2:
-            if comment_prs or wide:
-                strength = "practice"
-                refused.append((name, "kept as practice: required needs a guide quote or maintainers "
-                                      "saying it on 2 or more PRs"))
-            else:
-                refused.append((name, "no source that checks out"))
-                continue
-        if strength == "practice" and not good:
-            refused.append((name, f"no source that checks out (a practice needs {floor} or more merged "
-                                  "PRs, a maintainer's comment or a guide quote)"))
+        # Files merged PRs often change, and files only a current rule cites, are not guides: they
+        # can back a practice, never make a rule required.
+        must = [s for s in guides if not {"often", "cited"} & set(bundle["guides"].get(s["path"], {}))
+                and obliges(s["quote"])]
+        # Every rule, a step for you included, needs a source that checks out.
+        if not good:
+            refused.append((name, "no source that checks out" + ("" if strength == "required" else
+                           f" (a practice needs {floor} or more merged PRs, a maintainer's comment or a guide quote)")))
             continue
+        if strength == "required" and not must and len(comment_prs) < 2:
+            strength = "practice"
+            refused.append((name, "kept as practice: required needs a guide quote that says so (must, "
+                                  "never, do not and the like) or maintainers asking for it on 2 or more PRs"))
         seen.add(rid)
         kept.append({"id": rid, "section": r["section"], "strength": strength, "text": clean,
                      "sources": good})
@@ -661,7 +685,7 @@ def render_profile(repo, rules, base, learned_at):
            "A required rule is stated by a guide file or by maintainers on 2 or more PRs; a practice is "
            "what merged PRs show.", ""]
     last = None
-    for r in rule_order(rules):
+    for r in rule_order([r for r in rules if r["section"] != "for-you"]):
         if r["section"] != last:
             if last is not None:
                 out.append("")
@@ -686,50 +710,88 @@ def source_link(repo, base, s):
     return f"merged PRs {shown}" + (f" and {len(nums) - 8} more" if len(nums) > 8 else "")
 
 
+def review_notes(items, shown):
+    lines = [f"- {md_text(i, 40)}: {md_text(delink(one_line(w)), 300)}" for i, w in items[:shown]]
+    return lines + ([f"- and {len(items) - shown} more"] if len(items) > shown else [])
+
+
 def render_review(repo, rules, notes, dropped, summary, meta):
-    """PROFILE-REVIEW.md: what the user reads before approving a learned profile."""
+    """PROFILE-REVIEW.md: the short document the user reads before approving learned rules.
+    Every rule with its sources is in PROFILE-RULES.md (render_rules)."""
     pid = profile_id(rules)
     base = str(meta.get("base", ""))
-    req = sum(1 for r in rules if r["strength"] == "required")
-    guides, merged, closed = (int(meta.get(k, 0)) for k in ("guides", "merged", "closed"))
+    you = [r for r in rules if r["section"] == "for-you"]
+    req = [r for r in rules if r["section"] != "for-you" and r["strength"] == "required"]
+    prac = [r for r in rules if r["section"] != "for-you" and r["strength"] == "practice"]
+    guides, merged, closed, often, cited = (int(meta.get(k, 0)) for k in ("guides", "merged", "closed", "often", "cited"))
     out = [f"# What {md_text(repo, 100)} expects from a contribution", "",
-           f"**Learned, not yet approved.** Rules id `{pid}`. Runs on this repo refuse until you approve "
-           "this id; to correct a rule, write the correction in the repo's overrides file.", "",
+           (f"**Learned, not yet approved.** Rules id `{pid}`. Runs on this repo refuse until you approve it "
+            f"with `contrib-run --repo {md_text(repo, 100)} --approve-profile {pid}`; to correct a rule, write the "
+            "correction in the repo's overrides file." if rules else
+            "**Nothing was kept.** Every rule the session wrote was refused; why is in "
+            "[PROFILE-RULES.md](PROFILE-RULES.md). There is nothing to approve."), "",
            "| | |", "|---|---|",
-           f"| **Read** | {guides} guide files at base `{md_text(base, 12)}`, {merged} merged PRs by outside "
-           f"contributors, {closed} closed without merging |",
-           f"| **Rules** | {len(rules)} kept ({req} required, {len(rules) - req} practice); "
-           f"{len(notes)} notes on what was left out or changed; {len(dropped)} dropped by the screen |"]
-    if guides <= 1 or merged < 6:
+           f"| **Read** | {guides - often - cited} guide files and {often} files merged PRs often change"
+           + (f" and {cited} files current rules cite" if cited else "") + ", at base "
+           f"`{md_text(base, 12)}`; {merged} merged PRs by outside contributors, {closed} closed without merging |",
+           f"| **Rules** | {len(req)} required, {len(prac)} practices, {len(you)} steps for you. Every rule with "
+           "its sources: [PROFILE-RULES.md](PROFILE-RULES.md) |",
+           f"| **To check** | {len(notes)} notes on what was left out or changed, {len(dropped)} rules dropped by "
+           "the screen |"]
+    if guides - often <= 1 or merged < 6:
         out.append("| **Little to learn from** | Few guide files or merged outside PRs, so most of what this "
                    "repo expects is not here; expect to add overrides. |")
     out += ["", "## What the project cares about", ""]
     lines = [md_text(delink(one_line(l, RULE_MAX_CHARS)), RULE_MAX_CHARS)
              for l in str(summary or "").splitlines() if one_line(l)][:6]
     out += [f"- {no_block(l)}" for l in lines] or ["(The learn session wrote no summary.)"]
-    out += ["", "## Rules"]
+    if you:
+        out += ["", "## Steps for you", "", "Things only you can do, by hand. Sessions never see these.", ""]
+        out += [f"- {md_text(r['text'], RULE_MAX_CHARS)} ({source_link(repo, base, r['sources'][0])})"
+                for r in rule_order(you)]
+    out += ["", "## Required rules", "", "A PR that breaks one of these is likely sent back. Sources for each "
+            "are in PROFILE-RULES.md.", ""]
+    last = None
+    for r in rule_order(req):
+        if r["section"] != last:
+            last = r["section"]
+            out.append(f"**{dict(PROFILE_SECTIONS)[last]}**")
+        out.append(f"- {md_text(r['text'], RULE_MAX_CHARS)}")
+    if not req:
+        out.append("(none)")
+    out += ["", "## Practices", "", f"{len(prac)} practices: what merged PRs here usually do. They are listed "
+            "with their sources in PROFILE-RULES.md."]
+    if notes or dropped:
+        out += ["", "## Check these", ""]
+        out += review_notes(notes, CHECK_SHOWN)
+        if dropped:
+            out += ["", "Dropped by the screen (secrets, posting or filing, local details); add one to the "
+                    "overrides yourself if it matters:", ""] + review_notes(dropped, 5)
+    return "\n".join(out) + "\n"
+
+
+def render_rules(repo, rules, notes, dropped, meta):
+    """PROFILE-RULES.md: every learned rule with its sources, and every note, for checking."""
+    pid = profile_id(rules)
+    base = str(meta.get("base", ""))
+    out = [f"# Every rule learned for {md_text(repo, 100)}, with its sources", "",
+           f"Rules id `{pid}`, base `{md_text(base, 12)}`. The short review is in "
+           "[PROFILE-REVIEW.md](PROFILE-REVIEW.md).", ""]
     last = None
     for r in rule_order(rules):
         if r["section"] != last:
             last = r["section"]
-            out += ["", f"### {dict(PROFILE_SECTIONS)[last]}", ""]
-        out.append(f"- **{r['strength']}**: {md_text(r['text'], RULE_MAX_CHARS)}")
+            out += ["", f"## {dict(PROFILE_SECTIONS)[last]}", ""]
+        out.append(f"- **{r['strength']}** `{md_text(r['id'], 40)}`: {md_text(r['text'], RULE_MAX_CHARS)}")
         for s in r["sources"]:
             q = f": \"{md_text(delink(s['quote']), QUOTE_MAX_CHARS)}\"" if s.get("quote") else ""
             out.append(f"  - {source_link(repo, base, s)}{q}")
     if notes:
-        shown = NOTES_SHOWN
-        out += ["", "## Left out or changed", ""]
-        out += [f"- {md_text(i, 40)}: {md_text(delink(one_line(w)), 300)}" for i, w in notes[:shown]]
-        if len(notes) > shown:
-            out.append(f"- and {len(notes) - shown} more")
+        out += ["", "## Left out or changed", ""] + review_notes(notes, NOTES_SHOWN)
     if dropped:
         out += ["", "## Dropped by the screen", "",
                 "The screen takes rules about secrets, posting or filing anything, and local details. "
-                "If one of these matters, add it to the overrides yourself.", ""]
-        out += [f"- {md_text(i, 40)}: {md_text(delink(one_line(w)), 300)}" for i, w in dropped[:NOTES_SHOWN]]
-        if len(dropped) > NOTES_SHOWN:
-            out.append(f"- and {len(dropped) - NOTES_SHOWN} more")
+                "If one of these matters, add it to the overrides yourself.", ""] + review_notes(dropped, NOTES_SHOWN)
     return "\n".join(out) + "\n"
 
 
@@ -748,6 +810,14 @@ LEARN_BODY_MAX, LEARN_COMMENT_MAX, LEARN_BUNDLE_MAX = 20_000, 5_000, 3_000_000
 LEARN_MAX_TURNS = 60
 LEARN_TIMEOUT = 40 * 60
 LEARN_TOOLS = ("Read", "Glob", "Grep", "Edit", "Write")
+# Files the guides may never name but merged PRs keep changing (a changelog, a ratchet list):
+# the start of each is read like a guide, so a rule can quote it.
+OFTEN_TEXT = GUIDE_TEXT + (".yml", ".yaml", ".toml", ".cfg", ".ini")
+OFTEN_MAX_FILES = 8
+OFTEN_EXCERPT = 12_000
+LOCK_FILE = re.compile(r"[._-]lock\.(?:ya?ml|toml|txt)$|(?:^|/)requirements[^/]*\.txt$", re.I)
+TEST_PATH = re.compile(r"(?:^|/)(?:tests?|__tests__|specs?)(?:/|$)|(?:^|/)test_[^/]*\.py$|_test\.[a-z]+$|"
+                       r"\.(?:test|spec)\.[a-z]+$", re.I)
 CLA_FILE = re.compile(r"(?:^|/)(?:\.contributors|CLA[^/]*)(?:/|$)", re.I)
 LINK_RE = re.compile(r"\]\(\s*<?([^)\s>]+)")
 
@@ -773,6 +843,34 @@ def guide_links(path, text):
         if q not in out and q not in (".", "..") and not q.startswith("../"):
             out.append(q)
     return out
+
+
+def merged_files(prs):
+    """{path: how many merged PRs changed it}."""
+    c = collections.Counter()
+    for p in prs.values():
+        if p.get("state") == "merged":
+            c.update(set(p.get("files") or []))
+    return c
+
+
+def often_files(prs, guides):
+    """Text files that at least 3 merged PRs (and a tenth of them) changed, not already a guide:
+    [(path, count)], most changed first."""
+    merged = sum(1 for p in prs.values() if p.get("state") == "merged")
+    floor = max(3, -(-merged // 10))
+    hits = [(q, k) for q, k in merged_files(prs).items()
+            if k >= floor and q not in guides and q.lower().endswith(OFTEN_TEXT) and not LOCK_FILE.search(q)]
+    return sorted(hits, key=lambda x: (-x[1], x[0]))[:OFTEN_MAX_FILES]
+
+
+def test_dirs(prs):
+    """Folders merged PRs put tests in: [(folder, how many merged PRs)], most first."""
+    c = collections.Counter()
+    for p in prs.values():
+        if p.get("state") == "merged":
+            c.update({posixpath.dirname(q) or "." for q in p.get("files") or [] if TEST_PATH.search(q)})
+    return sorted(c.items(), key=lambda x: (-x[1], x[0]))[:10]
 
 
 def rule_changes(prev, rules):
@@ -1879,7 +1977,7 @@ class Driver:
                 tree[path] = parts[2]
             elif path and len(parts) == 3 and parts[1] == "blob" and parts[0] == "120000":
                 links[path] = parts[2]
-        guides, notes, total = {}, [], [0]
+        guides, notes, total, targets = {}, [], [0], set()
 
         def add(path):
             if path in guides:
@@ -1907,6 +2005,7 @@ class Driver:
                 notes.append(f"{q}: a link to {one_line(target, 120)}, which is not a file in the tree")
             else:
                 notes.append(f"{q}: a link, read as {to}")
+                targets.add(to)
                 add(to)
         first = sorted(q for q in tree if guide_match(q)) + [q for q in also if q in tree and not guide_match(q)]
         for q in first:
@@ -1918,7 +2017,35 @@ class Driver:
                            if x in tree and x not in guides and x not in linked and x.lower().endswith(GUIDE_TEXT)]
         for q in linked:
             add(q)
+        # A guide is a file the globs match, a link's target, or a file one of those links to.
+        real = {q for q in guides if guide_match(q) or q in targets}
+        for q in sorted(real):
+            if q.lower().endswith(GUIDE_TEXT):
+                real.update(x for x in guide_links(q, guides[q]["text"]) if x in guides)
+        for q in guides:
+            if q not in real:
+                guides[q]["cited"] = True
         return guides, notes
+
+    def fetch_often(self, base, prs, guides):
+        """Add the start of each file merged PRs often change to guides, marked with how many
+        changed it; returns how many were added."""
+        added = 0
+        for q, k in often_files(prs, {q for q, g in guides.items() if not g.get("cited")}):
+            # Paths come from PRs: read them literally, never as pathspec magic.
+            parts = self.git("--literal-pathspecs", "ls-tree", "--full-tree", base, "--", q).split("\t", 1)[0].split()
+            if len(parts) != 3 or parts[1] != "blob" or parts[0] not in ("100644", "100755"):
+                continue
+            data = self.git_blob(parts[2])
+            if b"\0" in data:
+                continue
+            part = len(data) > OFTEN_EXCERPT
+            if part:
+                cut = data[:OFTEN_EXCERPT]
+                data = cut[:cut.rfind(b"\n") + 1] or cut
+            guides[q] = {"text": data.decode("utf-8", errors="replace"), "blob": parts[2], "often": k, "part": part}
+            added += 1
+        return added
 
     def fetch_pr(self, n, item, merged):
         """One PR as the learn bundle keeps it, or None when it only touches CLA files."""
@@ -2023,8 +2150,24 @@ class Driver:
             write_json(bdir / "current.json", current)
         merged = sorted(n for n, p in prs.items() if p["state"] == "merged")
         closed = sorted(n for n, p in prs.items() if p["state"] != "merged")
+        plain = sorted(q for q in guides if not {"often", "cited"} & set(guides[q]))
+        cited = sorted(q for q in guides if "cited" in guides[q] and "often" not in guides[q])
+        often = sorted((q for q in guides if "often" in guides[q]), key=lambda q: (-guides[q]["often"], q))
         idx = [f"# Bundle for {self.repo}", "", f"Base commit: {base}", "",
-               f"## Guide files ({len(guides)})", ""] + [f"- guides/{q}" for q in sorted(guides)]
+               f"## Guide files ({len(plain)})", ""] + [f"- guides/{q}" for q in plain]
+        if often:
+            idx += ["", f"## Files merged PRs often change ({len(often)})", "",
+                    "No guide may name these, but they show what a contribution touches. Each is under guides/ "
+                    "and can be quoted like a guide.", ""]
+            idx += [f"- guides/{one_line(q, 200)}: changed by {guides[q]['often']} merged PRs"
+                    + (f"; only its first {OFTEN_EXCERPT // 1000} KB" if guides[q].get("part") else "") for q in often]
+        tdirs = test_dirs(prs)
+        if tdirs:
+            idx += ["", "## Where merged PRs put their tests", ""] + [f"- {one_line(d, 200)}: {k} merged PRs" for d, k in tdirs]
+        if cited:
+            idx += ["", f"## Files a current rule cites ({len(cited)})", "",
+                    "Not guide files. Each is under guides/; a quote from one can back a practice only.", ""]
+            idx += [f"- guides/{one_line(q, 200)}" for q in cited]
         idx += ["", f"## Merged PRs by outside contributors ({len(merged)})", "",
                 ", ".join(map(str, merged)) or "(none)", "", f"## Closed without merging ({len(closed)})", "",
                 ", ".join(map(str, closed)) or "(none)"]
@@ -2061,7 +2204,7 @@ class Driver:
         guides, notes = self.fetch_guides(base, cited)
         prs, skipped, labels = {}, collections.Counter(), []
         if not self.args.stub:
-            budget = [LEARN_BUNDLE_MAX - sum(len(g["text"]) for g in guides.values())]
+            budget = [LEARN_BUNDLE_MAX - OFTEN_MAX_FILES * OFTEN_EXCERPT - sum(len(g["text"]) for g in guides.values())]
             for merged, want in ((True, LEARN_MERGED), (False, LEARN_CLOSED)):
                 got, sk = self.fetch_prs(merged, want, budget)
                 prs.update(got)
@@ -2069,6 +2212,7 @@ class Driver:
             for lb in self.gh_json("api", f"repos/{self.repo}/labels?per_page=100") or []:
                 if isinstance(lb, dict):
                     labels.append(one_line(f"{lb.get('name', '')}: {lb.get('description') or ''}", 200))
+        n_often = self.fetch_often(base, prs, guides)
         subjects = [one_line(s, 200) for s in self.git("log", "--format=%s", "-n", "200", base).splitlines()]
         notes += [f"PRs {k}: {v}" for k, v in sorted(skipped.items())]
         current = {"id": prev.get("id"), "rules": prev.get("rules")} if prev else None
@@ -2092,7 +2236,9 @@ class Driver:
             raise RuntimeError("the learn session wrote no readable rules.json")
         kept, rnotes, dropped = check_rules(raw, {"guides": guides, "prs": prs})
         summary = raw.get("summary") if isinstance(raw.get("summary"), str) else ""
-        meta = {"base": base, "guides": len(guides), "merged": n_merged, "closed": len(prs) - n_merged}
+        meta = {"base": base, "guides": len(guides), "often": n_often, "merged": n_merged,
+                "cited": sum(1 for g in guides.values() if "cited" in g and "often" not in g),
+                "closed": len(prs) - n_merged}
         review = render_review(self.repo, kept, rnotes, dropped, summary, meta)
         cost = res.get("total_cost_usd")
         used = (f"| **Learn session** | {res.get('num_turns', '?')} turns, "
@@ -2100,8 +2246,9 @@ class Driver:
                 + (f", about ${cost:.2f} API-equivalent" if isinstance(cost, (int, float)) else "") + " |")
         review = review.replace("\n\n## What the project cares about", f"\n{used}\n\n## What the project cares about", 1)
         if not kept:
+            (home / "PROFILE-RULES.md").write_text(render_rules(self.repo, kept, rnotes, dropped, meta))
             (home / "PROFILE-REVIEW.md").write_text(review)
-            raise RuntimeError(f"no rule's sources checked out; what was refused is in {home / 'PROFILE-REVIEW.md'}")
+            raise RuntimeError(f"no rule's sources checked out; what was refused, and why, is in {home / 'PROFILE-RULES.md'}")
         pid = profile_id(kept)
         learned_at = datetime.date.today().isoformat()
         prof = {"repo": self.repo, "id": pid, "base": base, "learned_at": learned_at, "run": self.run_id,
@@ -2119,6 +2266,8 @@ class Driver:
         if same:
             # profile.md is the approved rules as runs see them; unapproved rules never get that heading.
             (rdir / "profile.md").write_text(render_profile(self.repo, kept, base, learned_at))
+        self.learn_written.append("PROFILE-RULES.md")
+        (rdir / "PROFILE-RULES.md").write_text(render_rules(self.repo, kept, rnotes, dropped, meta))
         self.learn_written.append("PROFILE-REVIEW.md")
         (rdir / "PROFILE-REVIEW.md").write_text(review)
         self.learn_written.append("CHANGES.md")

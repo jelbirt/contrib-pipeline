@@ -662,8 +662,8 @@ steps 1 and 2 built.
   file, comment, upload or handle a secret. The kept rules are rendered as escaped plain lines
   under a fixed heading, so nothing in them can become markup or a link in a prompt.
 - **Ids and approval.** The rules id is the first 12 hex digits of the SHA-256 of the kept rules.
-  `--learn` writes `profile.json`, `profile.md`, `PROFILE-REVIEW.md` (the reader-style review),
-  a `CHANGES.md` entry and a copy under `history/`, in `~/contrib-queue/repos/<owner>-<name>/`,
+  `--learn` writes `profile.json`, `profile.md`, `PROFILE-REVIEW.md` (the reader-style review;
+  short since the second learn, below), `PROFILE-RULES.md`, a `CHANGES.md` entry and a copy under `history/`, in `~/contrib-queue/repos/<owner>-<name>/`,
   and approves nothing. `--approve-profile ID` refuses any id but the one the latest rules hash
   to now, and copies those rules into `approved.json`. Runs use the rules in `approved.json`
   (checked against its own id), so a newer learn changes nothing until you approve it, and the
@@ -740,3 +740,54 @@ approved shape has no comma and a `## Not run` heading). Open, for the user: whe
 `landing/compare/`) and the user's own `.contributors` and `user-feedback/`, and whether the xerj
 learn should also read `engine/tests/es-compat-yaml/catch-lenient.txt`, the only place the
 ratchet rule is written. Both are `.env` changes, which SPEC asks about first.
+
+### The second learn: fewer, truer rules and a review you can read (2026-11-12)
+
+The first real learns (tests/learn/COMPARISON.md) kept 73 rules on xerj, 67 of them required, and
+wrote a 4,256-word review. Measured on the kept rules, 28 of xerj's 60 guide-backed required rules
+and 27 of pydantic's 32 rested on a quote that only asks ("please", "prefer", "should"), so
+"required" stopped meaning "a PR is sent back for this". Of the 6 baseline rules it missed, the CLA
+was missed because rules/profile.md told sessions to leave out signing; the ratchet file because no
+guide names it; sibling paths and test locations because nothing in the bundle showed them.
+
+- **Required means the guide says so.** A rule stays required only on a guide quote with an
+  obligation word (`OBLIGATION_RE`: must, never, do not, required, shall, not accepted and the
+  like) or maintainers asking on 2 or more PRs. Anything else is kept as a practice, with a note.
+- **At most 60 rules** (`PROFILE_MAX_RULES`), and stages/learn.md asks for 15 to 40, most important
+  first.
+- **Steps for you.** A new section, `for-you`, for what only the user can do by hand (sign a CLA,
+  ask to be assigned). It is shown in the review and never rendered into what sessions see, and the
+  screen lets it mention posting. It still needs a source that checks out: a mutant run while
+  writing these tests showed a `for-you` rule marked required with no good source was kept, so the
+  "no source" refusal now runs first for every rule.
+- **A short review, the full list apart.** PROFILE-REVIEW.md is the reader document: status and
+  approve command, a table (what was read, rule counts, notes), what the project cares about, steps
+  for you, required rules one line each by section, a practice count, and the first 12 notes.
+  PROFILE-RULES.md has every rule with its id and linked sources and every note.
+- **Files merged PRs often change.** A text file that at least 3 merged PRs (and a tenth of the
+  sample) changed, and that is not a guide, is added to the bundle as a guide-like file, its first
+  12 KB at a line end (`fetch_often`; links and binary files are skipped). The index lists them
+  apart from the guides, with how many PRs changed each, plus where merged PRs put their tests
+  (`test_dirs`). A quote from one checks out like a guide quote, and its path shows in
+  PROFILE-RULES.md.
+
+Review of this change (fixed):
+- **Often and cited files cannot make a rule required.** A changelog line says "must" about one
+  fix, not about every PR, so quotes from files merged PRs often change, and from files a
+  current rule cites that are no longer guides (`cited`, re-fetched on a refresh), count only
+  as practice sources. A cited file PRs often change is marked as often.
+- **"Says so" is narrower.** `obliges()` needs the obligation in one sentence and not negated
+  (`NOT_OBLIGED_RE`: "not required", "don't need to", "don't have to", "don't hesitate"); "always",
+  "requires" and bare "cannot" no longer count.
+- **`for-you` meets the same bar** for required and the same screen for secrets and local
+  details; only "posting or filing" is allowed there.
+- **File shapes.** `fetch_often` reads PR paths with `--literal-pathspecs`, skips trees,
+  submodules and lock files, and its excerpts count against the bundle budget; paths in the index
+  go through `one_line`; a learn that keeps nothing says "Nothing was kept." and points at
+  PROFILE-RULES.md.
+
+Tests: unit_learn.py checks each guard (obligation words, the cap, `for-you` screening and
+rendering, the short review and the full list, often files, test folders, `fetch_often`'s excerpt and
+skips, the bundle index, and one check per review fix above). Mutants that drop the obligation check, the `for-you` screen exception, the
+`for-you` filter in the profile, the often-file floor, or the cap each fail their own checks, and so do 9 mutants that undo one
+review fix each.
