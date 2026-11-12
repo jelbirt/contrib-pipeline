@@ -38,7 +38,7 @@ have no web, shell or GitHub access, and need none.
 3. Check your own work before you write: every guide path as listed, every PR number and
    comment `id` from the files, every quote copied and at least 8 words.
 4. Write `session/rules.json`, with a short `summary` of what the project cares about most
-   and a `why` for every rule. Aim for 15 to 40 rules; at most 60, and the driver keeps only
+   and a `short` label and a `why` for every rule. Aim for 15 to 40 rules; at most 60, and the driver keeps only
    the first 60, so put the rules that matter most first. Choose each strength as the rule
    format says: required only when the project would send a PR back for it. A rule for one
    area only (the website, CI files, one subsystem) starts its text with that area, and is

@@ -845,3 +845,38 @@ profile, and says why. Rule text, steps for you and the review's change lines ar
 with `no_block` in PROFILE-REVIEW.md, as summary lines already were. The prompts now say what
 draft-check.md lists, that more than 120 rules refuses the file, and that review lines are cut
 to 300 characters and 60 lines.
+
+### The rules review, as a flowchart (2026-11-12, after the third learn)
+
+The third learn's PROFILE-REVIEW.md for xerj was 2061 words: 32 required rules, each with its
+text, reason and sources, in one long list. The user asked for it shorter, with a flowchart if
+one fit. One does: every rule has a section, and the sections map onto the steps of a
+contribution, so the required rules can be drawn as the path a PR takes.
+
+- Each rule gains a `short` label (2 to 8 words, at most 60 characters), written by the
+  sessions. A missing or overlong label falls back to the id with its hyphens as spaces, so an
+  older learn still renders. Labels are a display field only and are part of the rules id, like
+  `why`.
+- The review's "What a PR must do here" section draws one box per step, in a fixed order (choose
+  the change, write the fix, test it, run the checks, commit, open the PR, review and merge),
+  with the number of required rules and up to 8 labels; steps with no required rule are left
+  out. The labels go through `flow_label`, which keeps letters, digits and plain punctuation
+  only, so session text cannot break out of a box or the diagram.
+- The required-rule list and the practices count are gone from the review. Reasons, sources and
+  practices are in PROFILE-RULES.md, which is unchanged and linked from the table.
+- The table's counts read as sentences ("1 file", "2 steps"), and the Left out row says
+  "nothing" when every rule's sources checked out.
+
+Rendered from the third learn's xerj rules (ids standing in for labels), the review is 663
+words, down from 2061: contrib-one/examples/profile-review.md. Unit checks pin the label
+fallback, the label sanitizing, the step order, the per-box cap and the counts; four mutants
+(no sanitizing, no cap, no fallback, steps in reverse) each fail their own check.
+
+Review of this change (fixed): the check that practices stay out of the diagram tested nothing
+(drawing practices, or every rule, survived), and nothing checked that every section has a
+step (dropping `legal` survived); both are checked now. Storing the id as a fallback label
+gave an unchanged learn a new id, and CHANGES.md could not say why: `short` is now stored only
+when it passes, the flowchart falls back at display time, and rule_changes names a changed
+`short` or `why`. The Left out row and the notes list say the rest are in PROFILE-RULES.md, a
+learn that listed no rules no longer says sources failed, labels keep letters outside ASCII,
+and SPEC.md describes the new layout. Mutants for each of these fail their own check.

@@ -370,15 +370,21 @@ ch = [f"change {i}" for i in range(20)]
 meta = {"base": "1557de2f5abc", "guides": 3, "often": 1, "merged": 9, "closed": 2}
 rv = m.render_review("o/r", mixed, [("x", "a <i>note</i>")], "Tests first.", meta, ch)
 check("the short review lists steps for you", "## Steps for you" in rv and "Sign the CLA" in rv)
-check("the short review gives each required rule its reason",
-      "Why: " in rv.split("## Required rules", 1)[1].split("## Practices", 1)[0])
-check("the short review lists required rules, not practices", "Commit subjects start" not in rv
-      and "1 required, 2 practices, 1 steps for you" in rv)
+flow = rv.split("## What a PR must do here", 1)[1].split("\n## ", 1)[0]
+lab = lambda r: m.flow_label(r.get("short") or r["id"].replace("-", " "))
+check("the short review draws the required rules as a flowchart, reasons left to the full list",
+      "```mermaid" in flow and "flowchart TD" in flow and "Why: " not in rv
+      and all(lab(r) in flow for r in mixed if r["strength"] == "required" and r["section"] != "for-you"))
+check("the flowchart draws required rules only, never practices or steps for you",
+      all(lab(r) not in flow for r in mixed if r["strength"] == "practice" or r["section"] == "for-you")
+      and "1 required, 2 practices, 1 step for you" in rv)
+check("every section but for-you has a step in the flowchart",
+      {s for _, ss in m.FLOW_STEPS for s in ss} == {k for k, _ in m.PROFILE_SECTIONS} - {"for-you"})
 check("the short review shows a few review changes", rv.count("\n- change ") == m.CHANGES_SHOWN
       and f"and {20 - m.CHANGES_SHOWN} more" in rv)
 check("the short review escapes notes", "\\<i\\>" in rv and "## Left out" in rv)
 check("the short review links the full list, not the required rules' sources", "(PROFILE-RULES.md)" in rv
-      and "/blob/" not in rv.split("## Required rules", 1)[1])
+      and "/blob/" not in rv.split("## What a PR must do here", 1)[1].split("## Steps for you", 1)[0])
 check("the short review shows the id the user approves", f"`{m.profile_id(mixed)}`" in rv)
 check("the short review says when there was little to learn from",
       "Little to learn from" in m.render_review("o/r", rs, [], "", {"guides": 1, "merged": 2}))
@@ -389,10 +395,15 @@ check("the full list has every rule with its id and reason",
 check("the full list links sources the driver built", "https://github.com/o/r/blob/1557de2f5abc/CONTRIBUTING.md" in rl)
 check("the full list has every review change", rl.count("\n- change ") == 20)
 many = [("(rule %d)" % i, "x") for i in range(500)]
-check("the short review shows a few notes", m.render_review("o/r", [], many, "", {}).count("\n- (rule") == m.CHECK_SHOWN)
+check("the short review shows a few notes and says where the rest are",
+      m.render_review("o/r", [], many, "", {}).count("\n- (rule") == m.CHECK_SHOWN
+      and f"and {500 - m.CHECK_SHOWN} more, in PROFILE-RULES.md" in m.render_review("o/r", [], many, "", {}))
+nothing = m.render_review("o/r", [], [], "", {})
+check("a learn that listed no rules says so, not that sources failed", "The sessions listed no rules" in nothing
+      and "nothing: the sessions listed no rules" in nothing and "checked out" not in nothing)
 check("the full list shows a bounded number of notes", m.render_rules("o/r", [], many, {}).count("\n- (rule") == m.NOTES_SHOWN)
 body = m.render_review("o/r", kept(rule()), [], "Tests first.\n## Rules\n- required: x\n> quoted\n1. one", meta
-                       ).split("## What the project cares about", 1)[1].split("\n## Required rules\n", 1)[0]
+                       ).split("## What the project cares about", 1)[1].split("\n## What a PR must do here\n", 1)[0]
 items = [l[2:] for l in body.splitlines() if l.startswith("- ")]
 check("summary lines cannot start a heading or a list", len(items) == 5
       and all(not re.match(r"[#>\-]|\d+\.", i) for i in items))
@@ -400,8 +411,36 @@ blocky = kept(rule(id="sign-cla", section="for-you", text="# Sign the CLA on you
     kept(rule(id="blocky", text="> Quoted rule text that starts a block.")) + \
     kept(rule(id="numbered", text="1. Numbered rule text that starts a list."))
 rv = m.render_review("o/r", blocky, [], "", meta, changes=["## Injected heading from the review", "2. a list item"])
-check("rules, steps for you and the review's changes cannot start a block in the review",
-      len(re.findall(r"^- \\[#>]|^- \d+\\[.)]", rv, re.M)) == 5 and not re.search(r"^- (#|>|\d+[.)])", rv, re.M))
+check("steps for you and the review's changes cannot start a block in the review",
+      len(re.findall(r"^- \\[#>]|^- \d+\\[.)]", rv, re.M)) == 3 and not re.search(r"^- (#|>|\d+[.)])", rv, re.M))
+
+# Short labels and the flowchart (2026-11-12): the review draws the required rules by step.
+check("a rule keeps the short label its session wrote", kept(rule(short="A test that fails first"))[0]["short"] == "A test that fails first")
+check("a missing, one-word or overlong label is not stored, and the flowchart shows the id",
+      all("short" not in kept(rule(**k))[0] for k in ({}, {"short": "Tests"}, {"short": "x" * 61 + " y"}))
+      and "fail first" in "\n".join(m.render_flow(kept(rule()))))
+check("a learn without labels keeps the id it had before labels existed",
+      m.profile_id(kept(rule())) == m.profile_id(kept(rule(short="Tests"))))
+check("CHANGES says when only a label or a reason changed",
+      m.rule_changes({"rules": kept(rule())}, kept(rule(short="A test that fails first"))) == [f"changed {kept(rule())[0]['id']}: its short"]
+      and m.rule_changes({"rules": kept(rule())}, kept(rule(why="Another reason for this rule.")))[0].endswith("its why"))
+check("a label keeps letters outside ASCII", m.flow_label("café crème brûlée") == "café crème brûlée")
+bad = m.flow_label('Tests"] --> evil["<script>x</script>\nmore')
+check("a label cannot break out of its box", not any(c in bad for c in '"[]<>{}|#;`\n') and "Tests" in bad)
+def req_rule(i, sec): return dict(id=f"r{i}", section=sec, strength="required", short=f"label {i}")
+fl = "\n".join(m.render_flow([req_rule(1, "checks"), req_rule(2, "scope"), req_rule(3, "tests")]))
+check("the flowchart's steps are in a fixed order, empty steps left out",
+      fl.index("Choose the change") < fl.index("Test it") < fl.index("Run the checks") and "Commit" not in fl
+      and fl.count(" --> ") == 2)
+fl = "\n".join(m.render_flow([req_rule(i, "checks") for i in range(m.FLOW_SHOWN + 3)]))
+check("a crowded step shows a few labels and counts the rest",
+      f"{m.FLOW_SHOWN + 3} required" in fl and "and 3 more" in fl and f"label {m.FLOW_SHOWN}" not in fl)
+check("no required rules, no flowchart", m.render_flow([]) == ["(none)"])
+
+rv = m.render_review("o/r", rs, [("x", "a note")], "", {**meta, "cited": 1})
+check("the review's counts read as sentences", "1 file current rules cite" in rv
+      and "1 file merged PRs often change" in rv and "1 rule or source the driver left out" in rv
+      and "nothing: every rule's sources checked out" in m.render_review("o/r", rs, [], "", meta))
 
 # The id
 check("the id does not depend on rule order", m.profile_id(rs) == m.profile_id(list(reversed(rs))))
@@ -427,7 +466,8 @@ check("a guide path is URL-quoted in its link",
 doc = (m.SKILL / "rules" / "profile.md").read_text()
 check("the format doc names every section", all(f"`{k}`" in doc for k, _ in m.PROFILE_SECTIONS))
 check("the format doc states the limits and the reason", f"at least {m.QUOTE_MIN_WORDS} words" in doc
-      and f"at most {m.PROFILE_MAX_RULES}" in doc and "**why**" in doc)
+      and f"at most {m.PROFILE_MAX_RULES}" in doc and "**why**" in doc
+      and "**short**" in doc and f"at most {m.SHORT_MAX_CHARS} characters" in doc)
 check("the review stage asks for reasons and a change list",
       all(w in (m.SKILL / "stages" / "learn-review.md").read_text() for w in ("`why`", "`review`")))
 

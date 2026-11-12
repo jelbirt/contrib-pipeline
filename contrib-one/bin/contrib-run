@@ -322,6 +322,12 @@ CHECK_SHOWN = 12   # notes in the short review; every note is in PROFILE-RULES.m
 CHANGES_SHOWN = 8  # review changes in the short review; every one is in PROFILE-RULES.md
 RULE_MAX_CHARS = 300
 WHY_MAX_CHARS = 300
+SHORT_MAX_CHARS = 60  # a rule's short label, shown in the review's flowchart
+FLOW_SHOWN = 8        # labels per flowchart box; the rest are counted
+# The steps of a contribution, in order, and the rule sections whose required rules each shows.
+FLOW_STEPS = (("Choose the change", ("scope", "candidate-sources")), ("Write the fix", ("reference", "legal")),
+              ("Test it", ("tests",)), ("Run the checks", ("checks",)), ("Commit", ("changelog", "commits")),
+              ("Open the PR", ("pr-body", "ai-policy")), ("Review and merge", ("review",)))
 RULE_MAX_SOURCES = 12
 QUOTE_MIN_WORDS = 8   # long enough to pin one place in the file, not a phrase found anywhere
 QUOTE_MAX_CHARS = 600
@@ -499,8 +505,14 @@ def check_rules(raw, bundle):
             continue
         seen.add(rid)
         # One order and no repeats, so the same rules always give the same id.
-        kept.append({"id": rid, "section": r["section"], "strength": r["strength"], "text": clean,
-                     "why": reason, "sources": [good[k] for k in sorted(good)]})
+        short = one_line(r.get("short"), 4 * SHORT_MAX_CHARS) if isinstance(r.get("short"), str) else ""
+        rule = {"id": rid, "section": r["section"], "strength": r["strength"],
+                "text": clean, "why": reason, "sources": [good[k] for k in sorted(good)]}
+        # Stored only when it passes, so a learn without labels keeps the id it had before labels
+        # existed; the flowchart shows the id in its place.
+        if words(short) >= 2 and len(short) <= SHORT_MAX_CHARS:
+            rule["short"] = short
+        kept.append(rule)
     return kept, notes
 
 
@@ -575,12 +587,38 @@ def source_link(repo, base, s):
 
 def review_notes(items, shown):
     lines = [f"- {md_text(i, 40)}: {md_text(one_line(w), 300)}" for i, w in items[:shown]]
-    return lines + ([f"- and {len(items) - shown} more"] if len(items) > shown else [])
+    return lines + ([f"- and {len(items) - shown} more, in PROFILE-RULES.md"] if len(items) > shown else [])
 
 
 def plain_list(lines, shown):
     return [f"- {no_block(md_text(x, 300))}" for x in lines[:shown]] + \
         ([f"- and {len(lines) - shown} more, in PROFILE-RULES.md"] if len(lines) > shown else [])
+
+
+def flow_label(s):
+    """A session's short label as plain text that cannot break out of a mermaid box."""
+    return re.sub(r" +", " ", re.sub(r"[^\w ,.'():/+-]", " ", one_line(s, SHORT_MAX_CHARS))).strip() or "(no label)"
+
+
+def count(n, one, many):
+    """'1 file', '2 files': the review's tables read as sentences."""
+    return f"{n} {one if n == 1 else many}"
+
+
+def render_flow(req):
+    """The required rules as the steps of a contribution, one box per step with a rule, in a
+    mermaid flowchart. The steps and their order are fixed here; the labels are the sessions'."""
+    boxes = []
+    for title, secs in FLOW_STEPS:
+        rs = [r for r in rule_order(req) if r["section"] in secs]
+        if rs:
+            labels = [flow_label(r.get("short") or r["id"].replace("-", " ")) for r in rs[:FLOW_SHOWN]]  # no label: the id
+            labels += [f"and {len(rs) - FLOW_SHOWN} more"] if len(rs) > FLOW_SHOWN else []
+            boxes.append(f"<b>{title}</b>, {len(rs)} required" + "".join(f"<br/>{l}" for l in labels))
+    if not boxes:
+        return ["(none)"]
+    return (["```mermaid", "flowchart TD"] + [f'    s{i}["{b}"]' for i, b in enumerate(boxes)]
+            + [f"    s{i} --> s{i + 1}" for i in range(len(boxes) - 1)] + ["```"])
 
 
 def render_review(repo, rules, notes, summary, meta, changes=()):
@@ -596,16 +634,23 @@ def render_review(repo, rules, notes, summary, meta, changes=()):
            (f"**Learned, not yet approved.** Rules id `{pid}`. Runs on this repo refuse until you approve it "
             f"with `contrib-run --repo {md_text(repo, 100)} --approve-profile {pid}`; to correct a rule, write the "
             "correction in the repo's overrides file." if rules else
-            "**Nothing was kept.** No rule had a source that checked out; why is in "
-            "[PROFILE-RULES.md](PROFILE-RULES.md). There is nothing to approve."), "",
+            ("**Nothing was kept.** No rule had a source that checked out; why is in "
+             "[PROFILE-RULES.md](PROFILE-RULES.md). There is nothing to approve." if notes else
+             "**Nothing was kept.** The sessions listed no rules. There is nothing to approve.")), "",
            "| | |", "|---|---|",
-           f"| **Read** | {guides - often - cited} guide files and {often} files merged PRs often change"
-           + (f" and {cited} files current rules cite" if cited else "") + ", at base "
-           f"`{md_text(base, 12)}`; {merged} merged PRs by outside contributors, {closed} closed without merging |",
-           f"| **Rules** | {len(req)} required, {len(prac)} practices, {len(you)} steps for you. Drafted by one "
-           "session, checked and corrected by a second. Every rule with its reason and sources: "
+           f"| **Read** | {count(guides - often - cited, 'guide file', 'guide files')}, "
+           f"{count(often, 'file', 'files')} merged PRs often change"
+           + (f", {count(cited, 'file', 'files')} current rules cite" if cited else "") + ", at base "
+           f"`{md_text(base, 12)}`; {count(merged, 'merged PR', 'merged PRs')} by outside contributors, "
+           f"{closed} closed without merging |",
+           f"| **Rules** | {len(req)} required, {count(len(prac), 'practice', 'practices')}, "
+           f"{count(len(you), 'step', 'steps')} for you. Drafted by one "
+           "session, checked and corrected by a second. Each rule with its reason and sources: "
            "[PROFILE-RULES.md](PROFILE-RULES.md) |",
-           f"| **Left out** | {len(notes)} notes on rules or sources the driver left out, and why |"]
+           f"| **Left out** | " + (f"{count(len(notes), 'rule or source', 'rules or sources')} the driver left "
+                                    "out, with the reasons under Left out below and in PROFILE-RULES.md |"
+                                    if notes else "nothing: every rule's sources checked out |" if rules else
+                                    "nothing: the sessions listed no rules |")]
     if guides - often <= 1 or merged < 6:
         out.append("| **Little to learn from** | Few guide files or merged outside PRs, so most of what this "
                    "repo expects is not here; expect to add overrides. |")
@@ -613,24 +658,15 @@ def render_review(repo, rules, notes, summary, meta, changes=()):
     lines = [md_text(one_line(l, RULE_MAX_CHARS), RULE_MAX_CHARS)
              for l in str(summary or "").splitlines() if one_line(l)][:6]
     out += [f"- {no_block(l)}" for l in lines] or ["(The sessions wrote no summary.)"]
+    out += ["", "## What a PR must do here", "", "The required rules, at the step of a contribution where each "
+            "applies. A PR that breaks one is likely sent back. Why each is required, and the practices, "
+            "are in PROFILE-RULES.md.", ""] + render_flow(req)
     if you:
         out += ["", "## Steps for you", "", "Things only you can do, by hand. Sessions never see these.", ""]
         out += [f"- {no_block(md_text(r['text'], RULE_MAX_CHARS))} ({source_link(repo, base, r['sources'][0])})"
                 for r in rule_order(you)]
-    out += ["", "## Required rules", "", "A PR that breaks one of these is likely sent back. Each says why it "
-            "is required; sources are in PROFILE-RULES.md.", ""]
-    last = None
-    for r in rule_order(req):
-        if r["section"] != last:
-            last = r["section"]
-            out.append(f"**{dict(PROFILE_SECTIONS)[last]}**")
-        out.append(f"- {no_block(md_text(r['text'], RULE_MAX_CHARS))} Why: {md_text(r['why'], WHY_MAX_CHARS)}")
-    if not req:
-        out.append("(none)")
-    out += ["", "## Practices", "", f"{len(prac)} practices: what merged PRs here usually do. They are listed "
-            "with their reasons and sources in PROFILE-RULES.md."]
     if changes:
-        out += ["", "## What the review changed", ""] + plain_list(list(changes), CHANGES_SHOWN)
+        out += ["", f"## What the review changed ({len(changes)})", ""] + plain_list(list(changes), CHANGES_SHOWN)
     if notes:
         out += ["", "## Left out", ""] + review_notes(notes, CHECK_SHOWN)
     return "\n".join(out) + "\n"
@@ -746,7 +782,7 @@ def rule_changes(prev, rules):
     out += [f"removed {i}" for i in sorted(old.keys() - new.keys())]
     for i in sorted(new.keys() & old.keys()):
         a, b = old[i], new[i]
-        what = [k for k in ("section", "strength", "text", "sources") if a.get(k) != b.get(k)]
+        what = [k for k in ("section", "strength", "text", "short", "why", "sources") if a.get(k) != b.get(k)]
         if what:
             out.append(f"changed {i}: its {', '.join(what)}")
     return out

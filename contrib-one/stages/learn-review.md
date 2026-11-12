@@ -30,6 +30,7 @@ web, shell or GitHub access, and need none.
      rule format says. Drafts tend to mark too much required: check each one against its
      quotes, and make advice a practice.
    - **Why.** Write `why` for every rule, from its sources.
+   - **Short label.** Give every rule a `short` label your user can read in a flowchart box.
    - **Worth keeping?** Merge rules that say the same thing. Cut advice any project would give
      that a reviewer here would not check. Make the text an outcome a reviewer can check.
 3. Look for what the draft missed. For each topic below, look in the bundle and add a rule

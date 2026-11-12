@@ -102,6 +102,7 @@ if prompt.startswith("Learn") or prompt.startswith("Refresh"):
             if len(ws) >= 10 and "|" not in line and "http" not in line:
                 rules.append({"id": f"guide-{len(rules) + 1}", "section": "scope", "strength": "required",
                               "text": f"Follows what {g.name} says in its line starting {ws[0]!r}.",
+                              "short": f"What {g.name} asks",
                               "why": f"{g.name} states it as a rule for every contribution.",
                               "sources": [{"guide": str(g.relative_to(bundle / "guides")), "quote": " ".join(ws[:10])}]})
                 break

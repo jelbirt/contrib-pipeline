@@ -102,8 +102,9 @@ data. The learned profile is different: it goes into every session's system prom
 ## Approval and visibility
 
 - **First learn:** `--learn` writes `PROFILE-REVIEW.md` in the packet's reader style: what
-  the project cares about, steps for you, the required rules one line each with their reason,
-  a practice count, what the review session changed in the draft, what the driver left out,
+  the project cares about, steps for you, a flowchart of the required rules by contribution
+  step (short labels; reasons and practices are in `PROFILE-RULES.md`), what the review
+  session changed in the draft, what the driver left out,
   and a note when there was little to learn from. `PROFILE-RULES.md` beside it lists every
   rule with its reason and linked sources, every review change, and everything left out. Its id is the first 12 characters of the
   profile's SHA-256. Runs on that repo refuse until you approve that id in chat; the skill

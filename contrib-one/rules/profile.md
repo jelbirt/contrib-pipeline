@@ -20,6 +20,7 @@ it.
       "section": "tests",
       "strength": "required",
       "text": "A fix comes with a test that fails before the change and passes after it.",
+      "short": "A test that fails first",
       "why": "CONTRIBUTING.md says a fix without a failing test will not be merged, and maintainers asked for one on two PRs.",
       "sources": [
         {"guide": "CONTRIBUTING.md", "quote": "every bug fix must include a regression test that fails without the fix"},
@@ -31,6 +32,7 @@ it.
       "section": "commits",
       "strength": "practice",
       "text": "Commit subjects use a conventional prefix with a scope, like fix(api): ...",
+      "short": "Conventional commit subject",
       "why": "Most merged PRs do it; no guide asks for it.",
       "sources": [{"prs": [2938, 2912, 2883, 2894, 2901]}]
     }
@@ -54,6 +56,10 @@ it.
     than one PR. Advice ("please", "should", "prefer", "consider") is a practice, even in a
     guide, and so is anything only merged PRs show. The same holds in `for-you`.
   - `practice`: what merged PRs here usually do, or what a guide recommends.
+- **short**: a label of 2 to 8 words, at most 60 characters, for the flowchart your user
+  reads: "A test that fails first", "cargo fmt passes". Plain words; square brackets, double quotes,
+  backticks, angle brackets and similar marks are taken out. A label that is too long or under
+  2 words is left out, and the id stands in.
 - **why**: one or two sentences, at least 3 words and at most 300 characters, saying why the
   rule has this strength, in terms of its sources. Your user reads it to decide whether to
   trust the rule.
