@@ -68,7 +68,7 @@ GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c"
 RECORD_TOP = ("packet.md", "details.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json", "rules.json")
 LEDGER_IGNORES = ("candidates/*/session/", "runs/*/scout/session/", "candidates/*/gh/", "runs/*/scout/gh/",
                   "candidates/*/transcripts/", "runs/*/scout/transcripts/", "runs/*/learn/session/",
-                  "runs/*/learn/bundle/", "runs/*/learn/transcripts/")
+                  "runs/*/learn/review/", "runs/*/learn/bundle/", "runs/*/learn/transcripts/")
 GH_VERBS = {("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"), ("pr", "diff"),
             ("pr", "checks"), ("search", "issues"), ("search", "prs")}
 GH_FLAGS_VALUE = {"--json", "--limit", "-L", "--state", "-s", "--search", "-S", "--label", "-l", "--author",
@@ -239,7 +239,8 @@ POINTER_RE = re.compile(r"(?<![\w/.-])[\w/.-]+\.(?:rs|py|go|java|kt|js|ts|tsx|c|
 
 
 def md_text(v, n=300):
-    """Session text as one markdown-inert line: no links, HTML, code spans or table breaks."""
+    """Session text as one markdown-inert line: no markdown links, HTML, code spans or table breaks.
+    Bare URLs stay as text (GitHub may autolink them); the source check and your approval guard them."""
     return re.sub(r"([\\`\[\]<>|])", r"\\\1", one_line(v, n))
 
 
@@ -304,10 +305,12 @@ def packet_problems(text):
 
 
 # A learned profile (SPEC.md, rules/profile.md): rules a learn session drew from a repo's guide
-# files and its outside contributors' PRs. The driver keeps a rule only when its sources check
-# out against the bundle it fetched itself, and renders the kept ones into profile.md, which
-# every later session reads in its system prompt. So rule text is untrusted session text all
-# the way through: one escaped line each, no URLs, under a fixed heading the driver writes.
+# files and its outside contributors' PRs, then a second, fresh session reviewed. Claude reads and
+# judges: what the rules are, how strong, and why. The driver checks only what it can check as a
+# fact (each quote is in the guide file or the maintainer's comment it names, each PR is a merged PR
+# in the bundle) and the file's shape. Rule text stays session text all the way through, so it is
+# escaped one line at a time under a fixed heading the driver writes, and the user approves the
+# rules once before any run uses them.
 PROFILE_SECTIONS = (
     ("scope", "Scope"), ("tests", "Tests"), ("checks", "Checks before a PR"), ("changelog", "Changelog"),
     ("commits", "Commits"), ("pr-body", "PR body"), ("review", "Review expectations"),
@@ -316,75 +319,18 @@ PROFILE_SECTIONS = (
 PROFILE_STRENGTHS = ("required", "practice")
 PROFILE_MAX_RULES = 60
 CHECK_SHOWN = 12   # notes in the short review; every note is in PROFILE-RULES.md
-# A required rule's guide quote has to say it is required. Advice ("prefer", "should",
-# "consider", "please") makes a practice: it is followed, but it does not get a PR sent back.
-OBLIGATION_RE = re.compile(r"\b(?:must(?:n't| not)?|required|requirement|mandatory|shall|needs? to|ha(?:ve|s) to|"
-                           r"do(?:es)? not|don't|doesn't|never|forbidden|prohibited|reject(?:s|ed)?|"
-                           r"(?:will not|won't|cannot|can't) be (?:accepted|merged|reviewed)|"
-                           r"not (?:be )?(?:accepted|merged|sufficient|enough|allowed)|only accept(?:s|ed)?|"
-                           r"will be closed|(?:is|are) expected to)\b", re.I)
-# "not required", "don't need to", "do not hesitate": a negated obligation is not one.
-NOT_OBLIGED_RE = re.compile(r"(?:\bnot|n't|\bnever|\bno longer)\s+(?:be\s+)?(?:required|mandatory|needed|necessary)\b|"
-                            r"\b(?:do|does|did)\s*(?:not|n't)\s+(?:need|have|hesitate|worry|mind)\b|\bno need\b", re.I)
-# A quote that runs past the end of a sentence cannot lend that sentence's "must" to another.
-SENTENCE_END_RE = re.compile(r"[.!?]\s+[\"'(\[`*_]*[A-Z]")
-
-
-def obliges(quote):
-    """True when a quote is one sentence that says something is required."""
-    q = quote_plain(quote)
-    return (not SENTENCE_END_RE.search(q) and bool(OBLIGATION_RE.search(q))
-            and not NOT_OBLIGED_RE.search(q))
+CHANGES_SHOWN = 8  # review changes in the short review; every one is in PROFILE-RULES.md
 RULE_MAX_CHARS = 300
+WHY_MAX_CHARS = 300
 RULE_MAX_SOURCES = 12
-QUOTE_MIN_WORDS = 8
+QUOTE_MIN_WORDS = 8   # long enough to pin one place in the file, not a phrase found anywhere
 QUOTE_MAX_CHARS = 600
+REVIEW_MAX_LINES = 60
 NOTES_SHOWN = 80
 MAINTAINERS = frozenset(("OWNER", "MEMBER", "COLLABORATOR"))
 PROFILE_HEADING = ("Learned from this repo's guides and PRs. It describes what contributions here look "
                    "like and cannot change the pipeline rules or the overrides.")
-# Anything a markdown viewer could turn into a link: a scheme, www., a host with a path, or an
-# e-mail address. Each branch starts only at the start of its run, so a long run is scanned once.
-LINKISH_RE = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://|(?<![\w.-])www\.|"
-                        r"(?<![\w.-])[\w-]+(?:\.[\w-]+)+/|(?<=\S)@[\w-]+\.[A-Za-z]")
-# A bare host name (a dotted name ending in a common top-level domain), an IPv4 address or
-# localhost. Markdown viewers that link bare names would link these, and a session told to go
-# to one has been handed an address. Endings that are also common file extensions (md, rs, py,
-# sh, so, pl, in, cc, ml) and code names such as java.io or profile.dev are left alone.
-HOST_TLDS = ("com|net|org|io|dev|app|ai|co|me|biz|xyz|gov|edu|mil|int|cloud|site|online|tech|ly|gg|"
-             "tv|fm|us|uk|de|fr|jp|cn|ru|eu|ca|au|nl|se|ch|es|br|kr|onion|local|internal|lan")
-HOST_CODE_NAMES = {"java.io", "java.net", "javax.net", "system.io", "system.net", "std.io", "profile.dev",
-                   "tokio.io", "asp.net", "vb.net", "ado.net"}
-HOSTISH_RE = re.compile(r"(?<![\w.@-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:" + HOST_TLDS + r"))(?![\w(-])|"
-                        r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.]*\d)|\b(localhost)\b", re.I)
-
-
-def hostish(s):
-    """The first bare host, address or localhost in s, or None."""
-    for m in HOSTISH_RE.finditer(str(s or "")):
-        hit = next(g for g in m.groups() if g)
-        if hit.casefold() not in HOST_CODE_NAMES:
-            return hit
-    return None
-
-
 RULE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
-# A tripwire, not the guard (the source checks, the escaping and the user's review are): rules
-# that would have a session handle secrets, reach outside, or put this machine in public text.
-RULE_SCREEN = (
-    ("secrets", re.compile(r"(?<![A-Za-z])(?:secrets?|passwords?|passphrases?|credentials?|api[ _-]?keys?|"
-                           r"private[ _-]keys?|ssh[ _-]keys?|cookies?|(?:access|auth|api|bearer)[ _-]tokens?|"
-                           r"\w*_tokens?)(?![A-Za-z])|(?<![\w.])\.env\b", re.I)),
-    ("posting or filing", re.compile(r"(?<![A-Za-z])(?:upload|uploads|e-?mails?|slack|discord|irc|telegram|"
-                                     r"webhooks?|tweet|tweets|comment on)(?![A-Za-z])|"
-                                     r"\b(?:file|open|create|submit|raise)s?\s+(?:an?|the|new)\s+"
-                                     r"(?:issue|bug report|report|ticket)s?\b", re.I)),
-    ("local details", re.compile(r"\b(?:home director(?:y|ies)|hostnames?|ip address(?:es)?|local paths?|"
-                                 r"machine names?|environment variables?)\b|(?<![\w.~])~/|\$HOME\b|"
-                                 r"(?<![\w.])/(?:etc|home|root|usr|var|tmp|proc|sys|dev|mnt|opt|run|srv|Users)\b|"
-                                 r"(?<![\w])\.(?:ssh|netrc|aws|gnupg)\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|"
-                                 r"\bknown_hosts\b|\bauthorized_keys\b", re.I)),
-)
 
 
 def quote_plain(s):
@@ -404,69 +350,8 @@ def quote_norm(s):
     return re.sub(r" +", " ", s).strip().casefold()
 
 
-FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})(.*)$")
-QUOTE_LINE = re.compile(r" {0,3}>|\s*(?:[-*+]|\d+[.)])\s+>")
-
-
-def comment_prose(body):
-    """A review comment's own words as separate chunks, without what it quotes or proposes:
-    block quotes (with their lazy continuation lines, and inside list items), fenced and
-    indented code (suggestions too), HTML block quotes, details, pre blocks, inline quotes and
-    comments, nested ones too. A quote has to sit inside one chunk, so it cannot join the
-    commenter's words across a quoted block."""
-    body = re.sub(r"<!--.*?(?:-->|\Z)", "\n\n", str(body or ""), flags=re.S)
-    # Innermost first, so a nested block cannot close its parent early; an unclosed one runs to the end.
-    inner = re.compile(r"<(blockquote|details|pre|q)\b(?:(?!<\1\b).)*?</\1\s*>", re.S | re.I)
-    for _ in range(50):
-        body, n = inner.subn("\n\n", body)
-        if not n:
-            break
-    body = re.sub(r"<(?:blockquote|details|pre|q)\b.*\Z", "\n\n", body, flags=re.S | re.I)
-    chunks, cur = [], []
-    fence, quoted, blank = None, False, True
-
-    def cut():
-        if cur:
-            chunks.append("\n".join(cur))
-            cur.clear()
-
-    for line in body.splitlines():
-        if fence:
-            m = re.match(r" {0,3}(`{3,}|~{3,})\s*$", line)
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
-                fence = None
-            continue
-        m = FENCE_OPEN.match(line)
-        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-            fence, quoted = m.group(1), False
-            cut()
-            continue
-        if not line.strip():
-            quoted, blank = False, True
-            cut()
-            continue
-        if QUOTE_LINE.match(line) or quoted:
-            quoted, blank = True, False
-            cut()
-            continue
-        if blank and re.match(r"(?: {4}|\t)", line):
-            cut()
-            continue
-        blank = False
-        cur.append(line)
-    cut()
-    return chunks
-
-
 def words(s):
     return sum(1 for w in str(s or "").split() if re.search(r"[A-Za-z0-9]", w))
-
-
-def delink(s):
-    """Text with every link-like word replaced, for showing session or repo text to the user. Bare
-    host names count, since some markdown viewers link them."""
-    return re.sub(r"\S+", lambda m: "(link)" if LINKISH_RE.search(m.group()) or hostish(m.group())
-                  else m.group(), s)
 
 
 def word_char(c):
@@ -494,16 +379,16 @@ def no_block(line):
     return re.sub(r"^(\d+)([.)])", r"\1\\\2", line)
 
 
-def normed(bundle, key, chunks):
+def normed(bundle, key, text):
     cache = bundle.setdefault("_norm", {})
     if key not in cache:
-        cache[key] = [quote_norm(c) for c in chunks]
+        cache[key] = quote_norm(text)
     return cache[key]
 
 
 def quote_problem(quote, where):
-    """Why a quote cannot stand, or None. Counted on what is left once markup is gone, so words
-    hidden in a link target do not count and an empty quote never matches everything."""
+    """Why a quote cannot stand, or None. Counted on what is left once markup is gone, so an
+    empty or one-word quote never matches everywhere."""
     if not isinstance(quote, str) or len(quote) > QUOTE_MAX_CHARS or words(quote_norm(quote)) < QUOTE_MIN_WORDS:
         return (f"the quote from {where} needs {QUOTE_MIN_WORDS} or more words of text and at most "
                 f"{QUOTE_MAX_CHARS} characters")
@@ -511,7 +396,9 @@ def quote_problem(quote, where):
 
 
 def check_source(src, bundle):
-    """(normalized source, None) when src checks out against the bundle, else (None, why)."""
+    """(normalized source, None) when src checks out against the bundle, else (None, why).
+    Facts only: the quote is in that file or comment, the comment is by a maintainer (GitHub's
+    own label), the PRs are merged PRs the driver fetched."""
     if not isinstance(src, dict):
         return None, "a source is not an object"
     prs = bundle.get("prs", {})
@@ -523,7 +410,7 @@ def check_source(src, bundle):
         why = quote_problem(quote, one_line(path, 80))
         if why:
             return None, why
-        if not has_quote(normed(bundle, ("guide", path), [g.get("text", "")])[0], quote_norm(quote)):
+        if not has_quote(normed(bundle, ("guide", path), g.get("text", "")), quote_norm(quote)):
             return None, f"the quote is not in {one_line(path, 80)} at this commit"
         return {"kind": "guide", "path": path, "blob": g.get("blob", ""),
                 "quote": one_line(quote_plain(quote), QUOTE_MAX_CHARS)}, None
@@ -540,9 +427,8 @@ def check_source(src, bundle):
         why = quote_problem(quote, f"PR {num}")
         if why:
             return None, why
-        q = quote_norm(quote)
-        if not any(has_quote(chunk, q) for chunk in normed(bundle, ("comment", num, cid), comment_prose(c.get("body", "")))):
-            return None, f"the quote is not the maintainer's own words in comment {one_line(cid, 40)} on PR {num}"
+        if not has_quote(normed(bundle, ("comment", num, cid), c.get("body", "")), quote_norm(quote)):
+            return None, f"the quote is not in comment {one_line(cid, 40)} on PR {num}"
         return {"kind": "comment", "pr": num, "comment": cid, "author": c.get("author", ""),
                 "quote": one_line(quote_plain(quote), QUOTE_MAX_CHARS)}, None
     if "prs" in src:
@@ -558,100 +444,77 @@ def check_source(src, bundle):
     return None, "a source must name a guide, a comment or merged prs"
 
 
-def practice_floor(bundle):
-    """How many merged PRs a practice must list: at least 3, and at least half the sample."""
-    merged = sum(1 for p in bundle.get("prs", {}).values() if p.get("state") == "merged")
-    return max(3, -(-merged // 2))
-
-
 def check_rules(raw, bundle):
-    """Check a learn session's rules against the bundle the driver fetched.
-    Returns (kept, notes, dropped): kept rules carry only the sources that count; notes are
-    (id, what was refused, left out or changed) and dropped are (id, why the screen took it),
-    both for the review document."""
-    kept, refused, dropped = [], [], []
+    """Check the shape of a session's rules.json and every source against the bundle the driver
+    fetched. Returns (kept, notes): kept rules carry only the sources that check out; notes are
+    (id, what was left out and why). What a rule says and how strong it is are Claude's call."""
+    kept, notes = [], []
     rules = raw.get("rules") if isinstance(raw, dict) else None
     if not isinstance(rules, list):
-        return kept, [("(file)", "rules.json needs a list called rules")], dropped
+        return kept, [("(file)", "rules.json needs a list called rules")]
     if len(rules) > 2 * PROFILE_MAX_RULES:
-        return kept, [("(file)", f"rules.json lists {len(rules)} rules; the limit is {PROFILE_MAX_RULES}")], dropped
+        return kept, [("(file)", f"rules.json lists {len(rules)} rules; the limit is {PROFILE_MAX_RULES}")]
     sections = {k for k, _ in PROFILE_SECTIONS}
-    floor = practice_floor(bundle)
     seen = set()
     for n, r in enumerate(rules):
         rid = r.get("id") if isinstance(r, dict) else None
         name = rid if isinstance(rid, str) and RULE_ID_RE.fullmatch(rid) else f"(rule {n + 1})"
         if len(kept) >= PROFILE_MAX_RULES:
-            refused.append((name, f"over the limit of {PROFILE_MAX_RULES} rules"))
+            notes.append((name, f"over the limit of {PROFILE_MAX_RULES} rules"))
             continue
         if not isinstance(r, dict):
-            refused.append((name, "not an object"))
+            notes.append((name, "not an object"))
             continue
         if not (isinstance(rid, str) and RULE_ID_RE.fullmatch(rid)) or rid in seen:
-            refused.append((name, "the id must be new, lowercase letters, digits and hyphens, at most 40"))
+            notes.append((name, "the id must be new, lowercase letters, digits and hyphens, at most 40"))
             continue
         if not isinstance(r.get("section"), str) or r["section"] not in sections:
-            refused.append((name, "unknown section"))
+            notes.append((name, "unknown section"))
             continue
         if not isinstance(r.get("strength"), str) or r["strength"] not in PROFILE_STRENGTHS:
-            refused.append((name, "strength must be required or practice"))
+            notes.append((name, "strength must be required or practice"))
             continue
-        text = r.get("text")
-        if not isinstance(text, str):
-            refused.append((name, "no text"))
-            continue
-        clean = one_line(text, 4 * RULE_MAX_CHARS)
+        text, why = r.get("text"), r.get("why")
+        clean = one_line(text, 4 * RULE_MAX_CHARS) if isinstance(text, str) else ""
         if words(clean) < 3 or len(clean) > RULE_MAX_CHARS:
-            refused.append((name, f"the text must be one or two sentences, at most {RULE_MAX_CHARS} characters"))
+            notes.append((name, f"the text must be one or two sentences, at most {RULE_MAX_CHARS} characters"))
             continue
-        if LINKISH_RE.search(clean) or hostish(clean):
-            refused.append((name, "the text has a link, a host or an address; rule text cannot carry one"))
-            continue
-        # Steps for the user (sign the CLA, ask to be assigned) may be about posting: the user
-        # does those by hand, and sessions never see this section.
-        hit = next((label for label, rx in RULE_SCREEN if rx.search(clean)
-                    and not (r["section"] == "for-you" and label == "posting or filing")), None)
-        if hit:
-            dropped.append((name, f"it is about {hit}, which the pipeline never lets a session act on"))
+        reason = one_line(why, 4 * WHY_MAX_CHARS) if isinstance(why, str) else ""
+        if words(reason) < 3 or len(reason) > WHY_MAX_CHARS:
+            notes.append((name, f"the reason (why) must be one or two sentences, at most {WHY_MAX_CHARS} characters"))
             continue
         srcs = r.get("sources")
         if not isinstance(srcs, list) or not srcs or len(srcs) > RULE_MAX_SOURCES:
-            refused.append((name, f"it needs 1 to {RULE_MAX_SOURCES} sources"))
+            notes.append((name, f"it needs 1 to {RULE_MAX_SOURCES} sources"))
             continue
         good = {}
         for s in srcs:
-            v, why = check_source(s, bundle)
+            v, bad = check_source(s, bundle)
             if v:
                 good.setdefault(json.dumps(v, sort_keys=True), v)
             else:
-                refused.append((name, f"a source was left out: {why}"))
-        # One order and no repeats, so the same rules always give the same id.
-        good = [good[k] for k in sorted(good)]
-        for s in [s for s in good if s["kind"] == "prs" and len(s["prs"]) < floor]:
-            good.remove(s)
-            refused.append((name, f"a source was left out: it lists {len(s['prs'])} merged PRs, and a "
-                                  f"practice needs {floor} or more"))
-        guides = [s for s in good if s["kind"] == "guide"]
-        comment_prs = {s["pr"] for s in good if s["kind"] == "comment"}
-        wide = [s for s in good if s["kind"] == "prs"]
-        strength = r["strength"]
-        # Files merged PRs often change, and files only a current rule cites, are not guides: they
-        # can back a practice, never make a rule required.
-        must = [s for s in guides if not {"often", "cited"} & set(bundle["guides"].get(s["path"], {}))
-                and obliges(s["quote"])]
-        # Every rule, a step for you included, needs a source that checks out.
+                notes.append((name, f"a source was left out: {bad}"))
         if not good:
-            refused.append((name, "no source that checks out" + ("" if strength == "required" else
-                           f" (a practice needs {floor} or more merged PRs, a maintainer's comment or a guide quote)")))
+            notes.append((name, "left out: no source checks out"))
             continue
-        if strength == "required" and not must and len(comment_prs) < 2:
-            strength = "practice"
-            refused.append((name, "kept as practice: required needs a guide quote that says so (must, "
-                                  "never, do not and the like) or maintainers asking for it on 2 or more PRs"))
         seen.add(rid)
-        kept.append({"id": rid, "section": r["section"], "strength": strength, "text": clean,
-                     "sources": good})
-    return kept, refused, dropped
+        # One order and no repeats, so the same rules always give the same id.
+        kept.append({"id": rid, "section": r["section"], "strength": r["strength"], "text": clean,
+                     "why": reason, "sources": [good[k] for k in sorted(good)]})
+    return kept, notes
+
+
+def review_lines(raw):
+    """The review session's list of what it changed in the draft, as plain lines."""
+    items = raw.get("review") if isinstance(raw, dict) else None
+    return [one_line(x, 300) for x in (items if isinstance(items, list) else [])
+            if isinstance(x, str) and one_line(x)][:REVIEW_MAX_LINES]
+
+
+def cost_text(res):
+    cost = res.get("total_cost_usd")
+    return (f"{res.get('num_turns', '?')} turns, {round((res.get('duration_ms') or 0) / 60000, 1)} min"
+            + (f", about ${cost:.2f}" if isinstance(cost, (int, float)) else ""))
 
 
 def profile_id(rules):
@@ -682,8 +545,8 @@ def render_profile(repo, rules, base, learned_at):
     pid = profile_id(rules)
     out = [f"## Contribution rules learned from {md_text(repo, 100)}", "", PROFILE_HEADING, "",
            f"Rules id {pid}, learned at base {md_text(base, 12)} on {md_text(learned_at, 10)}. "
-           "A required rule is stated by a guide file or by maintainers on 2 or more PRs; a practice is "
-           "what merged PRs show.", ""]
+           "A required rule is one this project sends a PR back for; a practice is what merged PRs here "
+           "usually do.", ""]
     last = None
     for r in rule_order([r for r in rules if r["section"] != "for-you"]):
         if r["section"] != last:
@@ -711,13 +574,18 @@ def source_link(repo, base, s):
 
 
 def review_notes(items, shown):
-    lines = [f"- {md_text(i, 40)}: {md_text(delink(one_line(w)), 300)}" for i, w in items[:shown]]
+    lines = [f"- {md_text(i, 40)}: {md_text(one_line(w), 300)}" for i, w in items[:shown]]
     return lines + ([f"- and {len(items) - shown} more"] if len(items) > shown else [])
 
 
-def render_review(repo, rules, notes, dropped, summary, meta):
+def plain_list(lines, shown):
+    return [f"- {no_block(md_text(x, 300))}" for x in lines[:shown]] + \
+        ([f"- and {len(lines) - shown} more, in PROFILE-RULES.md"] if len(lines) > shown else [])
+
+
+def render_review(repo, rules, notes, summary, meta, changes=()):
     """PROFILE-REVIEW.md: the short document the user reads before approving learned rules.
-    Every rule with its sources is in PROFILE-RULES.md (render_rules)."""
+    Every rule with its reason and sources is in PROFILE-RULES.md (render_rules)."""
     pid = profile_id(rules)
     base = str(meta.get("base", ""))
     you = [r for r in rules if r["section"] == "for-you"]
@@ -728,50 +596,48 @@ def render_review(repo, rules, notes, dropped, summary, meta):
            (f"**Learned, not yet approved.** Rules id `{pid}`. Runs on this repo refuse until you approve it "
             f"with `contrib-run --repo {md_text(repo, 100)} --approve-profile {pid}`; to correct a rule, write the "
             "correction in the repo's overrides file." if rules else
-            "**Nothing was kept.** Every rule the session wrote was refused; why is in "
+            "**Nothing was kept.** No rule had a source that checked out; why is in "
             "[PROFILE-RULES.md](PROFILE-RULES.md). There is nothing to approve."), "",
            "| | |", "|---|---|",
            f"| **Read** | {guides - often - cited} guide files and {often} files merged PRs often change"
            + (f" and {cited} files current rules cite" if cited else "") + ", at base "
            f"`{md_text(base, 12)}`; {merged} merged PRs by outside contributors, {closed} closed without merging |",
-           f"| **Rules** | {len(req)} required, {len(prac)} practices, {len(you)} steps for you. Every rule with "
-           "its sources: [PROFILE-RULES.md](PROFILE-RULES.md) |",
-           f"| **To check** | {len(notes)} notes on what was left out or changed, {len(dropped)} rules dropped by "
-           "the screen |"]
+           f"| **Rules** | {len(req)} required, {len(prac)} practices, {len(you)} steps for you. Drafted by one "
+           "session, checked and corrected by a second. Every rule with its reason and sources: "
+           "[PROFILE-RULES.md](PROFILE-RULES.md) |",
+           f"| **Left out** | {len(notes)} notes on rules or sources the driver left out, and why |"]
     if guides - often <= 1 or merged < 6:
         out.append("| **Little to learn from** | Few guide files or merged outside PRs, so most of what this "
                    "repo expects is not here; expect to add overrides. |")
     out += ["", "## What the project cares about", ""]
-    lines = [md_text(delink(one_line(l, RULE_MAX_CHARS)), RULE_MAX_CHARS)
+    lines = [md_text(one_line(l, RULE_MAX_CHARS), RULE_MAX_CHARS)
              for l in str(summary or "").splitlines() if one_line(l)][:6]
-    out += [f"- {no_block(l)}" for l in lines] or ["(The learn session wrote no summary.)"]
+    out += [f"- {no_block(l)}" for l in lines] or ["(The sessions wrote no summary.)"]
     if you:
         out += ["", "## Steps for you", "", "Things only you can do, by hand. Sessions never see these.", ""]
-        out += [f"- {md_text(r['text'], RULE_MAX_CHARS)} ({source_link(repo, base, r['sources'][0])})"
+        out += [f"- {no_block(md_text(r['text'], RULE_MAX_CHARS))} ({source_link(repo, base, r['sources'][0])})"
                 for r in rule_order(you)]
-    out += ["", "## Required rules", "", "A PR that breaks one of these is likely sent back. Sources for each "
-            "are in PROFILE-RULES.md.", ""]
+    out += ["", "## Required rules", "", "A PR that breaks one of these is likely sent back. Each says why it "
+            "is required; sources are in PROFILE-RULES.md.", ""]
     last = None
     for r in rule_order(req):
         if r["section"] != last:
             last = r["section"]
             out.append(f"**{dict(PROFILE_SECTIONS)[last]}**")
-        out.append(f"- {md_text(r['text'], RULE_MAX_CHARS)}")
+        out.append(f"- {no_block(md_text(r['text'], RULE_MAX_CHARS))} Why: {md_text(r['why'], WHY_MAX_CHARS)}")
     if not req:
         out.append("(none)")
     out += ["", "## Practices", "", f"{len(prac)} practices: what merged PRs here usually do. They are listed "
-            "with their sources in PROFILE-RULES.md."]
-    if notes or dropped:
-        out += ["", "## Check these", ""]
-        out += review_notes(notes, CHECK_SHOWN)
-        if dropped:
-            out += ["", "Dropped by the screen (secrets, posting or filing, local details); add one to the "
-                    "overrides yourself if it matters:", ""] + review_notes(dropped, 5)
+            "with their reasons and sources in PROFILE-RULES.md."]
+    if changes:
+        out += ["", "## What the review changed", ""] + plain_list(list(changes), CHANGES_SHOWN)
+    if notes:
+        out += ["", "## Left out", ""] + review_notes(notes, CHECK_SHOWN)
     return "\n".join(out) + "\n"
 
 
-def render_rules(repo, rules, notes, dropped, meta):
-    """PROFILE-RULES.md: every learned rule with its sources, and every note, for checking."""
+def render_rules(repo, rules, notes, meta, changes=()):
+    """PROFILE-RULES.md: every learned rule with its reason and sources, and every note."""
     pid = profile_id(rules)
     base = str(meta.get("base", ""))
     out = [f"# Every rule learned for {md_text(repo, 100)}, with its sources", "",
@@ -783,15 +649,14 @@ def render_rules(repo, rules, notes, dropped, meta):
             last = r["section"]
             out += ["", f"## {dict(PROFILE_SECTIONS)[last]}", ""]
         out.append(f"- **{r['strength']}** `{md_text(r['id'], 40)}`: {md_text(r['text'], RULE_MAX_CHARS)}")
+        out.append(f"  - Why: {md_text(r['why'], WHY_MAX_CHARS)}")
         for s in r["sources"]:
-            q = f": \"{md_text(delink(s['quote']), QUOTE_MAX_CHARS)}\"" if s.get("quote") else ""
+            q = f": \"{md_text(s['quote'], QUOTE_MAX_CHARS)}\"" if s.get("quote") else ""
             out.append(f"  - {source_link(repo, base, s)}{q}")
+    if changes:
+        out += ["", "## What the review changed", ""] + plain_list(list(changes), REVIEW_MAX_LINES)
     if notes:
-        out += ["", "## Left out or changed", ""] + review_notes(notes, NOTES_SHOWN)
-    if dropped:
-        out += ["", "## Dropped by the screen", "",
-                "The screen takes rules about secrets, posting or filing anything, and local details. "
-                "If one of these matters, add it to the overrides yourself.", ""] + review_notes(dropped, NOTES_SHOWN)
+        out += ["", "## Left out", ""] + review_notes(notes, NOTES_SHOWN)
     return "\n".join(out) + "\n"
 
 
@@ -1837,7 +1702,7 @@ class Driver:
             path = rest.split("\t", 1)[-1]
             if mode == "160000":
                 return f"a nested repository is tracked at {path}"
-            if re.match(r"(candidates/[^/]+|runs/[^/]+/(?:scout|learn))/session/", path):
+            if re.match(r"(candidates/[^/]+|runs/[^/]+/(?:scout|learn))/session/|runs/[^/]+/learn/review/", path):
                 return f"a session-written file is still tracked: {path}"
         return None
 
@@ -2166,7 +2031,8 @@ class Driver:
             idx += ["", "## Where merged PRs put their tests", ""] + [f"- {one_line(d, 200)}: {k} merged PRs" for d, k in tdirs]
         if cited:
             idx += ["", f"## Files a current rule cites ({len(cited)})", "",
-                    "Not guide files. Each is under guides/; a quote from one can back a practice only.", ""]
+                    "Files a current rule quotes that are no longer guide files. Each is under guides/ and can be "
+                    "quoted like a guide.", ""]
             idx += [f"- guides/{one_line(q, 200)}" for q in cited]
         idx += ["", f"## Merged PRs by outside contributors ({len(merged)})", "",
                 ", ".join(map(str, merged)) or "(none)", "", f"## Closed without merging ({len(closed)})", "",
@@ -2184,8 +2050,9 @@ class Driver:
                      + "\n".join(body or ["- no rule changed"]) + "\n")
 
     def learn(self):
-        """--learn: fetch the bundle, let one session write rules.json, keep the rules whose
-        sources check out, and write the profile and its review. Approves nothing."""
+        """--learn: fetch the bundle; one session drafts rules.json, a second re-reads the bundle and
+        corrects it. The driver checks only that each source is real, keeps the rules with one
+        that is, and writes the profile and its review. Approves nothing."""
         home = self.run_dir / "learn"
         sdir, bdir = home / "session", home / "bundle"
         self.learn_written = []   # what a failure part way through has left, for its message
@@ -2220,39 +2087,46 @@ class Driver:
         n_merged = sum(1 for x in prs.values() if x["state"] == "merged")
         self.log(f"learn: base {base[:12]}, {len(guides)} guide files, {n_merged} merged and "
                  f"{len(prs) - n_merged} closed PRs by outside contributors")
-        prompt = (f"{'Refresh' if prev else 'Learn'} the contribution rules of {self.repo}. Your bundle is "
-                  f"in {bdir}; start with {bdir}/index.md. Write {sdir}/rules.json, then {sdir}/next.json.")
-        system = "\n\n---\n\n".join((SKILL / f).read_text()
-                                     for f in ("rules/common.md", "rules/profile.md", "stages/learn.md"))
-        try:
-            res = self.session("learn", home, prompt, system, self.args.learn_model, [sdir], None, home, learn=True)
-        finally:
-            self.archive_transcripts(home)
-            shutil.rmtree(self.session_tmp(home, make=False), ignore_errors=True)
-        if res.get("is_error") or res.get("_rc"):
-            raise RuntimeError(f"the learn session ended with an error: {one_line(res.get('result'), 200)}")
-        raw = read_session_json(sdir / "rules.json")
-        if raw is None:
+        bundle = {"guides": guides, "prs": prs}
+        vdir = home / "review"
+        vdir.mkdir(exist_ok=True)
+        res = self.learn_session("learn", home, f"{'Refresh' if prev else 'Learn'} the contribution rules of "
+                                 f"{self.repo}. Your bundle is in {bdir}; start with {bdir}/index.md. Write "
+                                 f"{sdir}/rules.json, then {sdir}/next.json.", "stages/learn.md", sdir)
+        draft = read_session_json(sdir / "rules.json")
+        if draft is None:
             raise RuntimeError("the learn session wrote no readable rules.json")
-        kept, rnotes, dropped = check_rules(raw, {"guides": guides, "prs": prs})
+        dkept, dnotes = check_rules(draft, bundle)
+        (vdir / "draft-check.md").write_text(
+            f"# The driver's check of the draft\n\n{len(dkept)} rules had a source that checked out. These "
+            "rules or sources did not:\n\n" + ("\n".join(f"- {i}: {one_line(w, 300)}" for i, w in dnotes)
+                                              or "(none)") + "\n")
+        self.log(f"learn: draft has {len(dkept)} rules that check out, {len(dnotes)} notes; review starts")
+        rres = self.learn_session("review", home, f"Review the draft contribution rules of {self.repo}. The bundle "
+                                  f"is in {bdir}; start with {bdir}/index.md. The draft is {sdir}/rules.json, and the "
+                                  f"driver's check of its sources is {vdir}/draft-check.md. Write {vdir}/rules.json, "
+                                  f"then {vdir}/next.json.", "stages/learn-review.md", vdir)
+        raw = read_session_json(vdir / "rules.json")
+        if raw is None:
+            raise RuntimeError("the review session wrote no readable rules.json")
+        kept, rnotes = check_rules(raw, bundle)
         summary = raw.get("summary") if isinstance(raw.get("summary"), str) else ""
+        changes = review_lines(raw)
         meta = {"base": base, "guides": len(guides), "often": n_often, "merged": n_merged,
                 "cited": sum(1 for g in guides.values() if "cited" in g and "often" not in g),
                 "closed": len(prs) - n_merged}
-        review = render_review(self.repo, kept, rnotes, dropped, summary, meta)
-        cost = res.get("total_cost_usd")
-        used = (f"| **Learn session** | {res.get('num_turns', '?')} turns, "
-                f"{round((res.get('duration_ms') or 0) / 60000, 1)} min"
-                + (f", about ${cost:.2f} API-equivalent" if isinstance(cost, (int, float)) else "") + " |")
+        review = render_review(self.repo, kept, rnotes, summary, meta, changes)
+        used = f"| **Sessions** | learn: {cost_text(res)}; review: {cost_text(rres)} (API-equivalent) |"
         review = review.replace("\n\n## What the project cares about", f"\n{used}\n\n## What the project cares about", 1)
         if not kept:
-            (home / "PROFILE-RULES.md").write_text(render_rules(self.repo, kept, rnotes, dropped, meta))
+            (home / "PROFILE-RULES.md").write_text(render_rules(self.repo, kept, rnotes, meta, changes))
             (home / "PROFILE-REVIEW.md").write_text(review)
-            raise RuntimeError(f"no rule's sources checked out; what was refused, and why, is in {home / 'PROFILE-RULES.md'}")
+            raise RuntimeError(f"no rule's sources checked out; what was left out, and why, is in {home / 'PROFILE-RULES.md'}")
         pid = profile_id(kept)
         learned_at = datetime.date.today().isoformat()
         prof = {"repo": self.repo, "id": pid, "base": base, "learned_at": learned_at, "run": self.run_id,
-                "summary": summary[:2000], "rules": kept, "notes": rnotes, "dropped": dropped, "meta": meta}
+                "summary": summary[:2000], "rules": kept, "notes": rnotes, "changes": changes,
+                "draft": {"kept": len(dkept), "notes": len(dnotes)}, "meta": meta}
         same = appr is not None and appr["id"] == pid
         if same:
             review = "\n".join(f"**Approved** (the same rules as the id you approved). Rules id `{pid}`. To correct "
@@ -2267,7 +2141,7 @@ class Driver:
             # profile.md is the approved rules as runs see them; unapproved rules never get that heading.
             (rdir / "profile.md").write_text(render_profile(self.repo, kept, base, learned_at))
         self.learn_written.append("PROFILE-RULES.md")
-        (rdir / "PROFILE-RULES.md").write_text(render_rules(self.repo, kept, rnotes, dropped, meta))
+        (rdir / "PROFILE-RULES.md").write_text(render_rules(self.repo, kept, rnotes, meta, changes))
         self.learn_written.append("PROFILE-REVIEW.md")
         (rdir / "PROFILE-REVIEW.md").write_text(review)
         self.learn_written.append("CHANGES.md")
@@ -2276,9 +2150,21 @@ class Driver:
                                 + (f"; until then runs keep using {appr['id']}" if appr else "")]
         self.changes_entry(rdir, f"learned {pid}" + ("" if same else ", not approved"), rule_changes(prev, kept), hint)
         self.ledger_commit(f"learn {self.repo} rules {pid}")
-        self.log(f"learn: {len(kept)} rules kept, {len(rnotes)} notes, {len(dropped)} dropped; rules id {pid}; "
+        self.log(f"learn: {len(kept)} rules kept, {len(rnotes)} notes, {len(changes)} review changes; rules id {pid}; "
                  f"read {rdir / 'PROFILE-REVIEW.md'}" + ("" if same else ", then approve it"))
         return EXIT_DONE
+
+    def learn_session(self, stage, home, prompt, stage_file, wdir):
+        """One learn-side session (learn, then review): reads only its learn folder, writes only wdir."""
+        system = "\n\n---\n\n".join((SKILL / f).read_text() for f in ("rules/common.md", "rules/profile.md", stage_file))
+        try:
+            res = self.session(stage, home, prompt, system, self.args.learn_model, [wdir], None, home, learn=True)
+        finally:
+            self.archive_transcripts(home)
+            shutil.rmtree(self.session_tmp(home, make=False), ignore_errors=True)
+        if res.get("is_error") or res.get("_rc"):
+            raise RuntimeError(f"the {stage} session ended with an error: {one_line(res.get('result'), 200)}")
+        return res
 
     def learn_failure(self, e):
         """The log line for a learn that failed: what it left behind, if anything."""

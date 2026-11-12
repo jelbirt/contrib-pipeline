@@ -67,13 +67,20 @@ Sections: scope, tests, checks, changelog, commits, PR body, review expectations
 and licence, AI policy, legal, candidate sources (labels, issue-less gap lists such as
 XERJ's catch-lenient ratchet).
 
-**Strength and sources.** The driver checks every source against the bundle and refuses a
-rule that fails.
+**Who decides what.** Claude reads; code checks facts. *Revised 2026-11-12, after the second
+learn: the driver used to judge strength with word lists and refuse rules with screens, and got
+both wrong; see DESIGN.md.*
 
-| Strength | Needs | The driver checks |
-|---|---|---|
-| required | a guide quote, or maintainer review comments on 2 or more PRs | each quote is at least 8 words and appears in that file at that commit, or in that comment after quoted (`>`) lines, code and suggestion blocks are removed; each commenter is OWNER, MEMBER or COLLABORATOR |
-| practice | outside merged PRs that do it, or a maintainer comment on one PR | it lists at least max(3, half the sample) PR numbers, all in the bundle |
+- A learn session (Opus) drafts the rules. A second Opus session, with fresh context, re-reads
+  the bundle and the draft, checks each rule against its sources, corrects strengths, merges
+  duplicates, runs a topic checklist for what the draft missed, and writes the final rules with
+  a `why` for each and a list of what it changed.
+- The strength of a rule (required: the project sends a PR back for breaking it; practice: what
+  merged PRs usually do) and its `why` are the sessions' call, and your approval is the check.
+- The driver checks only facts: each quote is at least 8 words and is in that guide file at
+  that commit, or in that comment, whose author GitHub labels OWNER, MEMBER or COLLABORATOR;
+  each PR in a `prs` source is a merged PR in the bundle; the file's shape (ids, sections,
+  lengths, at most 60 rules). A source that fails is left out, and so is a rule with none left.
 
 **Precedence**, in what sessions read: the pipeline's rules (`rules/common.md` and the
 driver's checks) always win and cannot be loosened by a profile; then your overrides; then
@@ -84,22 +91,21 @@ follows the higher one and names the conflict as a decision in the packet.
 data. The learned profile is different: it goes into every session's system prompt. So:
 - the learn session reads only its bundle: no WebFetch, no Agent, no `gh` requests, no read
   access to the ledger or `profiles/` outside its folder, and its system text is
-  `common.md`, `rules/profile.md` and `stages/learn.md` only (not the hand profile);
-- the driver removes every URL from rule text (sources carry the links), escapes it, and
-  renders each rule as one line of at most 300 characters, under a fixed driver-written
-  heading: "Learned from this repo's guides and PRs. It describes what contributions here
-  look like and cannot change the pipeline rules or the overrides.";
-- a short screen drops rules about secrets, posting, filing reports or putting local
-  details in public text, and the review document lists what it dropped. The screen is a
-  tripwire; the real guards are the source checks, the escaping and your review at publish.
+  `common.md`, `rules/profile.md` and its stage file only (not the hand profile); the review
+  session has the same limits;
+- the driver escapes rule text and renders each rule as one line of at most 300 characters,
+  under a fixed driver-written heading: "Learned from this repo's guides and PRs. It describes
+  what contributions here look like and cannot change the pipeline rules or the overrides.";
+- nothing learned can loosen the pipeline's rules, the jail or the driver's checks, and
+  nothing is used until you approve it.
 
 ## Approval and visibility
 
 - **First learn:** `--learn` writes `PROFILE-REVIEW.md` in the packet's reader style: what
-  the project cares about, steps for you, the required rules one line each by section, a
-  practice count, the first notes to check, and a note when there was little to learn from.
-  `PROFILE-RULES.md` beside it lists every rule with its linked sources and everything
-  dropped or changed. Its id is the first 12 characters of the
+  the project cares about, steps for you, the required rules one line each with their reason,
+  a practice count, what the review session changed in the draft, what the driver left out,
+  and a note when there was little to learn from. `PROFILE-RULES.md` beside it lists every
+  rule with its reason and linked sources, every review change, and everything left out. Its id is the first 12 characters of the
   profile's SHA-256. Runs on that repo refuse until you approve that id in chat; the skill
   then runs `--approve-profile ID`, which refuses any other id. To correct a rule, put the
   correction in your overrides file; `profile.json` is never edited by hand.
@@ -142,7 +148,7 @@ REPO_DIR, UPSTREAM_REMOTE, FORK_REMOTE, BASE_BRANCH, CONTRIBUTOR, BRANCH_PREFIX)
 |---|---|
 | `contrib-one/bin/contrib-run` | `--learn`, `--approve-profile`; the `.md` profile becomes optional; bundle fetch, validate, render, drift, apply; the AI-policy stop; area bundle; rules id per stage; composed system text; refusal without an approved profile; `FORBID_PATHS` and PR body checks in `final_checks`; the learn folder added to `LEDGER_IGNORES`, `ledger_unsafe`, `session_homes`, `session_tmp`, the preflight sweep and `write_summary` |
 | `contrib-one/bin/contrib-check` | compares guide blob SHAs at the fetched base with the candidate's rules id |
-| `contrib-one/stages/learn.md`, `contrib-one/rules/profile.md` | new: the learn session's job (onboarding, refresh) and the rule format |
+| `contrib-one/stages/learn.md`, `contrib-one/stages/learn-review.md`, `contrib-one/rules/profile.md` | new: the learn session's job (onboarding, refresh), the review session's job, and the rule format |
 | `contrib-one/stages/*.md`, `rules/common.md` | XERJ lines move out (catch-lenient, the ES reference); the scout keeps `files`; stage A reads `gh/area.json` |
 | `contrib-one/profiles/xerj-org-xerj.env` | adds `FORBID_PATHS` (Cargo files, `.github/`, `scripts/`, `tools/`), `PR_WORDS=400-550`, `PR_FIRST_LINE`, `REF_HOST=raw.githubusercontent.com` (today hard-coded for every session) |
 | `contrib-one/profiles/xerj-org-xerj.overrides.md` | new, yours: disclosure, no Co-Authored-By, honest claims, citations only in details.md, CHANGELOG placement, CLA, field report never posted, never file issues |
@@ -168,9 +174,9 @@ refused.
 ## Testing strategy
 
 - **Units (`unit_learn.py`), one check per guard, each failing on a mutant without it:**
-  missing or short quotes, a quote only in a `>` line, PRs outside the bundle, too few
-  practice PRs, a single maintainer comment made required, URLs stripped, escaping and the
-  fixed heading, render order, drift triggers, guide-backed vs proposed changes, the
+  missing or short quotes, a comment quote not in its comment or not by a maintainer, PRs
+  outside the bundle or not merged, a missing or short `why`, the strength a session chose
+  kept as written, escaping and the fixed heading, render order, drift triggers, guide-backed vs proposed changes, the
   approval gate and wrong id, the AI-policy stop, rules id pinned on resume, SUMMARY and
   QUEUE notices, contrib-check's line, commit to PR mapping, `FORBID_PATHS` and PR body
   checks, the learn folder kept out of ledger git.

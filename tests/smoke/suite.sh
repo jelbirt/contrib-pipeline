@@ -48,10 +48,16 @@ sed 's#^REPO=.*#REPO=stub-org/stub#' "$PROFILE" > "$CONTRIB_PROFILE_DIR/stub-org
 lrun() { python3 $R --repo stub-org/stub --hours 8 --tick 2 --stub --claude $STUB "$@" >/dev/null 2>&1; rc=$?; }
 RD=$CONTRIB_LEDGER/repos/stub-org-stub
 STUB_PREFIX=smkl lrun --limit 1; want "refused without a profile" $rc 2
+STUB_REVIEW_FAIL=1 lrun --learn; want "a learn whose review fails" $rc 1
+want "a failed review writes no profile" "$([ -e "$RD/profile.json" ] && echo yes || echo no)" no
+want "a failed review says why" "$(cat $CONTRIB_LEDGER/runs/*.log | grep -c 'nothing was written: RuntimeError: the review session wrote no readable rules.json')" 1
 lrun --learn; want "learn rc" $rc 0
 pid=$(python3 -c "import json;print(json.load(open('$RD/profile.json'))['id'])" 2>/dev/null)
 want "nothing approved by a learn" "$([ -e "$RD/approved.json" ] && echo yes || echo no)" no
 want "review written" "$(grep -c 'Learned, not yet approved' "$RD/PROFILE-REVIEW.md")" 1
+want "a second session reviewed the draft and the driver's check" "$(grep '"stage": "learn-review"' $STUB_LOG | tail -1 | python3 -c "import sys,json;j=json.loads(sys.stdin.read());print(j['draft'], j['notes'])")" "True True"
+want "the review's changes are shown" "$(grep -c '^## What the review changed' "$RD/PROFILE-REVIEW.md")" 1
+want "the reviewed rules are used, not the draft" "$(python3 -c "import json,sys;p=json.load(open(sys.argv[1]));r=p['rules'];print(r[0]['strength'], len(p['changes']), all(x['why'] for x in r))" "$RD/profile.json")" "practice 1 True"
 want "learn session tools" "$(grep '"stage": "learn"' $STUB_LOG | tail -1 | python3 -c "import sys,json;j=json.loads(sys.stdin.read());print(','.join(j['tools']), j['builtin'])")" "Read,Glob,Grep,Edit Read,Glob,Grep,Edit,Write"
 STUB_PREFIX=smkl lrun --limit 1; want "refused before approval" $rc 2
 lrun --approve-profile 000000000000; want "wrong id refused" $rc 2

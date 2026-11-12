@@ -791,3 +791,57 @@ rendering, the short review and the full list, often files, test folders, `fetch
 skips, the bundle index, and one check per review fix above). Mutants that drop the obligation check, the `for-you` screen exception, the
 `for-you` filter in the profile, the often-file floor, or the cap each fail their own checks, and so do 9 mutants that undo one
 review fix each.
+
+### Claude reads, code checks facts (2026-11-12, after the second learn)
+
+The second learn showed the driver's own judging was the problem, not the learn. Measured on
+the four real learns: Opus wrote 74, 60, 37 and 37 rules, and the driver refused only one of
+them for a bad source, never for a made-up quote. What changed the results was the driver
+re-judging them: a word list decided which rules were required, and it got that wrong both
+ways (it made fail-first-test, cargo-fmt, clippy-clean and pydantic's assignment rule
+practices, and let pydantic's quality-bar and body-permalinks stay required on "does not" and
+"need to"). Regex screens for hosts, local paths and posting, HTML and block stripping for
+comments, and a practice floor added about a thousand lines that did nothing a model reading
+the text could not do better. Your user called it out, rightly: reading rules is Claude's job.
+
+What changed:
+- **Removed from the driver:** the obligation word lists and the required downgrade, the
+  rule-text screens (hosts, links, local paths, secrets, posting), comment block stripping,
+  link hiding, and the practice floor. The driver no longer decides strength or refuses a
+  rule for what it says.
+- **Kept, because they are facts code checks well:** a quote is at least 8 words and is really
+  in the guide file or comment it names (whitespace, case and markup aside, whole words); the
+  comment's author is labelled OWNER, MEMBER or COLLABORATOR by GitHub; a `prs` source lists
+  merged PRs in the bundle; the file's shape (ids, sections, lengths, 60 rules); escaping when
+  rendering. Fetching, the sandbox and approval are unchanged.
+- **Added: a review session.** A second Opus session (`stages/learn-review.md`), fresh context,
+  same sandbox and bundle, reads the draft and the driver's check of its sources
+  (`review/draft-check.md`), re-reads the bundle itself, confirms each rule against its
+  sources, corrects strengths, merges duplicates, runs a topic checklist for what drafts miss
+  (test locations, ratchet and skip files, sibling code paths, CLA), and writes the final
+  `review/rules.json`, a `why` for every rule, and a `review` list of what it changed. Your
+  user approves that file; the draft is never used.
+- **The review document** shows each required rule with its reason, what the review changed
+  (8 lines, all of them in PROFILE-RULES.md), and what the driver left out.
+
+Why Opus for both: the reviewer has to re-read the bundle to find what the draft missed, so a
+cheaper first reader saves little and caps recall; a weaker reviewer of a stronger draft tends
+to approve what it is given. Cost is about twice one learn, once per repo.
+
+Tests: unit_learn.py was rebuilt around the fact checks: quotes in guides and comments, the
+maintainer label, merged PRs, the reason field, the review list, the renderers and the id.
+Mutants that drop the maintainer check, accept a closed PR as merged, drop the reason check,
+skip the comment quote check or the 8-word minimum on comments each fail their own check. The
+stub suite's learn case now runs both sessions and checks the review saw the draft and its
+check, the review document lists the review's changes, and every kept rule has a reason.
+
+Review of this change (fixed): the bundle index still told the sessions that a quote from a
+cited file backs a practice only, a leftover of the removed rule; it now says cited files are
+quoted like guides, and a unit check keeps strength out of that text. The suite's strength
+check could not tell the draft from the review; it now checks that the review's change (the
+stub makes the first rule a practice) is what profile.json holds, and a new stub knob,
+`STUB_REVIEW_FAIL`, checks that a learn whose review writes nothing exits 1, writes no
+profile, and says why. Rule text, steps for you and the review's change lines are escaped
+with `no_block` in PROFILE-REVIEW.md, as summary lines already were. The prompts now say what
+draft-check.md lists, that more than 120 rules refuses the file, and that review lines are cut
+to 300 characters and 60 lines.
