@@ -31,7 +31,11 @@ work around a denial, and do not report one as a problem with the candidate.
 - No attribution of any kind: no `Co-Authored-By`, no "Generated with Claude Code", no Claude
   links, in commits or PR text.
 - Every number you quote must come from a command whose output is in `results/` or
-  `session/evidence/`. Say what was verified and what was assumed.
+  `session/evidence/`. Say what was verified and what was assumed. Say what a count counts,
+  as its source does: "26 tests" is not "26 examples" if some of the tests are something else.
+- A test reported as skipped did not pass (some runners report expected failures as skipped
+  too), so it never counts as passing. When a run's note says every test was reported skipped,
+  no test passed in it: never cite it as a pass, and say why the tests were skipped.
 - Commit messages follow the repo's style (read `git log` on the base) with a full body:
   motivation, root cause, fix, evidence, file pointers.
 

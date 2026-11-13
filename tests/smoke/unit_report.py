@@ -112,6 +112,7 @@ check("the detailed tables follow under Details", "### Sessions" in sm.split("##
       and "### Driver requests" in sm.split("## Details")[1])
 check("details.md is recorded with the packet", "details.md" in m.RECORD_TOP)
 d.prof_md = "profile"
+d.prof = {}          # a real run always has its profile loaded
 check("stages A and C get the spec and the example, B only the spec",
       all("## Example" in d.system_text(f) and "Ready to publish." in d.system_text(f)
           for f in ("A-investigate.md", "C-finish.md"))

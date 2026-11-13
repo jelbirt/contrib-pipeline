@@ -404,6 +404,59 @@ def c_tmp_guard(m):
         m.WORK = saved
 
 
+# ----- after the pydantic run: skipped runs, final checks, the limit, blocked commands -----------
+def c_all_skipped_note(m):
+    every = m.counts_note(dict(C, tests=26, skipped=26))
+    some = m.counts_note(dict(C, tests=26, skipped=25))
+    none = m.counts_note(dict(C, tests=0))
+    return "every test was reported skipped" in every and "every test was reported skipped" not in some + none
+
+
+def c_final_checks_cleared(m):
+    d = mk(m)
+    f = d.cand / "results" / "final-checks.txt"
+    d.record_final_checks(["uncommitted changes left in the clone"])
+    first = f.read_text() == "uncommitted changes left in the clone\n"
+    d.record_final_checks([])
+    return first and not f.exists()
+
+
+def c_final_checks_call(m):
+    """The stage C call site: a pass after the fix-up turn, or a first-try pass on a resumed
+    candidate, removes the file a refused finish left."""
+    out = []
+    for first in (["uncommitted changes left in the clone"], []):
+        d = mk(m)
+        d.stop_kind, d.args = "", SimpleNamespace(model="m")
+        f = d.cand / "results" / "final-checks.txt"
+        f.write_text("an earlier refusal\n")
+        seq = iter([first, []])
+        d.safe_final_checks = lambda: next(seq)
+        d.stage_loop = lambda *a, **k: {"action": "stage-done"}
+        act, problems = d.c_final_checks({"action": "stage-done"}, "C-finish.md")
+        out.append(act.get("action") == "stage-done" and problems == [] and not f.exists())
+    return all(out)
+
+
+def c_answer_limit(m):
+    d = mk(m)
+    d.args = SimpleNamespace(limit=3)
+    d.answer_cand = None
+    plain = d.run_limit()
+    d.answer_cand = (d.cand, "C")
+    return plain == 3 and d.run_limit() == 1
+
+
+def c_deny_text(m):
+    d = mk(m, SESSION_DENY="uv python3")
+    d.prof_md = "# hand profile\n"
+    text = d.system_text("C-finish.md")
+    bare = mk(m)
+    bare.prof_md = "# hand profile\n"
+    return ("## Commands blocked for you here" in text and "`uv`, `python3`" in text
+            and "Commands blocked" not in bare.system_text("C-finish.md"))
+
+
 CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_list, c_render_unknown,
           c_judge_none, c_judge_other_rc, c_judge_fail_needs_failure, c_judge_pass_needs_tests,
           c_judge_report_missing, c_result_commands_pass, c_result_unknown_kind, c_dispatch, c_paths_dash,
@@ -411,7 +464,8 @@ CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_l
           c_session_deny, c_ref_host, c_sweep, c_init_refusal, c_cmd_no_net, c_env_readonly, c_setup_key,
           c_requests_text, c_paths_at, c_filter_at, c_without_list, c_without_list_cargo, c_driver_error,
           c_report_word, c_skipped_not_gone, c_gate_missing, c_renamed_tests, c_setup_touched, c_issue_forms,
-          c_issue_refused, c_tools_key, c_unready_cleanup, c_tmp_short, c_tmp_guard]
+          c_issue_refused, c_tools_key, c_unready_cleanup, c_tmp_short, c_tmp_guard,
+          c_all_skipped_note, c_final_checks_cleared, c_final_checks_call, c_answer_limit, c_deny_text]
 for fn in CHECKS:
     check(fn.__name__[2:], safe(fn, m))
 for name in ("pydantic-pydantic", "xerj-org-xerj"):
@@ -422,6 +476,9 @@ shared = "\n".join((m.SKILL / p).read_text() for p in ("rules/common.md", "stage
                    "stages/B-fix.md", "stages/C-finish.md", "stages/scout.md"))
 for word in ("xerj", "cargo", "clippy", "catch-lenient", "8.13.4", "engine/crates"):
     check(f"the shared prompts do not name {word}", word not in shared.lower())
+check("the shared rules say a skipped test never counts as passing", "never counts as passing" in shared)
+check("stage C's reviewer checks every number and claim", "every number and factual claim" in shared)
+check("the limit is read in one place only (run_limit)", SRC.count("self.args.limit") == 1)
 xmd = (m.SKILL / "profiles" / "xerj-org-xerj.md").read_text()
 for word in ("xerj hub feedback", "catch-lenient", "8.13.4", "engine/crates/", "node-start", "clippy", "CHANGELOG"):
     check(f"xerj's profile holds {word}", word in xmd)
@@ -463,7 +520,7 @@ MUTANTS = [
     (c_env_readonly, "rw=(self.clone(), *extra_rw), ro=(self.env_dir, *self.tool_dirs()),",
      "rw=(self.clone(), self.env_dir, *extra_rw), ro=(*self.tool_dirs(),),"),
     (c_setup_key, 'self.prof.get("TOOLS", ""), *ids]).encode()', 'self.prof.get("TOOLS", "")]).encode()'),
-    (c_requests_text, "*([self.requests_text()] if self.commands else []), packet,", "packet,"),
+    (c_requests_text, "*([self.requests_text()] if self.commands else []), *self.deny_text(),", "*self.deny_text(),"),
     (c_paths_at, 'p.startswith(("-", "@"))', 'p.startswith("-")'),
     (c_filter_at, 'filt.startswith(("-", "@"))', 'filt.startswith("-")'),
     (c_without_list, '        if not isinstance(without, list):\n            return 2, out, "refused: without',
@@ -488,6 +545,12 @@ MUTANTS = [
      'if False and d.name not in ("cache", "cargo") and d != self.env_dir and not'),
     (c_tmp_short, 'f"cand-{hashlib.sha256(home.name.encode()).hexdigest()[:12]}"', 'f"cand-{home.name}"'),
     (c_tmp_guard, "        if n + SOCK_NAME_ROOM > SOCK_PATH_MAX:", "        if False:"),
+    (c_all_skipped_note, 'if c["tests"] > 0 and c["skipped"] >= c["tests"]:', "if False:"),
+    (c_final_checks_cleared, "        else:\n            f.unlink(missing_ok=True)", "        else:\n            pass"),
+    (c_final_checks_call, '        if act.get("action") == "stage-done":\n            self.record_final_checks(problems)\n        return act, problems',
+     "        return act, problems"),
+    (c_answer_limit, 'return 1 if getattr(self, "answer_cand", None) else self.args.limit', "return self.args.limit"),
+    (c_deny_text, "*self.deny_text(), packet,", "packet,"),
 ]
 for fn, old, new in MUTANTS:
     n = SRC.count(old)

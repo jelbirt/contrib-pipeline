@@ -1050,6 +1050,16 @@ def issue_number(x):
     return int(m.group(1)) if m and int(m.group(1)) > 0 else -1
 
 
+def counts_note(c):
+    """A test run's counts for its index note. When the report calls every test skipped, no test passed
+    (a runner may report expected failures as skipped too), so the note says that in words: a session
+    must not read the run as a pass, whatever it expected."""
+    note = f"{c['tests']} tests, {c['failures']} failed, {c['errors']} errors, {c['skipped']} skipped"
+    if c["tests"] > 0 and c["skipped"] >= c["tests"]:
+        note += "; every test was reported skipped, so no test passed in this run"
+    return note
+
+
 def judge_test(rc, counts, expect, prof, report=True):
     """Whether a commands-mode test run met its expectation, and why not. Facts only: the exit code
     against the profile's codes, then the report's counts when the command writes one
@@ -1694,9 +1704,13 @@ class Driver:
                 f.write(lock_id + "\n")
         return rc
 
+    def run_limit(self):
+        """How many candidates this run works: answering a candidate runs only that one."""
+        return 1 if getattr(self, "answer_cand", None) else self.args.limit
+
     # ----- preflight -----------------------------------------------------------------
     def preflight(self):
-        self.log(f"run {self.run_id}: repo {self.repo}, limit {self.args.limit}, "
+        self.log(f"run {self.run_id}: repo {self.repo}, limit {self.run_limit()}, "
                  f"deadline {datetime.datetime.fromtimestamp(self.deadline).isoformat(timespec='minutes')}")
         self.log(f"profile: {self.rules_from}")
         self.recover_stale()
@@ -2615,12 +2629,47 @@ class Driver:
             self.log(f"session {stage}: turn ends")
         return res
 
+    def deny_text(self):
+        """The profile's SESSION_DENY commands, named in the prompt so a session does not reach for one
+        (for instance an interpreter, to read a JSON file) and lose a turn to the denial."""
+        words = self.prof.get("SESSION_DENY", "").split()
+        if not words:
+            return []
+        return ["## Commands blocked for you here\n\n"
+                + ", ".join(f"`{w}`" for w in words)
+                + " are blocked in your shell for this repo, with any arguments: the driver runs the repo's "
+                "own tools for you (see \"Asking the driver\"). To read or search a file, JSON included, use "
+                "the Read and Grep tools, not a script."]
+
+    def c_final_checks(self, act, f):
+        """After stage C says it is done: the driver's final checks, one fix-up turn if they fail, and
+        results/final-checks.txt brought up to date. Returns the last action and the problems left."""
+        problems = self.safe_final_checks()
+        if problems and not self.stop_kind:
+            self.record_final_checks(problems)
+            act = self.stage_loop("C", f, self.args.model,
+                                  f" The driver's final checks found problems, listed in "
+                                  f"{self.cand}/results/final-checks.txt. Fix every one, then finish again.")
+            problems = self.safe_final_checks() if act.get("action") == "stage-done" else problems
+        if act.get("action") == "stage-done":
+            self.record_final_checks(problems)
+        return act, problems
+
+    def record_final_checks(self, problems):
+        """results/final-checks.txt lists the problems of the latest final checks, and is removed once
+        they pass, so a finished candidate never keeps a refusal that no longer holds."""
+        f = self.cand / "results" / "final-checks.txt"
+        if problems:
+            f.write_text("\n".join(problems) + "\n")
+        else:
+            f.unlink(missing_ok=True)
+
     def system_text(self, stage_file):
         packet = (SKILL / "rules" / "packet.md").read_text()
         if stage_file[:1] in ("A", "C"):
             packet += "\n" + (SKILL / "examples" / "packet.md").read_text()
         parts = [(SKILL / "rules" / "common.md").read_text(), self.prof_md,
-                 *([self.requests_text()] if self.commands else []), packet,
+                 *([self.requests_text()] if self.commands else []), *self.deny_text(), packet,
                  (SKILL / "stages" / stage_file).read_text()]
         return "\n\n---\n\n".join(parts)
 
@@ -3099,9 +3148,7 @@ class Driver:
             shutil.rmtree(tmp, ignore_errors=True)
         note = "reverted to base for this run: " + ", ".join(rels) if rels else ""
         if self.last_counts:
-            c = self.last_counts
-            note = (note + "; " if note else "") + (f"{c['tests']} tests, {c['failures']} failed, "
-                                                    f"{c['errors']} errors, {c['skipped']} skipped")
+            note = (note + "; " if note else "") + counts_note(self.last_counts)
         return rc, out, note
 
     def req_check(self, rid, req):
@@ -3878,13 +3925,7 @@ class Driver:
             if pend:
                 self.state(answer_pending=None, question=None, asked_by=None, context=None)
             if stage == "C" and act.get("action") == "stage-done":
-                problems = self.safe_final_checks()
-                if problems and not self.stop_kind:
-                    (self.cand / "results" / "final-checks.txt").write_text("\n".join(problems) + "\n")
-                    act = self.stage_loop("C", f, self.args.model,
-                                          f" The driver's final checks found problems, listed in "
-                                          f"{self.cand}/results/final-checks.txt. Fix every one, then finish again.")
-                    problems = self.safe_final_checks() if act.get("action") == "stage-done" else problems
+                act, problems = self.c_final_checks(act, f)
                 if act.get("action") == "stage-done" and problems and self.stop_kind:
                     raise StopRun()          # stopped before the fix-up turn; resume reruns C
                 if act.get("action") == "stage-done" and problems:
@@ -4328,10 +4369,9 @@ class Driver:
             queue = []
             if self.answer_cand:
                 queue = [("resume", str(self.answer_cand[0]))]
-                self.args.limit = 1          # answering runs only that candidate
             elif self.args.resume:
                 queue = [("resume", s["_dir"]) for s in self.all_states() if s.get("status") == "stopped"]
-            while len(self.done) < self.args.limit:
+            while len(self.done) < self.run_limit():
                 self.check_stop(between=True)
                 mine, ready = self.open_count()
                 if not self.answer_cand and mine + ready >= int(self.prof.get("MAX_OPEN", 10)):
@@ -4361,7 +4401,7 @@ class Driver:
                                 question=f"the driver hit an error on this candidate: "
                                 f"{type(e).__name__}: {one_line(e, 200)}")
             if not self.stop_kind:
-                self.stop_kind, self.stop_reason = "done", f"candidate limit reached ({self.args.limit})"
+                self.stop_kind, self.stop_reason = "done", f"candidate limit reached ({self.run_limit()})"
         except StopRun:
             pass
         except Exception as e:
