@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """contrib-check <slug>: has anything changed since this packet was made? No builds.
+contrib-check --where <slug>: the candidate's repo, folders and branch, as shell assignments.
+
+Every repo fact comes from the repo's profile: SENSITIVE_PATHS, AREAS, DOC_FILES, RATCHET_FILE
+and SETUP_KEY (see SPEC.md, phase 3).
 
 Prints facts, then one verdict line, worst first:
   merged-or-closed  upstream fixed it or the issue closed
   overlap           another PR or person has the same fix
   needs-look        something this script could not decide; read the printed lines
   rebase-code       conflicts in code: rebase, then the full bar on the final SHA
-  rebase-docs       conflicts only in CHANGELOG or the ratchet: rebase, then the PR's tests
-  retest-merge      merges cleanly, but the base changed this branch's crates: run the PR's
-                    tests on a trial merge before opening
+  rebase-docs       conflicts only in the profile's DOC_FILES: rebase, then the PR's tests
+  retest-merge      merges cleanly, but the base changed this branch's areas (AREAS) or the
+                    dependency setup (SETUP_KEY): run the PR's tests on a trial merge first
   unchanged         open it as it is
 Exit 0 for unchanged, 1 for anything that needs work or a decision, 2 if the check failed.
 """
-import datetime, json, os, re, subprocess, sys
+import datetime, json, os, re, shlex, subprocess, sys
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent
 LEDGER = Path(os.environ.get("CONTRIB_LEDGER", Path.home() / "contrib-queue"))
-DOC_FILES = {"CHANGELOG.md", "engine/tests/es-compat-yaml/catch-lenient.txt"}
-
-
-SENSITIVE = [r"(^|/)build\.rs$", r"(^|/)Cargo\.(toml|lock)$", r"(^|/)\.cargo/", r"(^|/)rust-toolchain",
-             r"^\.github/", r"(^|/)\.git(attributes|modules)$", r"\.(sh|ps1|bash)$", r"^scripts/", r"^tools/"]
+NEEDED = ("REPO_DIR", "UPSTREAM_REMOTE", "BASE_BRANCH", "SENSITIVE_PATHS", "AREAS")
 
 
 def after(t, since):
@@ -36,9 +36,13 @@ def after(t, since):
     return a is not None and (b is None or a > b)
 
 
+WHERE_MODE = False   # --where: the caller evals stdout, so a failure prints to stderr only
+
+
 def fail(msg):
-    print(f"CHECK FAILED: {msg}")
-    print("VERDICT needs-look")
+    out = sys.stderr if WHERE_MODE else sys.stdout
+    print(f"CHECK FAILED: {msg}", file=out)
+    print("VERDICT needs-look", file=out)
     sys.exit(2)
 
 
@@ -63,16 +67,68 @@ CLAIM_WORDS = ("i'll take", "i will take", "working on", "i'm on it", "im on it"
                "pr incoming", "draft pr")
 
 
-def main():
-    slug = sys.argv[1]
+def load(slug):
+    """A candidate's folder, state.json and repo profile, with the keys this script needs checked."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug or ""):
+        fail(f"bad slug {slug!r}")
     cand = LEDGER / "candidates" / slug
     s = json.loads((cand / "state.json").read_text())
     prof = {}
     pdir = Path(os.environ.get("CONTRIB_PROFILE_DIR", SKILL / "profiles"))
     for line in (pdir / f"{s['repo'].replace('/', '-')}.env").read_text().splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            k, v = line.split("#", 1)[0].split("=", 1)
-            prof[k.strip()] = v.strip().strip('"')
+        line = "" if line.lstrip().startswith("#") else line.split(" #", 1)[0].strip()
+        if "=" in line:          # read as contrib-run's load_env reads it
+            k, v = line.split("=", 1)
+            prof[k.strip()] = v.strip().strip('"').strip("'")
+    missing = [k for k in NEEDED if not prof.get(k)]
+    if missing:
+        fail(f"the {s['repo']} profile has no {', '.join(missing)}")
+    for key in ("SENSITIVE_PATHS", "AREAS"):
+        for rx in prof[key].split():
+            try:
+                groups = re.compile(rx).groups
+            except re.error as e:
+                fail(f"{key} {rx!r} is not a regex: {e}")
+            if key == "AREAS" and groups < 1:
+                fail(f"AREAS {rx!r} has no group naming the area")
+    return cand, s, prof
+
+
+def where(slug):
+    """What contrib-publish needs to know about a candidate, as lines a shell can eval."""
+    cand, s, prof = load(slug)
+    out = {"SLUG": slug, "CAND": str(cand), "REPO": s["repo"], "BRANCH": s.get("branch", ""),
+           "REPO_DIR": prof["REPO_DIR"], "USER_REPO_DIR": prof.get("USER_REPO_DIR", ""),
+           "UPSTREAM_REMOTE": prof["UPSTREAM_REMOTE"], "BASE_BRANCH": prof["BASE_BRANCH"],
+           "CONTRIBUTOR": prof.get("CONTRIBUTOR", ""), "FORK_CI": prof.get("FORK_CI", "")}
+    for k, v in out.items():
+        print(f"{k}={shlex.quote(str(v))}")
+
+
+def area_of(areas, path):
+    """The area a path is in: the first group of the first AREAS regex that matches, or None."""
+    for rx in areas:
+        m = rx.search(path)
+        if m and m.group(1):
+            return m.group(1)
+    return None
+
+
+def main():
+    global WHERE_MODE
+    if len(sys.argv) == 3 and sys.argv[1] == "--where":
+        WHERE_MODE = True
+        where(sys.argv[2])
+        return
+    if len(sys.argv) != 2:
+        fail("usage: contrib-check <slug>, or contrib-check --where <slug>")
+    slug = sys.argv[1]
+    cand, s, prof = load(slug)
+    sensitive = prof["SENSITIVE_PATHS"].split()
+    areas = [re.compile(rx) for rx in prof["AREAS"].split()]
+    doc_files = set(prof.get("DOC_FILES", "").split())
+    rl = prof.get("RATCHET_FILE", "")
+    setup_key = [k.rstrip("/") for k in prof.get("SETUP_KEY", "").split()]
     repo_dir, up, base = prof["REPO_DIR"], prof["UPSTREAM_REMOTE"], prof["BASE_BRANCH"]
     branch, made_from = s["branch"], s["base_sha"]
     git = lambda *a, check=True: sh("git", "-C", repo_dir, *a, check=check)
@@ -93,15 +149,14 @@ def main():
           f"{main_ref} now {main_sha[:9]}")
     print(f"files this branch changes: {', '.join(mine)}")
     verdicts = []
-    touchy = [f for f in mine if any(re.search(rx, f) for rx in SENSITIVE)]
+    touchy = [f for f in mine if any(re.search(rx, f) for rx in sensitive)]
     if touchy:
         print(f"sensitive paths touched (show their full diff before any push): {', '.join(touchy)}")
         verdicts.append("needs-look")
 
     since = s.get("started") or ""
-    rl = "engine/tests/es-compat-yaml/catch-lenient.txt"
     my_ratchet = set()
-    if rl in mine:
+    if rl and rl in mine:
         my_ratchet = {l[1:] for l in git("diff", f"{main_ref}...{branch}", "--", rl).splitlines()
                       if l.startswith("-") and not l.startswith("---")}
 
@@ -133,7 +188,7 @@ def main():
     prs = json.loads(sh("gh", "pr", "list", "-R", s["repo"], "--state", "open", "--limit", "200",
                         "--json", "number,title,author,createdAt,files,headRefName,headRepositoryOwner,"
                         "closingIssuesReferences"))
-    code_files = set(mine) - DOC_FILES
+    code_files = set(mine) - doc_files
     quiet = []
     for pr in prs:
         if (pr.get("headRefName") == branch and (pr.get("author") or {}).get("login") == me
@@ -152,8 +207,8 @@ def main():
                   f"{'closes the same issue' if issue_hit else 'deletes the same ratchet line'}")
             verdicts.append("overlap")
         elif shared:
-            # Same file is common (es_compat.rs is touched by most PRs). What matters is whether
-            # the two changes meet: a trial merge of this branch with that PR's head.
+            # Sharing a file is common (in some repos most PRs touch one big file). What matters is
+            # whether the two changes meet: a trial merge of this branch with that PR's head.
             prref = f"refs/contrib-check/pr-{pr['number']}"
             f = subprocess.run(["git", "-C", repo_dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", up,
                                 f"+pull/{pr['number']}/head:{prref}"],
@@ -168,9 +223,9 @@ def main():
             subprocess.run(["git", "-C", repo_dir, "update-ref", "-d", prref], capture_output=True)
             if clash:
                 new = after(pr.get("createdAt"), since)
-                code_clash = set(clash) - DOC_FILES
+                code_clash = set(clash) - doc_files
                 what = ("same code, maybe the same fix: read its diff" if code_clash
-                        else "neighbouring CHANGELOG or ratchet lines only; whichever merges second rebases")
+                        else "neighbouring lines in DOC_FILES only; whichever merges second rebases")
                 print(f"{'NEW ' if new else ''}CONFLICTS with #{pr['number']} {pr['title']} "
                       f"({pr['author']['login']}): {', '.join(clash)}  <- {what}")
                 if code_clash:
@@ -201,20 +256,25 @@ def main():
         conflicts = merge_tree(repo_dir, main_ref, branch)
         meet = git("merge-base", main_ref, branch)
         moved = git("diff", "--name-only", f"{meet}..{main_ref}").splitlines()
-        crates = {"/".join(p.split("/")[:3]) for p in code_files if p.startswith("engine/crates/")}
-        crate_moved = sorted(p for p in moved if "/".join(p.split("/")[:3]) in crates)
+        mine_areas = {a for a in (area_of(areas, p) for p in code_files) if a}
+        area_moved = sorted(p for p in moved if area_of(areas, p) in mine_areas)
+        setup_moved = sorted(p for p in moved if any(p == k or p.startswith(k + "/") for k in setup_key))
         print(f"base moved {len(moved)} files; conflicts: {', '.join(conflicts) or 'none'}")
-        if crate_moved:
-            print(f"base changed code in this branch's crates: {', '.join(crate_moved[:12])}"
-                  f"{' ...' if len(crate_moved) > 12 else ''}")
+        if area_moved:
+            print(f"base changed code in this branch's areas: {', '.join(area_moved[:12])}"
+                  f"{' ...' if len(area_moved) > 12 else ''}")
+        if setup_moved:
+            print(f"base changed the dependency setup: {', '.join(setup_moved[:12])}"
+                  f"{' ...' if len(setup_moved) > 12 else ''}")
+        retest = bool(area_moved or setup_moved)
         # No conflict means no rebase, and no rebase means no re-test: the PR is opened as is and
         # CI runs on the merge with the base (pull_request events build the merge ref).
-        if conflicts and not set(conflicts) <= DOC_FILES:
+        if conflicts and not set(conflicts) <= doc_files:
             verdicts.append("rebase-code")
         elif conflicts:
-            verdicts.append("rebase-code" if crate_moved else "rebase-docs")
-        elif crate_moved:
-            print("merges cleanly, but the base changed code this branch builds on")
+            verdicts.append("rebase-code" if retest else "rebase-docs")
+        elif retest:
+            print("merges cleanly, but the base changed code or dependencies this branch builds on")
             verdicts.append("retest-merge")
     order = ["merged-or-closed", "overlap", "needs-look", "rebase-code", "rebase-docs", "retest-merge"]
     verdict = next((v for v in order if v in verdicts), "unchanged")

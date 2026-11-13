@@ -385,3 +385,56 @@ one; 5A pydantic's `MAX_OPEN` is 2. The questions as they were asked:
 3. Assignment first: where an unassigned issue candidate stops.
 4. The shallow pipeline clone: unshallow it once.
 5. pydantic's `MAX_OPEN` is 10.
+
+# Phase 3: publish any repo (proposed 2026-11-13)
+
+## Objective
+`contrib-publish`, `contrib-check` and `contrib-run --retest` work for any profiled repo, with
+every repo fact in the profile. xerj keeps today's behaviour, read from its profile instead of
+the code. The first pydantic publish (pydantic/pydantic#14276) needed each of these steps by
+hand.
+
+## Profile keys
+| key | meaning | xerj | pydantic |
+|---|---|---|---|
+| `SENSITIVE_PATHS` | path regexes whose full diff the user sees before any push | today's list in contrib-check | `^\.github/`, `^pyproject\.toml$`, `^uv\.lock$`, `^Makefile$`, `(^\|/)Cargo\.(toml\|lock)$`, `(^\|/)build\.rs$`, `\.(sh\|bash)$` |
+| `DOC_FILES` | files where a conflict counts as docs only (rebase, no code retest) | `CHANGELOG.md` and the ratchet file | none |
+| `RATCHET_FILE` | optional: a list of lines a fix deletes; two PRs deleting one line overlap | `engine/tests/es-compat-yaml/catch-lenient.txt` | none |
+| `AREAS` | regexes whose first group names an area; base changes in the branch's areas force a retest on a clean merge | `^(engine/crates/[^/]+)` | `^(pydantic)/`, `^(pydantic-core)/`, `^(docs)/`, `^(tests)/` |
+| `FORK_CI` | `1`: the publish skill offers a CI run on the user's fork before the real PR | unset | `1` |
+
+A base change to a `SETUP_KEY` file also forces a retest (the dependencies changed). The
+driver's fixed session deny list loses `xerj` and `cargo`; they move to profiles'
+`SESSION_DENY` (xerj: `xerj cargo`; pydantic adds `cargo maturin`).
+
+## Pieces
+1. **contrib-check** reads the four path keys from the profile, and `contrib-check --where <slug>`
+   prints the candidate's pipeline clone, user checkout, upstream repo, fork owner and base
+   branch, so the skill never types a path or repo name. New `tests/smoke/unit_check.py`
+   (it has no tests today), with xerj's verdicts pinned before the move.
+2. **Retest in commands mode**: a fresh clone of the branch, or a trial merge with the
+   current base; the dependency setup for that base; then the same runs as the final gate
+   (gate checks, the passing test requests replayed, the changed test files), with the same
+   stop when a run writes to tracked files. The branch's own commits start at its fork point
+   (`git merge-base` with the current base), which is the recorded base unless step 4 rebased
+   it. Recorded in `state.json` `retest` as today. The final gate and retest share the
+   functions that build the request list and run it.
+3. **`bin/contrib-push <slug> <REVIEWED>`** (decision 1): today's push block as a tested script.
+   It first checks that the user's checkout pushes to a fork `CONTRIBUTOR` owns and that a
+   passing final gate or retest of `REVIEWED` is recorded (also before the fork CI push).
+   It fetches into the user's checkout, verifies the commit, pushes `fix/<slug>` to the fork
+   (never a force push), verifies the fork, opens the PR from the title and body files,
+   records `published` with the URL in `state.json` and commits the ledger.
+4. **contrib-publish SKILL.md**: no repo names; each step takes its paths from `--where`;
+   the retest text covers both modes.
+5. **Fork CI step** (decision 2), only on the user's go, because it pushes to the public fork:
+   sync the fork's base branch, push the branch, open a draft PR inside the fork, wait for
+   CI, compare each failed job with the same job on the upstream base commit (failing there
+   too means not caused by the change), show the table, close the draft PR.
+
+## Testing
+Unit checks with mutants for each new guard; `unit_check.py` pins xerj's verdicts on a git
+fixture before and after the move; the stub suite; one review. One real retest of the
+published pydantic candidate (no paid sessions, about 5 to 10 minutes, one heavy job): it
+also builds the new `--all-extras` environment, so the docs example that needs
+email-validator should pass there.

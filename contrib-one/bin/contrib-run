@@ -2509,8 +2509,8 @@ class Driver:
             "permissions": {
                 "deny": [f"Read(/{p})" for p in secret_files] + [f"Read(/{p}/**)" for p in secret_files]
                 + ["Read(//proc/**)", "Read(//sys/**)", f"Read(/{tmp_root})", f"Read(/{tmp_root}/**)"] + deny_edit
-                + ["Bash(git push:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(xerj:*)",
-                   "Bash(cargo:*)", "Bash(sudo:*)", "WebFetch(domain:api.github.com)", "WebSearch"]
+                + ["Bash(git push:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(sudo:*)",
+                   "WebFetch(domain:api.github.com)", "WebSearch"]
                 + [f"Bash({w}:*)" for w in self.prof.get("SESSION_DENY", "").split()],
             },
         }
@@ -3022,13 +3022,13 @@ class Driver:
         return v
 
     def ensure_setup(self, rid):
-        """Install the repo's dependencies for the base commit, once per change of the SETUP_KEY
-        paths. SETUP_CMD is the only command with network, so it runs on files exported from the
+        """Install the repo's dependencies for the base commit (for a retest with --merge, the
+        current base it merged), once per change of the SETUP_KEY paths. SETUP_CMD is the only command with network, so it runs on files exported from the
         pipeline clone at the base, never on the session's clone, with only the new environment,
         the export and the setup caches writable. Every later run gets the environment read-only."""
-        base = self.st()["base_sha"]
+        base = getattr(self, "setup_base", None) or self.st()["base_sha"]
         if not re.fullmatch(r"[0-9a-f]{40}", base or ""):
-            raise RuntimeError("state.json base_sha is not a commit id")
+            raise RuntimeError("the setup base is not a commit id")
         ids = [self.git("rev-parse", "--verify", "--quiet", f"{base}:{p}", check=False) or "-"
                for p in self.prof["SETUP_KEY"].split()]
         key = hashlib.sha256("\n".join([self.prof["SETUP_CMD"], self.prof.get("JAIL_ENV", ""),
@@ -3694,12 +3694,12 @@ class Driver:
         gone = {tuple(g) for g in (self.st().get("gate") or {}).get("gone_reqs", []) if isinstance(g, list)}
         return [t for t in tests if tuple(self.test_key(t)) not in gone]
 
-    def changed_test_files(self, base):
+    def changed_test_files(self, base, tip="HEAD"):
         """Files the branch's own commits add or change that the profile's TEST_FILES globs call
         tests, and that still exist: the gate runs them all, expecting pass."""
         globs = self.prof.get("TEST_FILES", "").split()
         out = []
-        for n in self.cgit("diff", "--name-only", "--no-renames", "--diff-filter=AM", "-z", f"{base}..HEAD",
+        for n in self.cgit("diff", "--name-only", "--no-renames", "--diff-filter=AM", "-z", f"{base}..{tip}",
                            check=False).split("\0"):
             if n and any(fnmatch.fnmatchcase(n, g) for g in globs) and self.session_paths([n]):
                 out.append(n)
@@ -3708,13 +3708,13 @@ class Driver:
                      "left out: " + one_line(", ".join(out[40:]), 300))
         return out[:40]
 
-    def setup_paths_touched(self, base):
+    def setup_paths_touched(self, base, tip="HEAD"):
         """Files under the profile's SETUP_KEY paths that the branch changes. Every run used their
         base version (the dependency setup installs from the base commit), so none was tested."""
         keys = self.prof.get("SETUP_KEY", "").split()
         if not keys:
             return []
-        return [n for n in self.cgit("diff", "--name-only", "--no-renames", "-z", f"{base}..HEAD", "--", *keys,
+        return [n for n in self.cgit("diff", "--name-only", "--no-renames", "-z", f"{base}..{tip}", "--", *keys,
                                      check=False).split("\0") if n]
 
     def replay_split(self, tests, stamp):
@@ -3725,6 +3725,47 @@ class Driver:
             r = dict(t, id=f"{stamp}-t{i}")
             (run if all(os.path.lexists(self.clone() / p) for p in t.get("paths", [])) else gone).append(r)
         return run, gone
+
+    def clean_runs(self, reqs, head):
+        """The final gate's and a retest's runs, one at a time on the commit as it is: untracked
+        files are cleaned before each, and the runs stop when one wrote to tracked files or moved
+        HEAD away from head. Returns the problems found, or []."""
+        bad = []
+
+        def tree_moved():
+            return bool(self.cgit("status", "--porcelain", check=False)) or self.cgit("rev-parse", "HEAD") != head
+
+        for r in reqs:
+            self.cgit("clean", "-ffdxq")
+            if tree_moved():
+                bad.append(f"the clone changed before {r['id']} (a step wrote to tracked files)")
+                break
+            self.run_requests([r], driver=True)
+        self.check_stop()
+        self.node_stop()
+        if not bad:
+            self.cgit("clean", "-ffdxq")      # as before each step: only tracked changes count
+            if tree_moved():
+                bad.append("the clone changed during the last step (it wrote to tracked files)")
+        return bad
+
+    def commands_gate_reqs(self, tests, stamp, base, tip="HEAD"):
+        """Commands mode, for the final gate and a retest: the repo's gate checks, every test the
+        sessions saw pass, then the test files the branch's own commits (base..tip) add or change.
+        Returns (a refusal or '', the requests, the replayed tests whose files are gone)."""
+        touched = self.setup_paths_touched(base, tip)
+        if touched:
+            return ("the branch changes files the dependency setup installs from the base commit ("
+                    + one_line(", ".join(touched), 200) + "), so no run tested that change"), [], []
+        reqs = [{"kind": "check", "name": n, "id": f"{stamp}-{n.lower()}"} for n in self.prof.get("GATE_CHECKS", "").split()]
+        replay, missing = self.replay_split(tests, stamp)
+        reqs += replay
+        # Test files the branch adds or changes, less those a replayed run already covers whole.
+        covered = {p for t in tests if not t.get("filter") for p in t.get("paths", [])}
+        changed = [p for p in self.changed_test_files(base, tip) if p not in covered]
+        if changed:
+            reqs.append({"kind": "test", "paths": changed, "filter": "", "id": f"{stamp}-changed"})
+        return "", reqs, missing
 
     def changed_crates(self, base):
         """Package names of the crates the branch's own commits touch (nearest Cargo.toml)."""
@@ -3777,18 +3818,9 @@ class Driver:
             # The repo's own checks first, then every test the sessions saw pass, then the test
             # files the branch changes, all on this fresh clone.
             crates = []
-            touched = self.setup_paths_touched(s["base_sha"])
-            if touched:
-                return ("the branch changes files the dependency setup installs from the base commit ("
-                        + one_line(", ".join(touched), 200) + "), so no run tested that change")
-            reqs = [{"kind": "check", "name": n, "id": f"{stamp}-{n.lower()}"} for n in self.prof.get("GATE_CHECKS", "").split()]
-            replay, missing = self.replay_split(tests, stamp)
-            reqs += replay
-            # Test files the branch adds or changes, less those a replayed run already covers whole.
-            covered = {p for t in tests if not t.get("filter") for p in t.get("paths", [])}
-            changed = [p for p in self.changed_test_files(s["base_sha"]) if p not in covered]
-            if changed:
-                reqs.append({"kind": "test", "paths": changed, "filter": "", "id": f"{stamp}-changed"})
+            refusal, reqs, missing = self.commands_gate_reqs(tests, stamp, s["base_sha"])
+            if refusal:
+                return refusal
         else:
             missing = []
             crates = sorted({t["crate"] for t in tests} | self.changed_crates(s["base_sha"]))
@@ -3799,23 +3831,7 @@ class Driver:
                     {"kind": "clippy", "workspace": True, "crates": crates, "id": f"{stamp}-clippy"}]
             reqs += [dict(t, id=f"{stamp}-t{i}") for i, t in enumerate(tests)]
         self.log(f"candidate {self.cand.name}: final gate on a fresh clone and build, {len(reqs)} runs")
-        bad = []
-
-        def tree_moved():
-            return bool(self.cgit("status", "--porcelain", check=False)) or self.cgit("rev-parse", "HEAD") != head
-
-        for r in reqs:
-            self.cgit("clean", "-ffdxq")
-            if tree_moved():
-                bad.append(f"the clone changed before {r['id']} (a gate step wrote to tracked files)")
-                break
-            self.run_requests([r], driver=True)
-        self.check_stop()
-        self.node_stop()
-        if not bad:
-            self.cgit("clean", "-ffdxq")      # as before each step: only tracked changes count
-            if tree_moved():
-                bad.append("the clone changed during the last gate step (it wrote to tracked files)")
+        bad = self.clean_runs(reqs, head)
         recs = {}
         idx = self.cand / "results" / "index.jsonl"
         for line in idx.read_text(errors="replace").splitlines():
@@ -4253,18 +4269,19 @@ class Driver:
 
     # ----- publish-time retest --------------------------------------------------------
     def retest(self, slug, merge):
-        """Re-run, in the jail, a candidate's passing test requests, clippy on their crates and
-        the full YAML suite, on its branch as it now is in the pipeline clone, or with --merge on
-        a trial merge with the current base. Nothing is saved back: the clone is thrown away."""
+        """Re-run, in the jail, a candidate's checks on its branch as it now is in the pipeline
+        clone, or with --merge on a trial merge with the current base: the final gate's runs in
+        commands mode (with the dependency setup for that base), else its passing test requests,
+        clippy on their crates and the full YAML suite. Nothing is saved back: the clone is
+        thrown away."""
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug or ""):
             raise RuntimeError(f"bad slug {slug!r}")
-        if self.commands:
-            raise RuntimeError("retest runs cargo profiles only for now; for this repo, rerun the final gate "
-                               "with --answer, or test by hand")
         self.cand = LEDGER / "candidates" / slug
         s = self.st()
         if not s.get("branch") or not s.get("base_sha"):
             raise RuntimeError(f"{slug}: state.json has no branch or base")
+        if s.get("repo") and s["repo"] != self.repo:
+            raise RuntimeError(f"{slug} belongs to {s['repo']}, not {self.repo}")
         if not shutil.which("bwrap") or not shutil.which("socat"):
             raise RuntimeError("bubblewrap or socat missing")
         self.git("fetch", "--quiet", self.prof["UPSTREAM_REMOTE"], self.prof["BASE_BRANCH"])
@@ -4277,13 +4294,21 @@ class Driver:
             raise RuntimeError(f"{self.clone()} exists; another run may be using it")
         if not self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{s['branch']}", check=False):
             raise RuntimeError(f"the pipeline clone has no branch {s['branch']}; nothing to retest")
+        # The branch's own commits start at its fork point: the recorded base, or after a rebase
+        # (contrib-publish step 4) the upstream commit it now sits on.
+        fork_pt = self.git("merge-base", self.upstream, f"refs/heads/{s['branch']}", check=False)
+        if not re.fullmatch(r"[0-9a-f]{40}", fork_pt or ""):
+            raise RuntimeError(f"{s['branch']} shares no history with {self.upstream}")
+        if fork_pt != s["base_sha"]:
+            print(f"the branch was rebased: its own commits start at {fork_pt[:12]}, not at the recorded "
+                  f"base {s['base_sha'][:12]}")
         stamp = time.strftime("%m%d-%H%M%S") + uuid.uuid4().hex[:4]
         self.target_name = f"retest-{slug}"
-        dst, head, merged = self.clone(), "", ""
+        dst, head, merged, missing, bad = self.clone(), "", "", [], []
         try:
-            self.make_clone(slug, s["branch"], s["base_sha"], restore=False)
+            self.make_clone(slug, s["branch"], fork_pt, restore=False)
             head = self.cgit("rev-parse", "HEAD")
-            crates = sorted({t["crate"] for t in tests} | self.changed_crates(s["base_sha"]))
+            crates = [] if self.commands else sorted({t["crate"] for t in tests} | self.changed_crates(fork_pt))
             if merge:
                 self.git("fetch", "-q", str(self.repo_dir), f"+refs/remotes/{self.upstream}:refs/remotes/{self.upstream}", cwd=dst)
                 try:
@@ -4291,12 +4316,19 @@ class Driver:
                 except RuntimeError as e:
                     raise RuntimeError(f"the trial merge with the base failed ({one_line(e, 150)}); rebase first")
                 merged = base_now
-            reqs = [{"kind": "fmt", "check": True, "id": f"retest-{stamp}-fmt"}]
-            reqs += [dict(t, id=f"retest-{stamp}-t{i}") for i, t in enumerate(tests)]
-            reqs += [{"kind": "clippy", "workspace": True, "crates": crates, "id": f"retest-{stamp}-clippy"},
-                     {"kind": "yaml", "full": True, "id": f"retest-{stamp}-yaml"}]
-            for r in reqs:
-                self.run_requests([r], driver=True)
+            if self.commands:
+                # The dependencies of the base this tree now has, and the branch's own commits
+                # only (head, not a trial merge) for the changed test files.
+                self.setup_base = merged or fork_pt
+                refusal, reqs, missing = self.commands_gate_reqs(tests, f"retest-{stamp}", fork_pt, tip=head)
+                if refusal:
+                    raise RuntimeError(refusal)
+            else:
+                reqs = [{"kind": "fmt", "check": True, "id": f"retest-{stamp}-fmt"}]
+                reqs += [dict(t, id=f"retest-{stamp}-t{i}") for i, t in enumerate(tests)]
+                reqs += [{"kind": "clippy", "workspace": True, "crates": crates, "id": f"retest-{stamp}-clippy"},
+                         {"kind": "yaml", "full": True, "id": f"retest-{stamp}-yaml"}]
+            bad = self.clean_runs(reqs, self.cgit("rev-parse", "HEAD"))
         finally:
             try:
                 self.node_stop()
@@ -4312,11 +4344,16 @@ class Driver:
                 rec = json.loads(line)
             except ValueError:
                 continue
-            if str(rec.get("id", "")).startswith(f"retest-{stamp}-"):
+            if isinstance(rec, dict) and str(rec.get("id", "")).startswith(f"retest-{stamp}-"):
                 recs.append(rec)
-        ok = len(recs) == len(reqs) and all(r.get("met") for r in recs)
-        self.state(retest={"at": now(), "head": head, "merged_with": merged, "ok": ok,
-                           "ids": [r["id"] for r in recs]})
+        ran = {r.get("id"): r for r in recs}
+        ok = not bad and not missing and all(ran.get(q["id"], {}).get("met") for q in reqs)
+        for b in bad:
+            print(f"FAIL {b}")
+        for q in missing:
+            print(f"FAIL {q['id']} (test): its files are gone from the tree: {', '.join(q.get('paths', []))}")
+        self.state(retest={"at": now(), "head": head, "merged_with": merged, "fork_point": fork_pt, "ok": ok,
+                           "ids": [r["id"] for r in recs], "problems": bad})
         for r in recs:
             print(f"{'ok  ' if r.get('met') else 'FAIL'} {r['id']} ({r['kind']}) exit {r['exit']}: "
                   f"{self.cand / r['log']}")
@@ -4569,7 +4606,7 @@ class Driver:
 
 def main():
     ap = argparse.ArgumentParser(description="Run the contribution pipeline (never pushes or posts).")
-    ap.add_argument("--repo", default="xerj-org/xerj")
+    ap.add_argument("--repo", required=True, help="owner/name of the upstream repo (its profile is used)")
     ap.add_argument("--limit", type=int, default=3, help="candidates to finish this run")
     ap.add_argument("--hours", type=float, default=8.0, help="deadline from now")
     ap.add_argument("--topic", default="", help="steer the scout")

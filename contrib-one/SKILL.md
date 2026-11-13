@@ -24,7 +24,7 @@ Check first, in this order, and stop to tell the user if one fails:
 Then start it in the background (it outlives the turn and logs to the ledger):
 
 ```bash
-setsid nohup ~/.claude/skills/contrib-one/bin/contrib-run --repo xerj-org/xerj --limit 3 --hours 8 \
+setsid nohup ~/.claude/skills/contrib-one/bin/contrib-run --repo <owner/name> --limit 3 --hours 8 \
   > /dev/null 2>&1 &
 ```
 

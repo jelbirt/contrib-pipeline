@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""contrib-push <slug> <REVIEWED>: publish one reviewed candidate, after the user's explicit go.
+contrib-push --fork-ci <slug> <REVIEWED>: push it to the user's fork and open a draft PR inside
+the fork, so the fork's CI runs on it; nothing goes to the upstream repo.
+
+Both paths first check that the user's checkout pushes to a fork CONTRIBUTOR owns, and that a
+passing final gate or retest of REVIEWED is recorded in state.json.
+The publish path, in order, stopping at the first problem with nothing opened:
+  1. contrib-check <slug> once more: only "unchanged", or "retest-merge" with a passing retest
+     of REVIEWED merged with the current base, goes on.
+  2. Fetch the pipeline clone's branch into the user's checkout and check it is REVIEWED.
+  3. Push REVIEWED to the fork's branch (never a force push) and check the fork has it.
+  4. Open the PR on the upstream repo from pr-title.txt and pr-body.txt in the candidate folder.
+  5. Record status "published" with the URL in state.json and commit the ledger through
+     contrib-run.
+Every repo fact comes from `contrib-check --where` (the profile and state.json). Exit 0 when the
+PR is open, 1 on a stop, 2 on bad input. Prints "PR <url>" on success.
+"""
+import datetime, fcntl, json, os, re, shlex, subprocess, sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LEDGER = Path(os.environ.get("CONTRIB_LEDGER", Path.home() / "contrib-queue"))
+# Tests point these at stubs; publishing uses the scripts next to this one.
+CHECK = os.environ.get("CONTRIB_PUSH_CHECK") or str(HERE / "contrib-check")
+RUN = os.environ.get("CONTRIB_PUSH_RUN") or str(HERE / "contrib-run")
+NOHOOKS = ["-c", "core.hooksPath=/dev/null"]
+
+
+class Stop(Exception):
+    pass
+
+
+def sh(*a, cwd=None):
+    r = subprocess.run(a, capture_output=True, text=True, cwd=cwd)
+    if r.returncode:
+        raise Stop(f"{' '.join(a[:5])} failed: {(r.stderr or r.stdout).strip()[:400]}")
+    return r.stdout.strip()
+
+
+def where(slug):
+    r = subprocess.run([sys.executable, "-I", CHECK, "--where", slug], capture_output=True, text=True)
+    if r.returncode:
+        raise Stop(f"contrib-check --where {slug}: {(r.stderr or r.stdout).strip()[-400:]}")
+    w = {}
+    for line in r.stdout.splitlines():
+        k, v = line.split("=", 1)
+        w[k] = shlex.split(v)[0] if v else ""
+    return w
+
+
+def ledger_free():
+    """Refuse while an unattended run holds the ledger lock, as a retest does."""
+    p = LEDGER / ".run.lock"
+    if not p.exists():
+        return
+    with open(p) as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Stop("a contrib-run holds the ledger lock; wait for it to finish")
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def fork_name(w):
+    """owner/name of the fork the user's checkout pushes to, checked against CONTRIBUTOR."""
+    url = sh("git", "-C", w["USER_REPO_DIR"], "remote", "get-url", "origin")
+    m = re.search(r"[/:]([\w.-]+)/([\w.-]+?)(\.git)?/?$", url)
+    if not m or m.group(1).lower() != w["CONTRIBUTOR"].lower():
+        raise Stop(f"origin of {w['USER_REPO_DIR']} is {url}, not a fork owned by {w['CONTRIBUTOR']}")
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def gate_check(w, s, rev):
+    """contrib-check once more, right before the push: the PR list and the base move."""
+    r = subprocess.run([sys.executable, "-I", CHECK, w["SLUG"]], capture_output=True, text=True)
+    print(r.stdout.rstrip())
+    v = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("VERDICT ")]
+    verdict = v[-1] if v else "none"
+    if verdict == "unchanged" and r.returncode == 0:
+        return
+    if verdict == "retest-merge":
+        base_now = sh("git", "-C", w["REPO_DIR"], "rev-parse", f"refs/remotes/{w['UPSTREAM_REMOTE']}/{w['BASE_BRANCH']}")
+        rt = s.get("retest") or {}
+        if rt.get("ok") is True and rt.get("head") == rev and rt.get("merged_with") == base_now:
+            print("retest-merge: a passing retest of this commit merged with the current base is recorded")
+            return
+        raise Stop("contrib-check says retest-merge and no passing retest of this commit merged with "
+                   f"the current base ({base_now[:12]}) is recorded: run contrib-run --retest {w['SLUG']} --merge")
+    raise Stop(f"contrib-check says {verdict}: show the user its lines")
+
+
+def push(w, rev):
+    """REVIEWED from the pipeline clone to the fork's branch, checked at both ends."""
+    x, slug, branch = w["USER_REPO_DIR"], w["SLUG"], w["BRANCH"]
+    tmp = f"refs/contrib-publish/{slug}"
+    sh("git", "-C", x, *NOHOOKS, "fetch", "-q", "--no-tags", w["REPO_DIR"], f"+refs/heads/{branch}:{tmp}")
+    try:
+        got = sh("git", "-C", x, "rev-parse", tmp)
+        if got != rev:
+            raise Stop(f"the branch moved after approval: it is {got[:12]}, the reviewed commit is {rev[:12]}")
+        sh("git", "-C", x, *NOHOOKS, "push", "--quiet", "origin", f"{rev}:refs/heads/{branch}")
+        remote = sh("git", "-C", x, "ls-remote", "origin", f"refs/heads/{branch}").split("\t")[0]
+        if remote != rev:
+            raise Stop(f"the fork's {branch} is {remote[:12] or 'missing'}, not the reviewed commit")
+    finally:
+        subprocess.run(["git", "-C", x, "update-ref", "-d", tmp], capture_output=True)
+
+
+def main():
+    args = sys.argv[1:]
+    ci = bool(args) and args[0] == "--fork-ci"
+    if ci:
+        args = args[1:]
+    if len(args) != 2:
+        print(__doc__.split("\n\n")[0]); return 2
+    slug, rev = args
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug):
+        print(f"bad slug {slug!r}"); return 2
+    if not re.fullmatch(r"[0-9a-f]{40}", rev):
+        print("REVIEWED must be a full 40-character commit id"); return 2
+    try:
+        w = where(slug)
+        for k in ("USER_REPO_DIR", "CONTRIBUTOR", "BRANCH"):
+            if not w.get(k):
+                raise Stop(f"{k} is empty for {slug} (the profile or state.json lacks it)")
+        cand = Path(w["CAND"])
+        s = json.loads((cand / "state.json").read_text())
+        if s.get("status") == "published" or s.get("pr"):
+            raise Stop(f"{slug} is already published: {s.get('pr')}")
+        if s.get("status") != "ready":
+            raise Stop(f"{slug} is {s.get('status')!r}, not ready")
+        ledger_free()
+        fork = fork_name(w)          # both modes: origin is the contributor's own fork
+        # Only a commit that passed the final gate or a retest goes out, in either mode: after a
+        # rebase or a follow-up commit, contrib-run --retest first.
+        covered = any(r.get("ok") is True and r.get("head") == rev for r in (s.get("gate") or {}, s.get("retest") or {}))
+        if not covered:
+            raise Stop(f"no passing final gate or retest of {rev[:12]} is recorded: run contrib-run --retest {slug} first")
+        if ci:
+            sh("gh", "repo", "sync", fork, "--branch", w["BASE_BRANCH"])
+            push(w, rev)
+            url = sh("gh", "pr", "create", "--repo", fork, "--base", w["BASE_BRANCH"], "--head", w["BRANCH"],
+                     "--draft", "--title", f"CI check: {slug}",
+                     "--body", "Not for merge: a CI run on the fork before opening the real pull request.")
+            print(f"FORK-CI {url.splitlines()[-1]}")
+            return 0
+        title_f, body_f = cand / "pr-title.txt", cand / "pr-body.txt"
+        title = title_f.read_text().strip() if title_f.is_file() else ""
+        if not title or "\n" in title or len(title) > 200:
+            raise Stop("pr-title.txt must hold the approved title, one line")
+        if not body_f.is_file() or not body_f.read_text().strip():
+            raise Stop("pr-body.txt is missing or empty")
+        gate_check(w, s, rev)
+        push(w, rev)
+        out = sh("gh", "pr", "create", "--repo", w["REPO"], "--base", w["BASE_BRANCH"],
+                 "--head", f"{fork.split('/')[0]}:{w['BRANCH']}", "--title", title, "--body-file", str(body_f))
+        url = out.splitlines()[-1].strip()
+        if not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", url):
+            raise Stop(f"gh pr create printed {out[-300:]!r}; check GitHub by hand before anything else")
+    except Stop as e:
+        print(f"STOP: {e}")
+        return 1
+    except Exception as e:          # a crash before the PR exists opens nothing
+        print(f"STOP: contrib-push crashed: {type(e).__name__}: {e}")
+        return 1
+    # The PR is open: say so first, then record it; nothing after this point may crash.
+    print(f"PR {url}")
+    try:
+        s = json.loads((cand / "state.json").read_text())
+        s.update(status="published", pr=url, published_head=rev,
+                 published_at=datetime.datetime.now().astimezone().isoformat(timespec="seconds"))
+        tmp = cand / "state.json.tmp"
+        tmp.write_text(json.dumps(s, indent=2) + "\n")
+        tmp.replace(cand / "state.json")
+    except Exception as e:      # the PR is open: say what to record, never crash
+        print(f"the PR is open, but state.json was not updated ({type(e).__name__}: {e}); record {url} by hand")
+        return 0
+    r = subprocess.run([sys.executable, "-I", RUN, "--repo", w["REPO"], "--commit-ledger", f"publish {slug}"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        print(f"the PR is open, but the ledger commit failed: {(r.stderr or r.stdout).strip()[:300]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

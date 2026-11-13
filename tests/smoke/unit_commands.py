@@ -157,8 +157,129 @@ def c_shallow(m):
     except RuntimeError:
         return False
     return raises(d.refuse_shallow, "is a shallow clone")
+def retest_driver(m, met=True, missing=(), fork="b" * 40, repo=None, dirty_after=None):
+    """A commands-mode driver whose retest runs on stubs: no clone, no jail, no git. It records
+    the base and tip the gate requests are built from, the setup base at that moment, and the
+    clean before each run; each run writes an index record, met or not. fork is the branch's
+    fork point (the recorded base "b"*40 unless it was rebased); dirty_after makes the tree show
+    a tracked change once that many runs have happened."""
+    d = mk(m)
+    d.calls = []
+    d.upstream = "upstream/main"
+    d.st = lambda: {"branch": "fix/c1", "base_sha": "b" * 40, "repo": repo or d.repo}
+    d.state = lambda **k: d.calls.append(("state", k))
+    d.git = lambda *a, **k: {"rev-parse": "n" * 40, "merge-base": fork}.get(a[0], "")
+    d.replay_tests = lambda skip_gone=False: [{"kind": "test", "paths": ["tests/a.py"], "filter": ""}]
+    home = t / "retest-clone"
+    shutil.rmtree(home, ignore_errors=True)
+    d.clone = lambda: home
+    d.make_clone = lambda *a, **k: home.mkdir(parents=True)
+    def cgit(*a, **k):
+        d.calls.append(("cgit",) + a)
+        if a[:1] == ("rev-parse",):
+            return "h" * 40
+        if a[:1] == ("status",) and dirty_after is not None and sum(c[0] == "run" for c in d.calls) >= dirty_after:
+            return " M src/x.py"
+        return ""
+    d.cgit = cgit
+    reqs = [{"kind": "check", "name": "FORMAT", "id": "x-format"}, {"kind": "test", "paths": ["tests/a.py"], "id": "x-t0"}]
+    def gate_reqs(tests, stamp, base, tip="HEAD"):
+        d.calls.append(("gate", base, tip, getattr(d, "setup_base", "unset")))
+        return "", [dict(r, id=r["id"].replace("x-", stamp + "-")) for r in reqs], list(missing)
+    d.commands_gate_reqs = gate_reqs
+    idx = d.cand / "results" / "index.jsonl"
+    idx.write_text("")
+    def run_requests(rs, driver=False):
+        for r in rs:
+            d.calls.append(("run", r["id"]))
+            with idx.open("a") as f:
+                f.write(json.dumps({"id": r["id"], "kind": r["kind"], "exit": 0, "log": "l",
+                                    "met": met if r["kind"] == "test" else True}) + "\n")
+    d.run_requests = run_requests
+    d.node_stop = d.drop_copy = lambda *a, **k: None
+    d.sweep = lambda *a, **k: None
+    d.target_dir = d.bins = lambda: t / "retest-none"
+    return d
+
+
+def quiet(fn):
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn()
+
+
 def c_retest(m):
-    return raises(lambda: mk(m).retest("abc", False), "cargo profiles only")
+    """Commands mode retests: the gate's requests, built from the branch's own commits up to its
+    head, every one met, gives a pass."""
+    d = retest_driver(m)
+    rc = quiet(lambda: d.retest("c1", False))
+    gate = [c for c in d.calls if c[0] == "gate"]
+    return rc == m.EXIT_DONE and gate == [("gate", "b" * 40, "h" * 40, "b" * 40)]
+
+
+def c_retest_tip(m):
+    """The changed test files come from base..head of the branch, not from a trial merge's HEAD."""
+    d = retest_driver(m)
+    quiet(lambda: d.retest("c1", True))
+    return [c[2] for c in d.calls if c[0] == "gate"] == ["h" * 40]
+
+
+def c_retest_merge_setup(m):
+    """With --merge, the dependencies are those of the base it merged."""
+    d = retest_driver(m)
+    quiet(lambda: d.retest("c1", True))
+    return [c[3] for c in d.calls if c[0] == "gate"] == ["n" * 40]
+
+
+def c_retest_unmet(m):
+    d = retest_driver(m, met=False)
+    return quiet(lambda: d.retest("c1", False)) == m.EXIT_SOFT
+
+
+def c_retest_missing(m):
+    d = retest_driver(m, missing=[{"id": "gone", "paths": ["tests/gone.py"]}])
+    return quiet(lambda: d.retest("c1", False)) == m.EXIT_SOFT
+
+
+def c_retest_clean(m):
+    """Each run starts from the commit: a clean between the previous run and every run."""
+    d = retest_driver(m)
+    quiet(lambda: d.retest("c1", False))
+    seq = [c[0] if c[0] != "cgit" else c[1] for c in d.calls if c[0] in ("run", "cgit")]
+    runs = [i for i, c in enumerate(seq) if c == "run"]
+    return len(runs) == 2 and all("clean" in seq[a + 1:b] for a, b in zip([-1] + runs, runs))
+
+
+def c_retest_rebased(m):
+    """After a rebase the branch's own commits start at its new fork point, not the recorded
+    base: the changed tests and the dependencies come from there."""
+    d = retest_driver(m, fork="c" * 40)
+    rc = quiet(lambda: d.retest("c1", False))
+    return rc == m.EXIT_DONE and [c[1:] for c in d.calls if c[0] == "gate"] == [("c" * 40, "h" * 40, "c" * 40)]
+
+
+def c_retest_repo(m):
+    """A candidate of another repo is refused, so its branch is never tested against this profile."""
+    d = retest_driver(m, repo="other-org/other")
+    return raises(lambda: quiet(lambda: d.retest("c1", False)), "belongs to other-org/other") and not any(
+        c[0] == "run" for c in d.calls)
+
+
+def c_retest_dirty_mid(m):
+    """A run that writes to tracked files stops the retest before the next run, as in the gate."""
+    d = retest_driver(m, dirty_after=1)
+    rc = quiet(lambda: d.retest("c1", False))
+    st = [c[1]["retest"] for c in d.calls if c[0] == "state"]
+    return (rc == m.EXIT_SOFT and sum(c[0] == "run" for c in d.calls) == 1 and st and st[0]["ok"] is False
+            and "changed before" in " ".join(st[0]["problems"]))
+
+
+def c_retest_dirty_last(m):
+    """The last run writing to tracked files fails the retest too."""
+    d = retest_driver(m, dirty_after=2)
+    rc = quiet(lambda: d.retest("c1", False))
+    st = [c[1]["retest"] for c in d.calls if c[0] == "state"]
+    return rc == m.EXIT_SOFT and st and "during the last step" in " ".join(st[0]["problems"])
 def settings(m, **over):
     return json.dumps(mk(m, **over).settings_for([t / "w"], t / "clone"))
 def c_session_deny(m):
@@ -225,6 +346,14 @@ def c_env_readonly(m):
     d = setup_driver(m, C2)
     d.ensure_setup("r1")
     return bind_kind(d.cap[0], d.env_dir) == "--bind" and bind_kind(d.cmd_jail(["runner"]), d.env_dir) == "--ro-bind"
+
+
+def c_setup_base(m):
+    """A retest's setup base, when set, picks the environment, not the candidate's base."""
+    d1, d2 = setup_driver(m, C1), setup_driver(m, C2)
+    d1.setup_base = C2
+    d2.ensure_setup("r1"); d1.ensure_setup("r1")
+    return d1.env_dir == d2.env_dir
 
 
 def c_setup_key(m):
@@ -460,7 +589,9 @@ def c_deny_text(m):
 CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_list, c_render_unknown,
           c_judge_none, c_judge_other_rc, c_judge_fail_needs_failure, c_judge_pass_needs_tests,
           c_judge_report_missing, c_result_commands_pass, c_result_unknown_kind, c_dispatch, c_paths_dash,
-          c_assign_other, c_assign_none, c_assign_me, c_recheck, c_answer, c_shallow, c_retest,
+          c_assign_other, c_assign_none, c_assign_me, c_recheck, c_answer, c_shallow, c_retest, c_retest_tip, c_retest_merge_setup, c_retest_rebased, c_retest_repo,
+          c_retest_dirty_mid, c_retest_dirty_last, c_retest_unmet,
+          c_retest_missing, c_retest_clean, c_setup_base,
           c_session_deny, c_ref_host, c_sweep, c_init_refusal, c_cmd_no_net, c_env_readonly, c_setup_key,
           c_requests_text, c_paths_at, c_filter_at, c_without_list, c_without_list_cargo, c_driver_error,
           c_report_word, c_skipped_not_gone, c_gate_missing, c_renamed_tests, c_setup_touched, c_issue_forms,
@@ -509,7 +640,24 @@ MUTANTS = [
      "        n = self.st().get(\"issue\")\n        if False:"),
     (c_answer, 'if self.assign_first and isinstance(st.get("issue"), int) and not self.is_assigned(st["issue"]):', "if False:"),
     (c_shallow, 'if self.git("rev-parse", "--is-shallow-repository", check=False) == "true":', "if False:"),
-    (c_retest, "        if self.commands:\n            raise RuntimeError(\"retest runs cargo", "        if False:\n            raise RuntimeError(\"retest runs cargo"),
+    (c_retest, '        tests = self.replay_tests(skip_gone=True)\n',
+     '        tests = self.replay_tests(skip_gone=True)\n        if self.commands:\n            raise RuntimeError("retest runs cargo profiles only")\n'),
+    (c_retest_tip, 'fork_pt, tip=head)', 'fork_pt)'),
+    (c_retest_merge_setup, "self.setup_base = merged or fork_pt", "self.setup_base = fork_pt"),
+    (c_retest_unmet, 'not missing and all(ran.get(q["id"], {}).get("met") for q in reqs)', 'not missing'),
+    (c_retest_missing, 'not missing and all(', 'all('),
+    (c_retest_clean, '''            self.cgit("clean", "-ffdxq")
+            if tree_moved():''', '''            if tree_moved():'''),
+    (c_retest_rebased, '''fork_pt = self.git("merge-base", self.upstream, f"refs/heads/{s['branch']}", check=False)''',
+     'fork_pt = s["base_sha"]'),
+    (c_retest_repo, 'if s.get("repo") and s["repo"] != self.repo:', "if False:"),
+    (c_retest_dirty_mid, '''            if tree_moved():
+                bad.append(f"the clone changed before''', '''            if False:
+                bad.append(f"the clone changed before'''),
+    (c_retest_dirty_last, '''        if not bad:
+            self.cgit("clean", "-ffdxq")      # as before each step''', '''        if False:
+            self.cgit("clean", "-ffdxq")      # as before each step'''),
+    (c_setup_base, 'base = getattr(self, "setup_base", None) or self.st()["base_sha"]', 'base = self.st()["base_sha"]'),
     (c_session_deny, '+ [f"Bash({w}:*)" for w in self.prof.get("SESSION_DENY", "").split()]', "+ []"),
     (c_ref_host, 'domains = [] if only is not None else self.prof.get("REF_HOST", "").split()',
      'domains = [] if only is not None else ["raw.githubusercontent.com"]'),
