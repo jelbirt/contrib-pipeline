@@ -374,6 +374,36 @@ def safe(fn, mod, *a):
         return False
 
 
+def tmp_driver(m):
+    d = mk(m)
+    d.run_id = "2026-11-12-202225"
+    d.run_dir = Path(os.environ["CONTRIB_LEDGER"]) / "runs" / d.run_id
+    return d
+
+
+def c_tmp_short(m):
+    # A 60-character slug must not lengthen the scratch folder; names stay stable and distinct.
+    d, saved = tmp_driver(m), m.WORK
+    m.WORK = Path("/home/u/contrib-work")
+    try:
+        long_slug = d.cand.parent / ("docs-" + "x" * 55)
+        a, b = d.session_tmp(long_slug, make=False), d.session_tmp(long_slug, make=False)
+        other = d.session_tmp(d.cand.parent / "docs-y", make=False)
+        return len(a.name) <= 23 and a == b and a != other and a.parent == m.WORK / "tmp"
+    finally:
+        m.WORK = saved
+
+
+def c_tmp_guard(m):
+    # A WORK folder too long for the sandbox sockets is refused, not left to fail in every session.
+    d, saved = tmp_driver(m), m.WORK
+    m.WORK = Path("/tmp/" + "w" * 80)
+    try:
+        return raises(lambda: d.session_tmp(d.run_dir / "scout", make=False), "sandbox sockets")
+    finally:
+        m.WORK = saved
+
+
 CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_list, c_render_unknown,
           c_judge_none, c_judge_other_rc, c_judge_fail_needs_failure, c_judge_pass_needs_tests,
           c_judge_report_missing, c_result_commands_pass, c_result_unknown_kind, c_dispatch, c_paths_dash,
@@ -381,7 +411,7 @@ CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_l
           c_session_deny, c_ref_host, c_sweep, c_init_refusal, c_cmd_no_net, c_env_readonly, c_setup_key,
           c_requests_text, c_paths_at, c_filter_at, c_without_list, c_without_list_cargo, c_driver_error,
           c_report_word, c_skipped_not_gone, c_gate_missing, c_renamed_tests, c_setup_touched, c_issue_forms,
-          c_issue_refused, c_tools_key, c_unready_cleanup]
+          c_issue_refused, c_tools_key, c_unready_cleanup, c_tmp_short, c_tmp_guard]
 for fn in CHECKS:
     check(fn.__name__[2:], safe(fn, m))
 for name in ("pydantic-pydantic", "xerj-org-xerj"):
@@ -456,6 +486,8 @@ MUTANTS = [
      'self.prof.get("JAIL_ENV", ""),'),
     (c_unready_cleanup, 'if d.is_dir() and d.name not in ("cache", "cargo") and d != self.env_dir and not',
      'if False and d.name not in ("cache", "cargo") and d != self.env_dir and not'),
+    (c_tmp_short, 'f"cand-{hashlib.sha256(home.name.encode()).hexdigest()[:12]}"', 'f"cand-{home.name}"'),
+    (c_tmp_guard, "        if n + SOCK_NAME_ROOM > SOCK_PATH_MAX:", "        if False:"),
 ]
 for fn, old, new in MUTANTS:
     n = SRC.count(old)

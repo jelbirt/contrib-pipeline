@@ -1077,6 +1077,11 @@ def judge_test(rc, counts, expect, prof, report=True):
     return True, ""
 
 
+# Claude Code makes its sandbox bridge sockets in the session's TMPDIR, named
+# claude-socks-<16 hex>.sock (a slash plus 34 characters); a Unix socket path holds at most 107.
+SOCK_NAME_ROOM, SOCK_PATH_MAX = 35, 107
+
+
 class Driver:
     # Defaults for drivers built without __init__ (unit checks); __init__ sets them from the profile.
     commands = False
@@ -1714,6 +1719,7 @@ class Driver:
         self.trim_kept_builds()
         self.ensure_ledger_ignores()
         gb = c_free_gb()
+        self.session_tmp(self.run_dir / "scout", make=False)   # the longest scratch path fits the sockets
         if gb < int(self.prof.get("START_GB", 32)) and not (self.args.stub and not self.args.real_requests):
             raise RuntimeError(f"C: has {gb} GB free, below the {self.prof.get('START_GB', 32)} GB start floor")
         if not shutil.which(self.args.claude):
@@ -2244,6 +2250,7 @@ class Driver:
         corrects it. The driver checks only that each source is real, keeps the rules with one
         that is, and writes the profile and its review. Approves nothing."""
         home = self.run_dir / "learn"
+        self.session_tmp(home, make=False)   # the scratch path fits the sandbox sockets, before any fetch
         sdir, bdir = home / "session", home / "bundle"
         self.learn_written = []   # what a failure part way through has left, for its message
         sdir.mkdir(parents=True, exist_ok=True)
@@ -2523,8 +2530,17 @@ class Driver:
         """The session's scratch folder: its own, outside the shared /tmp/claude-<uid> (which is
         hidden from it), removed when the candidate or the scout finishes and swept at start."""
         scout = self.run_dir / "scout"
-        d = WORK / "tmp" / (f"scout-{self.run_id}" if home == scout else f"learn-{self.run_id}"
-                            if home == self.run_dir / "learn" else f"cand-{home.name}")
+        # A fixed-length name: Claude Code puts its sandbox bridge sockets in this folder, and a
+        # long slug once pushed their path past the Unix socket limit, so no sandboxed command ran.
+        rid = self.run_id.replace("-", "")
+        d = WORK / "tmp" / (f"scout-{rid}" if home == scout else f"learn-{rid}"
+                            if home == self.run_dir / "learn" else
+                            f"cand-{hashlib.sha256(home.name.encode()).hexdigest()[:12]}")
+        n = len(os.fsencode(d))     # the socket limit counts bytes, not characters
+        if n + SOCK_NAME_ROOM > SOCK_PATH_MAX:
+            raise RuntimeError(f"the session scratch folder {d} is {n} bytes long; the sandbox sockets made "
+                               f"in it need it to be at most {SOCK_PATH_MAX - SOCK_NAME_ROOM} "
+                               f"(set CONTRIB_WORK to a shorter folder)")
         if make:
             d.mkdir(mode=0o700, parents=True, exist_ok=True)
         return d

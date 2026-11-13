@@ -294,8 +294,12 @@ build. What changed from the sections above:
 - **Tags.** Fetches out of session clones use `--no-tags`, and publish names every ref in
   full (`refs/heads/fix/<slug>`, `refs/remotes/upstream/main`), so a session's tag cannot
   stand in for the branch.
-- **Temp folders.** Named `cand-<slug>` and `scout-<run id>`, removed at finish and after
-  the scout on any exit, and swept at the next start. The Read tool is also denied all of
+- **Temp folders.** Named `cand-<12 hex of the slug's sha256>`, `scout-<run id>` and
+  `learn-<run id>` (run id without dashes), removed at finish and after the scout on any
+  exit, and swept at the next start. The names are short and fixed in length because
+  Claude Code makes its sandbox sockets in this folder: a 40-character slug once pushed
+  their path past the 107-byte Unix socket limit, and every sandboxed command in the session
+  failed. The driver refuses a CONTRIB_WORK too long for them, at start and before each session. The Read tool is also denied all of
   `/tmp/claude-<uid>`.
 - **Ignored-files log** leaves out the sandbox mask names, so real leftovers show.
 

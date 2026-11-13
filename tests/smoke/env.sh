@@ -2,7 +2,7 @@
 # never in the real ledger, work dir or pipeline clone.
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 SMOKE=${SMOKE:-$HOME/contrib-smoke}
-export CONTRIB_LEDGER=$SMOKE/ledger CONTRIB_WORK=$SMOKE/work CONTRIB_PROFILE_DIR=$SMOKE/profiles \
+export CONTRIB_LEDGER=$SMOKE/ledger CONTRIB_WORK=$SMOKE/w CONTRIB_PROFILE_DIR=$SMOKE/profiles \
        CONTRIB_TRANSCRIPTS=$SMOKE/tr STUB_LOG=$SMOKE/stub.log
 mkdir -p "$CONTRIB_LEDGER" "$CONTRIB_WORK" "$CONTRIB_PROFILE_DIR" "$CONTRIB_TRANSCRIPTS"
 cp "$ROOT"/contrib-one/profiles/* "$CONTRIB_PROFILE_DIR"/
