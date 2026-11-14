@@ -44,7 +44,7 @@ runs: nothing is deleted that cannot be recovered, and `--resume` continues.
   cost, and a link to each packet. Each candidate: `candidates/<slug>/` holds the driver's
   `state.json`, `results/` and `gh/`, and the session's `session/packet.md` (the user's review,
   in the shape `rules/packet.md` sets), `session/details.md` (the full record behind it),
-  `session/PR_BODY.md` and `session/evidence/`. The work itself is on the branch, kept in `~/contrib-work/repos/xerj`.
+  `session/PR_BODY.md` and `session/evidence/`. The work itself is on the branch, kept in the pipeline clone (the profile's `REPO_DIR`).
 - Exit codes: 0 done, 10 soft stop, 20 hard stop, 30 shutdown could not clean everything
   (QUEUE.md's banner says what is left).
 

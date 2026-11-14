@@ -23,7 +23,7 @@ Nothing is pushed or posted without the user's explicit "push and open".
   them. Everything the stages need is restated in the skills and the repo profile.
 
 ## Components
-1. **Driver script** (bash, on WSL; started by hand or cron). It, not the model, runs every
+1. **Driver script** (Python, `bin/contrib-run`, on WSL; started by hand or cron). It, not the model, runs every
    build and test (a model Bash call times out at 10 min, and the guard can wait 30). Preflight each round: disk
    and memory via the guard's numbers, `gh auth status`, fetch upstream. Runs one fresh
    `claude -p` session per stage with a pinned model and permission mode. When and how it

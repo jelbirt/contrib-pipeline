@@ -237,7 +237,7 @@ refused.
 
 # SPEC: phase 2, the pipeline runs any repo's own test, lint and format commands
 
-**Proposed 2026-11-12, waiting for your approval.**
+**Built 2026-11-12 (decisions below).**
 
 ## Objective
 
@@ -386,7 +386,7 @@ one; 5A pydantic's `MAX_OPEN` is 2. The questions as they were asked:
 4. The shallow pipeline clone: unshallow it once.
 5. pydantic's `MAX_OPEN` is 10.
 
-# Phase 3: publish any repo (proposed 2026-11-13)
+# Phase 3: publish any repo (built 2026-11-13)
 
 ## Objective
 `contrib-publish`, `contrib-check` and `contrib-run --retest` work for any profiled repo, with
@@ -410,8 +410,8 @@ driver's fixed session deny list loses `xerj` and `cargo`; they move to profiles
 ## Pieces
 1. **contrib-check** reads the four path keys from the profile, and `contrib-check --where <slug>`
    prints the candidate's pipeline clone, user checkout, upstream repo, fork owner and base
-   branch, so the skill never types a path or repo name. New `tests/smoke/unit_check.py`
-   (it has no tests today), with xerj's verdicts pinned before the move.
+   branch, so the skill never types a path or repo name. New `tests/smoke/unit_check.py`,
+   with xerj's verdicts pinned before the move.
 2. **Retest in commands mode**: a fresh clone of the branch, or a trial merge with the
    current base; the dependency setup for that base; then the same runs as the final gate
    (gate checks, the passing test requests replayed, the changed test files), with the same
