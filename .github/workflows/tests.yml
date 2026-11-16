@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # Pinned: the sandbox step below depends on Ubuntu 24.04's AppArmor setting.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The jail checks in unit_fetch.py start real bubblewrap sandboxes. Ubuntu 24.04 blocks
+      # unprivileged user namespaces through AppArmor by default, so this runner allows them.
+      - name: Install bubblewrap and allow user namespaces
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # The sandbox always mounts these; the image has them, this makes sure.
+          mkdir -p "$HOME/.rustup" "$HOME/.cargo/bin"
+
+      # The runner's Python 3.12 matches the driver's target; the driver uses only the stdlib.
+      - name: Unit files
+        env:
+          CONTRIB_REQUIRE_BWRAP: "1"   # a missing bwrap fails instead of skipping the jail checks
+        run: tests/smoke/units.sh

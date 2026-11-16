@@ -127,6 +127,8 @@ if shutil.which("bwrap"):
     fresh(); ok_git = subprocess.run(d.cargo_jail(f"git -C {c} rev-parse HEAD"), capture_output=True, text=True, timeout=60)
     head = g("rev-parse", "HEAD", cwd=c).stdout.strip()
     check(f"git in a build jail reads the bound copy (rc {ok_git.returncode})", ok_git.stdout.strip() == head)
+elif os.environ.get("CONTRIB_REQUIRE_BWRAP"):
+    check("bwrap is installed (CONTRIB_REQUIRE_BWRAP is set)", False)
 else:
     print("SKIP build jail checks: bwrap is not installed")
 print("ALL PASS" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)

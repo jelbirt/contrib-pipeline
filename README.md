@@ -1,5 +1,7 @@
 # contrib-pipeline
 
+[![tests](https://github.com/jelbirt/contrib-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/jelbirt/contrib-pipeline/actions/workflows/tests.yml)
+
 An unattended pipeline that finds, reproduces and fixes small defects in an open source
 repository, and leaves each fix as a reviewed packet for a person to publish. Every Claude
 session it starts runs in a sandbox with no way to push, open a pull request or post; the
@@ -8,6 +10,23 @@ interactive step that pushes only on an explicit "push and open".
 
 It runs as two Claude Code skills: `contrib-one` (the unattended run) and `contrib-publish`
 (publishing a finished packet with you).
+
+**First result:** a docs fix approved by a pydantic maintainer and awaiting merge as of
+2026-11-15, [pydantic/pydantic#14276](https://github.com/pydantic/pydantic/pull/14276). The
+whole story, with every stop and fix and what each step cost, is in
+[docs/case-study-pydantic.md](docs/case-study-pydantic.md).
+
+## What this project demonstrates
+
+| Area | Where to look |
+|---|---|
+| **Orchestrating AI agents** | A driver runs a chain of headless Claude sessions (scout, investigate, fix, finish) that hand off through files, with a separate reviewer for each change and a learn step that turns a repo's guides and PR history into rules a person approves. `contrib-one/bin/contrib-run`, `contrib-one/stages/` |
+| **Sandboxing and threat modeling** | Every session runs in a bubblewrap sandbox with no way to push or post and network access only to an allowlist of domains; the driver treats whatever a session writes as untrusted input. 13 recorded review rounds, with exploit tests for the holes they found. `contrib-one/DESIGN.md`, `notes/review-r10.md`, `tests/exploit/` |
+| **Checking AI claims with code** | The driver never takes the model's word for a test result: it runs every build and test itself, records them, and re-runs them on a fresh clone before a change can be marked ready. |
+| **Automated testing** | Unit checks for the driver's guards, many paired with a mutant (a copy of the driver with that guard removed, which the check must catch), and an end-to-end suite that runs the whole driver against a stub Claude. `tests/smoke/` |
+| **CI** | GitHub Actions runs the unit checks, including real sandbox checks, on every push. `.github/workflows/tests.yml` |
+| **Measurement** | Every run writes a summary of cost, denials and driver requests per session; learned rules are scored against a hand-written baseline. `tests/learn/` |
+| **Working with a person** | The pipeline never publishes by itself. It stops with one clear question when it needs a decision, and publishing pushes only on an explicit "push and open". `contrib-publish/SKILL.md` |
 
 ## How it works
 
@@ -76,6 +95,8 @@ This is set up for one machine and has not been tuned for others:
 | `SPEC.md` | The specs for learning rules (phase 1), running any repo's own commands (phase 2) and publishing any repo (phase 3). |
 | `contrib-one/DESIGN.md` | The full design and the record of every review round. |
 | `notes/` | Findings from the first real run and the whole-pipeline review. |
+| `docs/` | Case studies of real runs. |
+| `.github/workflows/tests.yml` | CI: the unit checks on every push. |
 
 ## Install
 
@@ -148,11 +169,18 @@ sets `FORK_CI=1`, shows you the PR title and body, and runs `contrib-push` only 
 From the repo root:
 
 ```bash
-fail=0; for f in tests/smoke/unit*.py; do python3 -I "$f" contrib-one/bin/contrib-run || fail=1; done; [ "$fail" = 0 ]
+tests/smoke/units.sh
 bash tests/smoke/suite.sh
 ```
+
+CI runs `units.sh` on every push (Ubuntu 24.04, with bubblewrap, so the sandbox checks run
+for real). The suite runs only locally, because it needs the xerj pipeline clone.
 
 The suite needs no GitHub access and no real Claude, but it copies the xerj pipeline clone
 (the xerj profile's `REPO_DIR`, with an `upstream` remote) and needs bwrap and socat. It
 prints `SUITE PASS` and leaves its files in `~/contrib-smoke/<stamp>`. Both commands must
 pass before every commit.
+
+## License
+
+[Apache-2.0](LICENSE).
