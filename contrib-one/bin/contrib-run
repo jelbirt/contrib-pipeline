@@ -535,9 +535,21 @@ def review_lines(raw):
             if isinstance(x, str) and one_line(x)][:REVIEW_MAX_LINES]
 
 
+def session_ms(res):
+    """How long a session turn took, as the driver timed it from launch to exit. Claude Code's own
+    duration_ms leaves out the time a session spends waiting on its subagents, so a scout that hands
+    its searching to subagents looks like seconds of work. Records from before the driver timed
+    turns have only duration_ms."""
+    v = res.get("driver_wall_ms")
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        return v
+    v = res.get("duration_ms")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
 def cost_text(res):
     cost = res.get("total_cost_usd")
-    return (f"{res.get('num_turns', '?')} turns, {round((res.get('duration_ms') or 0) / 60000, 1)} min"
+    return (f"{res.get('num_turns', '?')} turns, {round(session_ms(res) / 60000, 1)} min"
             + (f", about ${cost:.2f}" if isinstance(cost, (int, float)) else ""))
 
 
@@ -2604,13 +2616,23 @@ class Driver:
         self.log(f"session {stage}: turn starts ({model})")
         env = self.claude_env()
         env["CLAUDE_CODE_TMPDIR"] = env["TMPDIR"] = str(stmp)
+        t0 = time.monotonic()
         rc = self.run_tracked("session", cmd, cwd=str(cwd), env=env, timeout=LEARN_TIMEOUT if learn else TURN_TIMEOUT, out=out,
                               err_apart=True)
+        wall_ms = int((time.monotonic() - t0) * 1000)
         text = out.read_text(errors="replace") if out.exists() else ""
         err = Path(str(out) + ".err").read_text(errors="replace")[-4000:] if Path(str(out) + ".err").exists() else ""
         res = read_json(out, None)
-        if not isinstance(res, dict):
-            res = {"is_error": True, "result": text[-2000:]}
+        if isinstance(res, dict):
+            res["driver_wall_ms"] = wall_ms     # the run summary reads it back from this record
+            write_json(out, res)
+        else:
+            # No result (a timeout, a hard stop, a crash): the raw output is kept beside the record,
+            # and the record still carries the turn's time, so the summary counts it.
+            res = {"is_error": True, "result": text[-2000:], "driver_wall_ms": wall_ms}
+            if out.exists():
+                out.replace(Path(str(out) + ".raw"))
+            write_json(out, res)
         res["_rc"] = rc
         msg = str(res.get("result", ""))
         if new_sid:
@@ -4088,7 +4110,7 @@ class Driver:
                     continue
                 p["turns"] += 1
                 p["mt"] += d.get("num_turns") or 0
-                p["ms"] += d.get("duration_ms") or 0
+                p["ms"] += session_ms(d)
                 p["after"][sid] = max(p["after"].get(sid, 0.0), cost)
                 for x in d.get("permission_denials") or []:
                     if isinstance(x, dict):

@@ -326,7 +326,12 @@ Changes since:
 - **Audit trail.** Transcripts and subagent transcripts are gzipped into the candidate folder
   (Claude Code deletes its own after 30 days); `runs/<id>/SUMMARY.md` lists sessions, turns,
   minutes, cost (this run's share of each session's cumulative figure), denials and driver
-  requests. The ledger is committed again after shutdown and after the exit line.
+  requests. The ledger is committed again after shutdown and after the exit line. Session
+  minutes are the driver's own time for each turn, launch to exit, waits on subagents
+  included (`driver_wall_ms` in each sessions/ record): Claude Code's `duration_ms` leaves
+  those waits out, so the first pydantic run's scout read 0.2 min for nearly 6. Older
+  records fall back to `duration_ms`. A turn that ended with no result (a timeout or a stop)
+  still gets a record with its time; its raw output is kept beside it as `.json.raw`.
 - **Instructions.** Sessions are told to read ES source with WebFetch (curl is denied), to make
   needs-you questions stand alone, and to treat the scout's suggested fix as a hypothesis.
 - **Tests.** `tests/stub-claude` is the permanent stub; stub runs covered the happy path,

@@ -598,6 +598,71 @@ def c_home_words(m):
                  "USER_REPO_DIR": f"{h}/q", "PR_FIRST_LINE": "about ~ 5 min, see ~/notes"}
 
 
+# ----- session minutes: the driver times each turn itself -----------------------------------------
+def session_driver(m, out_text):
+    """A driver whose session launch writes out_text as Claude Code's result, after 0.3 s."""
+    import time
+    d = tmp_driver(m)
+    home = d.run_dir / "scout"
+    (home / "sessions").mkdir(parents=True, exist_ok=True)
+    d.session_tmp = lambda h, make=True: t / "stmp"
+    d.settings_for = lambda *a, **k: {}
+    d.claude_cmd = lambda *a, **k: ["claude"]
+    d.claude_env = lambda: {}
+    d.transcripts = lambda sid: []
+    def run(role, cmd, out=None, **k):
+        time.sleep(0.3)
+        Path(out).write_text(out_text)
+        return 0
+    d.run_tracked = run
+    return d, home
+
+
+def c_session_wall(m):
+    # A scout that waited 0.3 s on its subagents reports duration_ms 5; the driver's own time is kept,
+    # in the result and in the record the summary reads.
+    d, home = session_driver(m, json.dumps({"session_id": "s1", "duration_ms": 5, "num_turns": 1}))
+    res = d.session("scout", t, "p", "s", "m", [], None, home)
+    rec = json.loads(next((home / "sessions").glob("scout-*.json")).read_text())
+    return (300 <= res.get("driver_wall_ms", 0) < 5000 and rec.get("driver_wall_ms") == res["driver_wall_ms"]
+            and rec.get("session_id") == "s1" and rec.get("duration_ms") == 5)
+
+
+def c_session_wall_error(m):
+    # A turn whose output is not a result (a timeout, a stop) still has its time in its record, which
+    # the summary reads, and its raw output is kept beside the record.
+    d, home = session_driver(m, "not json")
+    res = d.session("scout", t, "p", "s", "m", [], None, home)
+    recs = sorted((home / "sessions").glob("scout-*.json"))
+    rec = json.loads(recs[-1].read_text()) if recs else {}
+    raw = Path(str(recs[-1]) + ".raw") if recs else None
+    return (res.get("driver_wall_ms", 0) >= 300 and rec.get("driver_wall_ms") == res["driver_wall_ms"]
+            and rec.get("is_error") is True and raw.is_file() and raw.read_text() == "not json")
+
+
+def c_minutes_text(m):
+    # The learn report's minutes come from the driver's time; an older record falls back to duration_ms.
+    return ("4.0 min" in m.cost_text({"num_turns": 3, "duration_ms": 12000, "driver_wall_ms": 240000})
+            and "0.2 min" in m.cost_text({"num_turns": 3, "duration_ms": 12000})
+            and "0.2 min" in m.cost_text({"num_turns": 3, "duration_ms": 12000, "driver_wall_ms": True}))
+
+
+def c_summary_wall(m):
+    # The run summary's session minutes use the driver's time: the run 1 scout read 0.2 min, not 5.8.
+    import time
+    d = tmp_driver(m)
+    d.run_id = "2026-11-12-000001"      # a run of its own: no other check's session records
+    d.run_dir = d.run_dir.parent / d.run_id
+    d.t_start, d.stop_kind, d.stop_reason, d.done = time.time() - 60, None, "finished", []
+    d.run_dir.mkdir(parents=True, exist_ok=True)
+    sess = d.run_dir / "scout" / "sessions"; sess.mkdir(parents=True, exist_ok=True)
+    (sess / f"scout-{int(time.time())}.json").write_text(json.dumps(
+        {"session_id": "s1", "total_cost_usd": 2.46, "num_turns": 3, "duration_ms": 13892, "driver_wall_ms": 350000}))
+    d.write_summary()
+    sm = (d.run_dir / "SUMMARY.md").read_text()
+    return "| scout | scout | 1 | 3 | 5.8 | 2.46 | 0 |" in sm and "the sessions worked 6 min" in sm
+
+
 CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_list, c_render_unknown,
           c_judge_none, c_judge_other_rc, c_judge_fail_needs_failure, c_judge_pass_needs_tests,
           c_judge_report_missing, c_result_commands_pass, c_result_unknown_kind, c_dispatch, c_paths_dash,
@@ -609,7 +674,7 @@ CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_l
           c_report_word, c_skipped_not_gone, c_gate_missing, c_renamed_tests, c_setup_touched, c_issue_forms,
           c_issue_refused, c_tools_key, c_unready_cleanup, c_tmp_short, c_tmp_guard,
           c_all_skipped_note, c_final_checks_cleared, c_final_checks_call, c_answer_limit, c_deny_text,
-          c_home_words]
+          c_home_words, c_session_wall, c_session_wall_error, c_minutes_text, c_summary_wall]
 for fn in CHECKS:
     check(fn.__name__[2:], safe(fn, m))
 for name in ("pydantic-pydantic", "xerj-org-xerj"):
@@ -714,6 +779,14 @@ MUTANTS = [
     (c_deny_text, "*self.deny_text(), packet,", "packet,"),
     (c_home_words, "env[k] = home_words(v) if k in PATH_KEYS else v", "env[k] = v"),
     (c_home_words, "env[k] = home_words(v) if k in PATH_KEYS else v", "env[k] = home_words(v)"),
+    (c_session_wall, '            res["driver_wall_ms"] = wall_ms     # the run summary reads it back from this record\n'
+                     "            write_json(out, res)\n", "            pass\n"),
+    (c_session_wall_error, '"result": text[-2000:], "driver_wall_ms": wall_ms}', '"result": text[-2000:]}'),
+    (c_session_wall_error, "                out.replace(Path(str(out) + \".raw\"))\n            write_json(out, res)\n",
+     "                pass\n"),
+    (c_minutes_text, "round(session_ms(res) / 60000, 1)", "round((res.get('duration_ms') or 0) / 60000, 1)"),
+    (c_minutes_text, "if isinstance(v, int) and not isinstance(v, bool) and v >= 0:", "if isinstance(v, int) and v >= 0:"),
+    (c_summary_wall, 'p["ms"] += session_ms(d)', 'p["ms"] += d.get("duration_ms") or 0'),
 ]
 for fn, old, new in MUTANTS:
     n = SRC.count(old)
