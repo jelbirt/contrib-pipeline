@@ -17,10 +17,10 @@ jobs:
 
       # The jail checks in unit_fetch.py start real bubblewrap sandboxes. Ubuntu 24.04 blocks
       # unprivileged user namespaces through AppArmor by default, so this runner allows them.
-      - name: Install bubblewrap and allow user namespaces
+      - name: Install bubblewrap and socat, and allow user namespaces
         run: |
           sudo apt-get update -q
-          sudo apt-get install -yq bubblewrap
+          sudo apt-get install -yq bubblewrap socat
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           # The sandbox always mounts these; the image has them, this makes sure.
           mkdir -p "$HOME/.rustup" "$HOME/.cargo/bin"
