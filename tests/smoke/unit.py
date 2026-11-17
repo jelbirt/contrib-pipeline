@@ -24,6 +24,9 @@ class Cand: name = "t"
 d.cand = Cand()
 c = t / "clone"; subprocess.run(["git", "init", "-q", str(c)], check=True)
 d.clone = lambda: c
+# A real repository outside the clone for the plants to point at: git resolves a pointer to it, so
+# only the driver's own checks can refuse one (a missing target makes git itself fail instead).
+v = t / "victim"; subprocess.run(["git", "init", "-q", str(v)], check=True)
 # git_dir_check asks git (in the jail, during a run) where the git dir is; here plain host git.
 d.cgit = lambda *a, check=True, **k: subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True).stdout.strip()
 def refused():
@@ -32,14 +35,21 @@ def refused():
     except RuntimeError:
         return True
 check("plain clone accepted", not refused())
-(c / ".git" / "commondir").write_text("/home/user/xerj/.git\n"); check("commondir refused", refused())
+(c / ".git" / "commondir").write_text(f"{v}/.git\n"); check("commondir refused", refused())
 (c / ".git" / "commondir").unlink()
-(c / ".git" / "objects" / "info" / "alternates").write_text("/home/user/xerj/.git/objects\n"); check("alternates refused", refused())
+# ...and it is the commondir check that refuses it: a copy of the driver without that check lets it through.
+mp = t / "cr-no-commondir"
+mp.write_text(Path(drv).read_text().replace('for rel in ("commondir", "gitdir",', 'for rel in ("gitdir",', 1))
+ld2 = importlib.machinery.SourceFileLoader("cr2", str(mp)); mm = importlib.util.module_from_spec(importlib.util.spec_from_loader("cr2", ld2)); ld2.exec_module(mm)
+(c / ".git" / "commondir").write_text(f"{v}/.git\n"); d.__class__ = mm.Driver
+check("without the commondir check the plant gets through, so the check above tests it", not refused())
+d.__class__ = m.Driver; (c / ".git" / "commondir").unlink()
+(c / ".git" / "objects" / "info" / "alternates").write_text(f"{v}/.git/objects\n"); check("alternates refused", refused())
 (c / ".git" / "objects" / "info" / "alternates").unlink()
-os.symlink("/home/user/xerj/.git/refs/heads", c / ".git" / "refs" / "x"); check("symlinked ref folder refused", refused())
+os.symlink(f"{v}/.git/refs/heads", c / ".git" / "refs" / "x"); check("symlinked ref folder refused", refused())
 os.unlink(c / ".git" / "refs" / "x")
 check("clean again accepted", not refused())
-(c / ".git" / "objects" / "ab").mkdir(exist_ok=True); os.symlink("/home/user/xerj/.git/objects", c / ".git" / "objects" / "ab" / "x")
+(c / ".git" / "objects" / "ab").mkdir(exist_ok=True); os.symlink(f"{v}/.git/objects", c / ".git" / "objects" / "ab" / "x")
 check("symlink deep in objects refused", refused()); os.unlink(c / ".git" / "objects" / "ab" / "x")
 (c / ".git" / "HEAD").write_text("garbage\n"); (c / "HEAD").write_text("ref: refs/heads/main\n"); (c / "refs").mkdir(); (c / "objects").mkdir()
 check("fake repository at the clone root refused", refused())

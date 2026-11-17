@@ -586,6 +586,18 @@ def c_deny_text(m):
             and "Commands blocked" not in bare.system_text("C-finish.md"))
 
 
+
+def c_home_words(m):
+    """In a path key, a word that is ~ or starts with ~/ is the home folder; ~user and a ~ inside a
+    word are not. A text key keeps its ~ as written."""
+    p = Path(tempfile.mkdtemp()) / "p.env"
+    p.write_text("REPO_DIR=~/x   # note\nTOOLS=~/a ~/b\nGUARD=~ x~/y ~user/z\nUSER_REPO_DIR=\"~/q\"\n"
+                 "PR_FIRST_LINE=about ~ 5 min, see ~/notes\n")
+    e, h = m.load_env(p), str(m.HOME)
+    return e == {"REPO_DIR": f"{h}/x", "TOOLS": f"{h}/a {h}/b", "GUARD": f"{h} x~/y ~user/z",
+                 "USER_REPO_DIR": f"{h}/q", "PR_FIRST_LINE": "about ~ 5 min, see ~/notes"}
+
+
 CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_list, c_render_unknown,
           c_judge_none, c_judge_other_rc, c_judge_fail_needs_failure, c_judge_pass_needs_tests,
           c_judge_report_missing, c_result_commands_pass, c_result_unknown_kind, c_dispatch, c_paths_dash,
@@ -596,7 +608,8 @@ CHECKS = [c_missing_key, c_paths_word, c_unknown_slot, c_gate_checks, c_render_l
           c_requests_text, c_paths_at, c_filter_at, c_without_list, c_without_list_cargo, c_driver_error,
           c_report_word, c_skipped_not_gone, c_gate_missing, c_renamed_tests, c_setup_touched, c_issue_forms,
           c_issue_refused, c_tools_key, c_unready_cleanup, c_tmp_short, c_tmp_guard,
-          c_all_skipped_note, c_final_checks_cleared, c_final_checks_call, c_answer_limit, c_deny_text]
+          c_all_skipped_note, c_final_checks_cleared, c_final_checks_call, c_answer_limit, c_deny_text,
+          c_home_words]
 for fn in CHECKS:
     check(fn.__name__[2:], safe(fn, m))
 for name in ("pydantic-pydantic", "xerj-org-xerj"):
@@ -699,6 +712,8 @@ MUTANTS = [
      "        return act, problems"),
     (c_answer_limit, 'return 1 if getattr(self, "answer_cand", None) else self.args.limit', "return self.args.limit"),
     (c_deny_text, "*self.deny_text(), packet,", "packet,"),
+    (c_home_words, "env[k] = home_words(v) if k in PATH_KEYS else v", "env[k] = v"),
+    (c_home_words, "env[k] = home_words(v) if k in PATH_KEYS else v", "env[k] = home_words(v)"),
 ]
 for fn, old, new in MUTANTS:
     n = SRC.count(old)

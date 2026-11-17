@@ -20,6 +20,7 @@ fi
 # real clone repacks, the copy alone holds the old ones, so suite.sh deletes it when it passes.
 PROFILE=$CONTRIB_PROFILE_DIR/xerj-org-xerj.env
 REAL_REPO=$(sed -n 's/^REPO_DIR=\([^[:space:]]*\).*/\1/p' "$ROOT/contrib-one/profiles/xerj-org-xerj.env")
+REAL_REPO=${REAL_REPO/#\~\//$HOME/}   # the profile's ~/ means the home folder
 SMOKE_REPO=$SMOKE/repo
 case $SMOKE_REPO in *[!A-Za-z0-9/._-]*)
   echo "refusing: $SMOKE has characters the profile rewrite cannot carry"; return 2;; esac

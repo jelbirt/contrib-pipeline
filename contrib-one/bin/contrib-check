@@ -66,6 +66,9 @@ CLAIM_WORDS = ("i'll take", "i will take", "working on", "i'm on it", "im on it"
                "can i take", "i'd like to work", "i would like to work", "picking this up", "opened #",
                "pr incoming", "draft pr")
 
+PATH_KEYS = ("REPO_DIR", "USER_REPO_DIR", "GUARD", "TOOLS")   # profile keys where ~/ is the home folder
+HOME_WORD = re.compile(r"(?<!\S)~(?=/|\s|$)")   # ~ or ~/... as a whole word, as a shell expands it
+
 
 def load(slug):
     """A candidate's folder, state.json and repo profile, with the keys this script needs checked."""
@@ -79,7 +82,8 @@ def load(slug):
         line = "" if line.lstrip().startswith("#") else line.split(" #", 1)[0].strip()
         if "=" in line:          # read as contrib-run's load_env reads it
             k, v = line.split("=", 1)
-            prof[k.strip()] = v.strip().strip('"').strip("'")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            prof[k] = HOME_WORD.sub(lambda _: str(Path.home()), v) if k in PATH_KEYS else v
     missing = [k for k in NEEDED if not prof.get(k)]
     if missing:
         fail(f"the {s['repo']} profile has no {', '.join(missing)}")

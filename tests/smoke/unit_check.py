@@ -152,6 +152,22 @@ rc, out = run("--where", "../" + slug)
 check("where_bad_slug", rc == 2 and "bad slug" in out)
 
 
+def home_test(src=None):
+    """A path key's ~/ is the home folder, as contrib-run reads it; other keys keep their ~."""
+    s2 = case(PYD.replace("USER_REPO_DIR=/home/u/p it's", "USER_REPO_DIR=~/p").replace("CONTRIBUTOR=me", "CONTRIBUTOR=~/me"),
+              dict(DOC))
+    rc, out = run("--where", s2, src=src)
+    return rc == 0 and f"USER_REPO_DIR={ENV['HOME']}/p\n" in out and "CONTRIBUTOR='~/me'\n" in out
+
+
+check("where_home", home_test())
+DRV = Path(sys.argv[1]).read_text()
+for line in ("PATH_KEYS = ", "HOME_WORD = "):
+    mine = [x for x in SRC.splitlines() if x.startswith(line)]
+    check(f"contrib-check's {line.split()[0]} is word for word the driver's",
+          len(mine) == 1 and mine[0] in DRV.splitlines())
+
+
 def where_quiet(src=None):
     """A failed --where prints nothing on stdout, so a caller's eval runs nothing."""
     path = CHK
@@ -212,6 +228,9 @@ mutant("setup_moved", "retest = bool(area_moved or setup_moved)", "retest = bool
 mutant("area_moved", "retest = bool(area_moved or setup_moved)", "retest = bool(setup_moved)", area_test)
 mutant("slug", 'if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug or ""):', "if False:", slug_test)
 mutant("where_quiet", "out = sys.stderr if WHERE_MODE else sys.stdout", "out = sys.stdout", where_quiet)
+mutant("home", "prof[k] = HOME_WORD.sub(lambda _: str(Path.home()), v) if k in PATH_KEYS else v", "prof[k] = v", home_test)
+mutant("home_keys", "prof[k] = HOME_WORD.sub(lambda _: str(Path.home()), v) if k in PATH_KEYS else v",
+       "prof[k] = HOME_WORD.sub(lambda _: str(Path.home()), v)", home_test)
 mutant("areas_group", 'if key == "AREAS" and groups < 1:', "if False:", group_test)
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

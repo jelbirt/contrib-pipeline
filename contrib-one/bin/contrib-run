@@ -107,13 +107,25 @@ def now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+PATH_KEYS = ("REPO_DIR", "USER_REPO_DIR", "GUARD", "TOOLS")   # profile keys where ~/ is the home folder
+HOME_WORD = re.compile(r"(?<!\S)~(?=/|\s|$)")   # ~ or ~/... as a whole word, as a shell expands it
+
+
+def home_words(v):
+    """v with each word that is ~ or starts with ~/ given the home folder, as a shell does, so a
+    profile can name paths without naming anyone's home. ~user and a ~ inside a word stay as they are.
+    Only PATH_KEYS get this: a text value such as PR_FIRST_LINE must never gain a home path."""
+    return HOME_WORD.sub(lambda _: str(HOME), v)
+
+
 def load_env(path):
     env = {}
     for line in Path(path).read_text().splitlines():
         line = "" if line.lstrip().startswith("#") else line.split(" #", 1)[0].strip()
         if "=" in line:
             k, v = line.split("=", 1)
-            env[k.strip()] = v.strip().strip('"').strip("'")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            env[k] = home_words(v) if k in PATH_KEYS else v
     return env
 
 

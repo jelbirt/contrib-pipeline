@@ -24,6 +24,9 @@ class Cand: name = "t"
 d.cand = Cand()
 c = t / "clone"; subprocess.run(["git", "init", "-q", str(c)], check=True)
 d.clone = lambda: c
+# A real repository outside the clone for the plants to point at: git resolves a pointer to it, so
+# only the driver's own checks can refuse one (a missing target makes git itself fail instead).
+v = t / "victim"; subprocess.run(["git", "init", "-q", str(v)], check=True)
 # git_dir_check asks git (in the jail, during a run) where the git dir is; here plain host git.
 d.cgit = lambda *a, check=True, **k: subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True).stdout.strip()
 def refused():
@@ -32,11 +35,11 @@ def refused():
     except RuntimeError:
         return True
 check("plain clone accepted", not refused())
-(c / ".git" / "commondir").write_text("/home/user/xerj/.git\n"); check("commondir refused", refused())
+(c / ".git" / "commondir").write_text(f"{v}/.git\n"); check("commondir refused", refused())
 (c / ".git" / "commondir").unlink()
-(c / ".git" / "objects" / "info" / "alternates").write_text("/home/user/xerj/.git/objects\n"); check("alternates refused", refused())
+(c / ".git" / "objects" / "info" / "alternates").write_text(f"{v}/.git/objects\n"); check("alternates refused", refused())
 (c / ".git" / "objects" / "info" / "alternates").unlink()
-os.symlink("/home/user/xerj/.git/refs/heads", c / ".git" / "refs" / "x"); check("symlinked ref folder refused", refused())
+os.symlink(f"{v}/.git/refs/heads", c / ".git" / "refs" / "x"); check("symlinked ref folder refused", refused())
 os.unlink(c / ".git" / "refs" / "x")
 check("clean again accepted", not refused())
 print("ALL PASS" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)

@@ -18,7 +18,7 @@ START_GB=${START_GB:-32}; FLOOR_GB=${FLOOR_GB:-20}
 MEM_FLOOR_MB=${MEM_FLOOR_MB:-2048}; SWAP_GROW_MB=${SWAP_GROW_MB:-${SWAP_CEIL_MB:-1536}}
 WAIT_SECS=${WAIT_SECS:-1800}; RETRIES=${RETRIES:-1}; JOBS=${JOBS:-4}
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/cc CC=/usr/bin/cc
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/home/user/xerj/engine/target} CARGO_BUILD_JOBS=$JOBS RUST_TEST_THREADS=${RUST_TEST_THREADS:-4}
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/xerj/engine/target} CARGO_BUILD_JOBS=$JOBS RUST_TEST_THREADS=${RUST_TEST_THREADS:-4}
 c_gb()   { df -BG --output=avail /mnt/c | tail -1 | tr -dc 0-9; }
 mem_mb() { awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo; }
 swap_mb(){ awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{print int((t-f)/1024)}' /proc/meminfo; }
