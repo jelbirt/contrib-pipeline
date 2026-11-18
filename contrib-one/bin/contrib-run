@@ -67,6 +67,7 @@ GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c"
 # itself is ignored by the ledger's git, so nothing a session plants there reaches git).
 RECORD_TOP = ("packet.md", "details.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json", "rules.json")
 LEDGER_IGNORES = ("candidates/*/session/", "runs/*/scout/session/", "candidates/*/gh/", "runs/*/scout/gh/",
+                  "candidates/*/.ignore", "runs/*/scout/.ignore",
                   "candidates/*/transcripts/", "runs/*/scout/transcripts/", "runs/*/learn/session/",
                   "runs/*/learn/review/", "runs/*/learn/bundle/", "runs/*/learn/transcripts/")
 GH_VERBS = {("issue", "view"), ("issue", "list"), ("pr", "view"), ("pr", "list"), ("pr", "diff"),
@@ -235,6 +236,134 @@ def one_line(s, n=300):
         s = "".join(" " if c.isspace() else c for c in s if c.isspace() or unicodedata.category(c)[0] != "C")
     s = re.sub(r"\s+", " ", s).strip().replace(EM_DASH, ",").replace(EN_DASH, "-")
     return s[:n]
+
+
+def quoted(s):
+    """Someone else's text (an issue body, a comment) kept multi-line with its indentation, with
+    control and format characters removed and every line quoted with "> ", so no line of it can
+    pass for one the driver wrote."""
+    s = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(s or "").replace("\r\n", "\n").replace("\r", "\n"))
+    if not s.isascii():
+        s = "".join(" " if c.isspace() and c not in "\n\t" else c for c in s
+                    if c.isspace() or unicodedata.category(c)[0] != "C")
+    s = s.strip("\n")
+    return "\n".join(("> " + x).rstrip() for x in s.split("\n")) if s.strip() else "> (empty)"
+
+
+def write_digests(dest, repo, limits=None):
+    """Readable copies of the gh snapshots in dest. gh writes each JSON file as one line (about
+    2 MB for 300 issues), which the Read tool cuts short and Grep can only return whole, and a
+    profile may deny the interpreters a session would parse it with. So the driver writes one
+    index line per item (issues.txt, prs.txt, mine.txt) to read whole and grep, and one file
+    per issue or PR (issues/<N>.md, prs/<N>.md) with its full text. An index says so when a
+    list reached its gh --limit (limits, by name). The ledger's .gitignore hides dest, and the
+    Grep tool honours it, so a Grep of the folder above dest would skip dest without a word: a
+    .ignore beside dest lets it back in."""
+    def load(name):
+        v = read_json(dest / f"{name}.json")
+        if not isinstance(v, list):
+            return None
+        return [x for x in v if isinstance(x, dict) and type(x.get("number")) is int and x["number"] > 0]
+
+    def who(a):
+        return one_line(a.get("login"), 40) or "-" if isinstance(a, dict) else "-"
+
+    def names(xs, key):
+        return ", ".join(one_line(x.get(key), 60) for x in (xs if isinstance(xs, list) else [])
+                         if isinstance(x, dict)) or "-"
+
+    def day(s):
+        return one_line(s, 10) or "-"
+
+    def num(v):
+        return str(v) if type(v) is int else "?"
+
+    def cut(name, items):
+        lim = (limits or {}).get(name)
+        if not lim or items is None or len(items) < lim:
+            return []
+        return [f"# {len(items)} listed: gh's limit of {lim} was reached, so older ones are not here. "
+                "Ask the driver for a gh read of any other."]
+
+    def ref(r):
+        if not isinstance(r, dict) or type(r.get("number")) is not int:
+            return None
+        rp = r.get("repository") if isinstance(r.get("repository"), dict) else {}
+        full = f"{who(rp.get('owner'))}/{one_line(rp.get('name'), 100)}"
+        return f"#{r['number']}" if full.lower() in (repo.lower(), "-/") else f"{full}#{r['number']}"
+
+    note = "Lines starting with > are the author's and commenters' own words, quoted as data."
+    for sub in ("issues", "prs"):
+        p = dest / sub
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.is_dir():
+            shutil.rmtree(p)
+        p.mkdir()
+    ig = dest.parent / ".ignore"
+    if ig.is_symlink():
+        ig.unlink()
+    if not ig.is_dir():
+        ig.write_text(f"!{dest.name}/\n")
+
+    issues = load("issues")
+    out = ["# Open issues, newest first, one per line: number | opened | updated | comments | assignees "
+           "| labels | title. Full text and comments: issues/<number>.md"] + cut("issues", issues)
+    for x in issues if issues is not None else []:
+        n, com = x["number"], [c for c in x.get("comments") or [] if isinstance(c, dict)]
+        out.append(f"#{n} | {day(x.get('createdAt'))} | upd {day(x.get('updatedAt'))} | {len(com)} comments "
+                   f"| assigned: {names(x.get('assignees'), 'login')} | {names(x.get('labels'), 'name')} "
+                   f"| {one_line(x.get('title'), 200)}")
+        md = [f"# Issue #{n}: {one_line(x.get('title'), 300)}", "",
+              f"- author: {who(x.get('author'))}", f"- opened: {one_line(x.get('createdAt'), 25)}",
+              f"- updated: {one_line(x.get('updatedAt'), 25)}",
+              f"- assignees: {names(x.get('assignees'), 'login')}", f"- labels: {names(x.get('labels'), 'name')}",
+              "", note, "", "## Body", "", quoted(x.get("body")), "", f"## Comments ({len(com)})"]
+        for c in com:
+            hidden = f" (hidden: {one_line(c.get('minimizedReason'), 40) or 'yes'})" if c.get("isMinimized") else ""
+            md += ["", f"### {who(c.get('author'))} ({one_line(c.get('authorAssociation'), 20).lower() or '-'}), "
+                       f"{one_line(c.get('createdAt'), 25)}{hidden}", "", quoted(c.get("body"))]
+        (dest / "issues" / f"{n}.md").write_text("\n".join(md) + "\n")
+    if issues is None:
+        out.append("# issues.json could not be read")
+    (dest / "issues.txt").write_text("\n".join(out) + "\n")
+
+    prs = load("prs")
+    out = ["# Open PRs, newest first, one per line: number | opened | author | open or draft | closes "
+           "| title | files. Full text and every file: prs/<number>.md; to find the PRs that change "
+           "a file, grep prs/ for its path."] + cut("prs", prs)
+    for x in prs if prs is not None else []:
+        n = x["number"]
+        files = [f for f in x.get("files") or [] if isinstance(f, dict)]
+        paths = [one_line(f.get("path"), 200) for f in files]
+        closes = ", ".join(r for r in map(ref, x.get("closingIssuesReferences") or []) if r) or "-"
+        shown = ", ".join(paths[:15]) + (f" (+{len(paths) - 15} more)" if len(paths) > 15 else "")
+        out.append(f"#{n} | {day(x.get('createdAt'))} | {who(x.get('author'))} "
+                   f"| {'draft' if x.get('isDraft') else 'open'} | closes {closes} | {one_line(x.get('title'), 200)} "
+                   f"| {len(paths)} files: {shown or '-'}")
+        md = [f"# PR #{n}: {one_line(x.get('title'), 300)}", "",
+              f"- author: {who(x.get('author'))}", f"- opened: {one_line(x.get('createdAt'), 25)}",
+              f"- branch: {one_line(x.get('headRefName'), 200) or '-'}",
+              f"- state: {'draft' if x.get('isDraft') else 'open'}", f"- closes: {closes}", "",
+              f"## Files ({len(files)})", ""]
+        md += [f"- {one_line(f.get('path'), 300)} (+{num(f.get('additions'))}/-{num(f.get('deletions'))}, "
+               f"{one_line(f.get('changeType'), 20).lower() or '-'})" for f in files] or ["- none listed"]
+        md += ["", note, "", "## Body", "", quoted(x.get("body"))]
+        (dest / "prs" / f"{n}.md").write_text("\n".join(md) + "\n")
+    if prs is None:
+        out.append("# prs.json could not be read")
+    (dest / "prs.txt").write_text("\n".join(out) + "\n")
+
+    mine = load("mine")
+    out = ["# The contributor's own recent PRs, one per line: number | state | opened | merged | title | files"]
+    out += cut("mine", mine)
+    for x in mine if mine is not None else []:
+        out.append(f"#{x['number']} | {one_line(x.get('state'), 12).lower() or '-'} | {day(x.get('createdAt'))} "
+                   f"| merged {day(x.get('mergedAt'))} | {one_line(x.get('title'), 200)} "
+                   f"| files: {names(x.get('files'), 'path')}")
+    if mine is None:
+        out.append("# mine.json could not be read")
+    (dest / "mine.txt").write_text("\n".join(out) + "\n")
 
 
 # The packet is the user's review of a candidate (rules/packet.md); stage C's output must have
@@ -2454,17 +2583,20 @@ class Driver:
         if self.args.stub:
             for n in ("issues", "prs", "mine"):
                 write_json(dest / f"{n}.json", [])
+            write_digests(dest, self.repo)
             return
-        issues = self.gh("issue", "list", "-R", self.repo, "--state", "open", "--limit", "300", "--json",
+        lim = {"issues": 300, "prs": 200, "mine": 50}
+        issues = self.gh("issue", "list", "-R", self.repo, "--state", "open", "--limit", str(lim["issues"]), "--json",
                          "number,title,body,labels,author,createdAt,updatedAt,comments,assignees")
-        prs = self.gh("pr", "list", "-R", self.repo, "--state", "open", "--limit", "200", "--json",
+        prs = self.gh("pr", "list", "-R", self.repo, "--state", "open", "--limit", str(lim["prs"]), "--json",
                       "number,title,body,author,createdAt,headRefName,files,isDraft,closingIssuesReferences")
         mine = self.gh("pr", "list", "-R", self.repo, "--author", self.prof["CONTRIBUTOR"], "--state", "all",
-                       "--limit", "50", "--json", "number,title,state,createdAt,mergedAt,files")
+                       "--limit", str(lim["mine"]), "--json", "number,title,state,createdAt,mergedAt,files")
         (dest / "issues.json").write_text(issues)
         (dest / "prs.json").write_text(prs)
         (dest / "mine.json").write_text(mine)
         (dest / "fetched.txt").write_text(now() + "\n")
+        write_digests(dest, self.repo, lim)
 
     # ----- sandboxed Claude sessions -------------------------------------------------
     def settings_for(self, write_dirs, clone, only=None):
