@@ -6,6 +6,8 @@ export CONTRIB_LEDGER=$SMOKE/ledger CONTRIB_WORK=$SMOKE/w CONTRIB_PROFILE_DIR=$S
        CONTRIB_TRANSCRIPTS=$SMOKE/tr STUB_LOG=$SMOKE/stub.log
 mkdir -p "$CONTRIB_LEDGER" "$CONTRIB_WORK" "$CONTRIB_PROFILE_DIR" "$CONTRIB_TRANSCRIPTS"
 cp "$ROOT"/contrib-one/profiles/* "$CONTRIB_PROFILE_DIR"/
+# The cases expect autonomous runs; the pause case sets RUN_MODE itself.
+sed -i '/^RUN_MODE=/d' "$CONTRIB_PROFILE_DIR"/*.env
 if [ ! -d "$CONTRIB_LEDGER/.git" ]; then
   git -C "$CONTRIB_LEDGER" init -q -b main
   mkdir -p "$CONTRIB_LEDGER"/{candidates,runs,cache}; touch "$CONTRIB_LEDGER"/{QUEUE.md,rejects.md}

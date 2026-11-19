@@ -997,3 +997,39 @@ its own docs.
   for a stage that reads and does not run). Both reached stages A and C only, so a scout
   could pick a fix the gate would refuse (81 of pydantic's last 277 commits touch
   pydantic-core), and lost turns to denied interpreter calls in earlier pydantic runs.
+
+## Pause mode: pick before any work starts (2026-11-19, asked for before a xerj run)
+
+A run went straight from the scout to work: it took the scout's ranked list best first, with
+no point where the user could see the list and choose, and the candidates it did not reach
+were left only in that run's `scout/record/candidates.json`. The user asked for two modes as
+a setting, the autonomous one as built and one that stops after the scout and shows the
+candidates first, for more oversight of the work that will be done.
+
+- `RUN_MODE` in the profile, `autonomous` (the default when unset, so every existing profile
+  runs as before) or `pause`; any other value is refused by name. `--mode autonomous|pause`
+  overrides it for one run. xerj's profile sets `pause`; pydantic's stays autonomous.
+- A pause run scouts as before (same checks, same five at most, one in an issue-less run),
+  then stops with exit 0 before any candidate starts: no clone, branch or build. It saves the
+  list in `repos/<owner>-<name>/scouted.json` (tracked in the ledger's git), with the run id,
+  the time and the base commit, and each candidate under the folder name it will get (made
+  unique against the ledger and against the list). A scout that finds nothing leaves the old
+  list as it was. The scout's `confidence` and `files` are now kept with each candidate, since
+  the list is where the user reads them.
+- `QUEUE.md` shows the list first, under "Scouted, waiting for your pick", with each
+  candidate's title, slug, issue, size, confidence, why, source, files and the assignment
+  request draft, all made markdown-inert, and the command to pick. The run's `SUMMARY.md`
+  leads with the pause and shows the same list.
+- `--pick SLUG [SLUG ...]` works the named candidates in the order given and never scouts; the
+  limit becomes the number picked. It refuses a slug that is not on the list, one named twice,
+  one a later run already took, and an empty list (saying a pause run makes one). A candidate
+  leaves the list when its work starts, so a pick the run did not reach (a stop, the open-PR
+  cap) stays on it. The rest stay until the next pause run replaces the list; an autonomous run
+  leaves it alone. Stage A already rechecks claims and overlapping PRs before any fix, so an
+  older list is safe to pick from. `--pick` is refused with `--answer`, `--resume`,
+  `--issue-less` and `--topic`, which each choose the work another way.
+- No command drops a candidate from the list for now; the next pause run replaces it.
+
+Unit checks: tests/smoke/unit_pause.py. The stub suite runs a pause run, an unknown pick, a
+pick of two in reverse order, and an autonomous override; tests/smoke/env.sh strips `RUN_MODE`
+from the suite's copy of the profiles so the other cases stay autonomous.

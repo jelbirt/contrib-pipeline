@@ -1206,6 +1206,7 @@ BASE_KEYS = ("REPO_DIR", "UPSTREAM_REMOTE", "BASE_BRANCH", "CONTRIBUTOR")
 CARGO_KEYS = ("GUARD", "YAML_DIR", "SERVER_BUILD", "SERVER_BIN", "RUNNER_BUILD", "RUNNER_BIN")
 COMMAND_KEYS = ("GUARD", "SETUP_CMD", "SETUP_KEY", "TEST_CMD", "TEST_EXIT_PASS", "TEST_EXIT_FAIL")
 CMD_SLOTS = {"env", "cache", "paths", "junit"}
+RUN_MODES = ("autonomous", "pause")   # RUN_MODE in a profile, --mode for one run
 
 
 def profile_problems(prof, base_only=False):
@@ -1216,6 +1217,9 @@ def profile_problems(prof, base_only=False):
     if cmd and not base_only:
         need += [f"CHECK_{n}" for n in checks]
     out = [f"{k} is missing or empty" for k in dict.fromkeys(need) if not prof.get(k, "").strip()]
+    mode = prof.get("RUN_MODE", "").strip()
+    if mode and mode not in RUN_MODES:
+        out.append(f"RUN_MODE is {mode!r}: it is autonomous or pause")
     if not cmd or base_only:
         return out
     for k in ("TEST_EXIT_PASS", "TEST_EXIT_FAIL", "TEST_EXIT_NONE"):
@@ -1367,10 +1371,18 @@ def judge_test(rc, counts, expect, prof, report=True):
 SOCK_NAME_ROOM, SOCK_PATH_MAX = 35, 107
 
 
+def slug_word(raw):
+    """A scout's slug as a ledger folder name: lower-case letters, digits and dashes, 48 at most."""
+    return re.sub(r"[^a-z0-9-]+", "-", str(raw or "").lower()).strip("-")[:48].strip("-")
+
+
 class Driver:
     # Defaults for drivers built without __init__ (unit checks); __init__ sets them from the profile.
     commands = False
     assign_first = False
+    run_mode = "autonomous"
+    picks = None                 # --pick: the scouted candidates this run works, in order
+    scouted = None               # pause mode: the list this run saved for your pick
     env_dir = None
     last_counts = None
 
@@ -1395,6 +1407,9 @@ class Driver:
             sys.exit(2)
         self.commands = bool(self.prof.get("TEST_CMD", "").strip())
         self.assign_first = self.prof.get("ASSIGN_FIRST", "").strip() == "1"
+        # autonomous works what the scout finds; pause stops after the scout and keeps its list
+        # for --pick. --mode overrides the profile for one run.
+        self.run_mode = getattr(args, "mode", None) or self.prof.get("RUN_MODE", "").strip() or "autonomous"
         self.env_dir = None
         self.last_counts = None
         self.repo_dir = Path(self.prof["REPO_DIR"])
@@ -1986,15 +2001,17 @@ class Driver:
         return f"contrib-run --repo {self.repo} --resume{flag}"
 
     def run_limit(self):
-        """How many candidates this run works: answering a candidate runs only that one, and an
-        issue-less run takes one at most."""
+        """How many candidates this run works: answering a candidate runs only that one, an
+        issue-less run takes one at most, and a --pick run takes the ones picked."""
         if getattr(self, "answer_cand", None) or getattr(self.args, "issue_less", False):
             return 1
+        if self.picks:
+            return len(self.picks)
         return self.args.limit
 
     # ----- preflight -----------------------------------------------------------------
     def preflight(self):
-        self.log(f"run {self.run_id}: repo {self.repo}, limit {self.run_limit()}, "
+        self.log(f"run {self.run_id}: repo {self.repo}, mode {self.run_mode}, limit {self.run_limit()}, "
                  f"deadline {datetime.datetime.fromtimestamp(self.deadline).isoformat(timespec='minutes')}")
         self.log(f"profile: {self.rules_from}")
         self.recover_stale()
@@ -2235,6 +2252,7 @@ class Driver:
         lines = ["# Queue", ""]
         if banner:
             lines += banner + [""]
+        lines += self.scouted_lines()
         titles = [("ready", "Ready for your review"), ("needs-you", "Needs your decision"),
                   ("stopped", "Stopped mid-way (resumable)"), ("running", "Running"), ("failed", "Failed"),
                   ("abandoned", "Abandoned"), ("published", "Published")]
@@ -4179,7 +4197,7 @@ class Driver:
             return [f"the final checks could not run: {type(e).__name__}: {one_line(e, 200)}"]
 
     def new_slug(self, raw):
-        slug = re.sub(r"[^a-z0-9-]+", "-", str(raw or "").lower()).strip("-")[:48].strip("-")
+        slug = slug_word(raw)
         if not slug:
             slug = f"cand-{self.run_id}"
         base, n = slug, 2
@@ -4423,6 +4441,10 @@ class Driver:
         for _, st in self.done:
             counts[st] = counts.get(st, 0) + 1
         outcome = ", ".join(f"{n} {words.get(st, st)}" for st, n in counts.items()) or "No candidate was worked"
+        if self.scouted is not None:
+            k = len(self.scouted["candidates"])
+            paused = f"scouted {k} candidate{'s' if k != 1 else ''} and paused for your pick"
+            outcome = f"{outcome}; {paused}" if self.done else paused
         top = [f"# Run {self.run_id}", "",
                f"**{outcome[0].upper() + outcome[1:]}.** {(time.time() - self.t_start) / 60:.0f} min, "
                f"{total:.2f} USD. Ended {now()} ({self.stop_kind or 'done'}): "
@@ -4433,6 +4455,14 @@ class Driver:
                 title = self.report_head(LEDGER / "candidates" / n)[0] or n
                 top.append(f"| {title} | {words.get(st, st)} | [packet](../../candidates/{n}/session/packet.md) |")
             top.append("")
+        if self.scouted is not None and self.scouted["candidates"]:
+            top += ["| Scouted candidate | Slug | Issue | Size | Confidence |", "|---|---|---|---|---|"]
+            for c in self.scouted["candidates"]:
+                n = issue_number(c.get("issue"))
+                top.append(f"| {md_text(c.get('title'), 200)} | `{c['slug']}` | {f'#{n}' if n and n > 0 else 'none'} "
+                           f"| {md_text(c.get('size'), 10)} | {md_text(c.get('confidence'), 10)} |")
+            top += ["", f"Pick with `contrib-run --repo {self.repo} --pick SLUG [SLUG ...]`. QUEUE.md says why the "
+                        "scout chose each one.", ""]
         top += [f"Time: the sessions worked {sess_ms / 60000:.0f} min; the driver's builds, tests and suites "
                 f"took {req_secs / 60:.0f} min between their turns.", "", "## Details", ""]
         (self.run_dir / "SUMMARY.md").write_text("\n".join(top + lines) + "\n")
@@ -4584,8 +4614,11 @@ class Driver:
                 if issue_less and names_issue(c):
                     dropped += 1
                     continue
-                out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "issue_less",
-                                              "assign_comment") if k in c})
+                out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "confidence",
+                                              "issue_less", "assign_comment") if k in c})
+                files = c.get("files")
+                if isinstance(files, list):         # shown when a pause run lists the candidates
+                    out[-1]["files"] = [one_line(f, 160) for f in files[:10] if isinstance(f, str) and f.strip()]
                 if issue_less:
                     out[-1]["issue"] = None       # whatever else it wrote, it is not an issue number
                 terms = c.get("search_terms")
@@ -4598,6 +4631,111 @@ class Driver:
                 self.log(f"scout: kept 1 of {len(out)} issue-less candidates; at most one per run")
             out = out[:1]
         return out
+
+    # ----- pause mode (RUN_MODE=pause or --mode pause) and --pick ----------------------
+    def scouted_file(self):
+        return self.rules_dir() / "scouted.json"
+
+    def save_scouted(self, cands):
+        """Pause mode: keep the scout's list for --pick in repos/<owner>-<name>/scouted.json,
+        replacing the last one. Each slug is made the folder name the candidate will get, so the
+        name the user types is the one in the ledger."""
+        out, seen = [], set()
+        for i, c in enumerate(cands, 1):
+            slug = base = slug_word(c.get("slug")) or f"cand-{i}"
+            n = 2
+            while slug in seen or (LEDGER / "candidates" / slug).exists() or (WORK / "clones" / slug).exists():
+                slug, n = f"{base}-{n}", n + 1
+            seen.add(slug)
+            out.append({**c, "slug": slug})
+        saved = {"repo": self.repo, "run": self.run_id, "scouted": now(),
+                 "base_sha": self.git("rev-parse", self.upstream, check=False) or None,
+                 "topic": one_line(getattr(self.args, "topic", ""), 200) or None, "candidates": out}
+        f = self.scouted_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        write_json(f, saved)
+        return saved
+
+    def pause(self, cands):
+        """Work none of the scout's candidates: save them for the user's pick and end the run."""
+        self.scouted = self.save_scouted(cands)
+        n = len(self.scouted["candidates"])
+        self.log("pause mode: scouted " + ", ".join(c["slug"] for c in self.scouted["candidates"]))
+        self.stop_kind, self.stop_reason = "done", (f"pause mode: {n} scouted candidate{'s' if n != 1 else ''} "
+                                                    "wait for your pick")
+
+    def pick_setup(self, slugs):
+        """--pick: the named candidates from the saved list, in the order given. Refuses a name the
+        list does not hold, one given twice, and one already in the ledger (a later run took it)."""
+        saved = read_json(self.scouted_file(), None)
+        cands = saved.get("candidates") if isinstance(saved, dict) else None
+        if not isinstance(cands, list) or not cands:
+            raise RuntimeError(f"no scouted candidates wait for a pick in {self.repo}; a pause run "
+                               "(--mode pause, or RUN_MODE=pause in the profile) makes the list")
+        by = {c["slug"]: c for c in cands if isinstance(c, dict) and isinstance(c.get("slug"), str)}
+        known = {Path(s["_dir"]).name for s in self.all_states()}
+        out = []
+        for s in slugs:
+            if any(c["slug"] == s for c in out):
+                raise RuntimeError(f"{s} is named twice")
+            if s not in by:
+                raise RuntimeError(f"{s} is not on the list scouted {one_line(saved.get('scouted'), 40)}, "
+                                   f"which holds: {', '.join(by)}")
+            if s in known:
+                raise RuntimeError(f"{s} is already in the ledger (candidates/{s}): a run took it after the scout")
+            out.append(by[s])
+        return out
+
+    def unlist(self, slug):
+        """A picked candidate leaves the saved list when its work starts; one not reached stays."""
+        f = self.scouted_file()
+        saved = read_json(f, None)
+        if isinstance(saved, dict) and isinstance(saved.get("candidates"), list):
+            saved["candidates"] = [c for c in saved["candidates"]
+                                   if not (isinstance(c, dict) and c.get("slug") == slug)]
+            write_json(f, saved)
+
+    @staticmethod
+    def scouted_lines():
+        """QUEUE.md's first section: each repo's saved list while it holds any candidate."""
+        lists = []
+        for f in sorted((LEDGER / "repos").glob("*/scouted.json")):
+            s = read_json(f, None)
+            if (isinstance(s, dict) and isinstance(s.get("candidates"), list)
+                    and re.fullmatch(r"[\w.-]+/[\w.-]+", str(s.get("repo", "")))
+                    and s["repo"].replace("/", "-") == f.parent.name):
+                cands = [c for c in s["candidates"] if isinstance(c, dict)
+                         and re.fullmatch(r"[a-z0-9-]+", str(c.get("slug", "")))]
+                if cands:
+                    lists.append((s, cands))
+        if not lists:
+            return []
+        lines = [f"## Scouted, waiting for your pick ({sum(len(c) for _, c in lists)})", ""]
+        for s, cands in lists:
+            base = md_text(str(s.get("base_sha") or "")[:10], 10)
+            topic = f", topic: {md_text(s['topic'], 200)}" if s.get("topic") else ""
+            lines += [f"**{s['repo']}**, scouted {md_text(s.get('scouted'), 40)} by run {md_text(s.get('run'), 40)}"
+                      f"{' at ' + base if base else ''}{topic}. Work the ones you want with "
+                      f"`contrib-run --repo {s['repo']} --pick SLUG [SLUG ...]`, in the order you give and with no "
+                      "new scout; stage A rechecks claims and open PRs before any work. The next pause run "
+                      "replaces this list.", ""]
+            for i, c in enumerate(cands, 1):
+                n = issue_number(c.get("issue"))
+                facts = [f"issue #{n}" if n and n > 0 else "no issue"]
+                facts += [f"{k} {md_text(c[k], 20)}" for k in ("size", "confidence") if c.get(k)]
+                lines.append(f"{i}. **{md_text(c.get('title'), 200) or c['slug']}** (`{c['slug']}`): "
+                             + ", ".join(facts))
+                lines.append(f"   - Why: {md_text(c.get('why'), 600)}")
+                if c.get("source"):
+                    lines.append(f"   - Source: {md_text(c['source'], 200)}")
+                files = [x for x in c.get("files") or [] if isinstance(x, str)] if isinstance(c.get("files"), list) else []
+                if files:
+                    lines.append("   - Files: " + ", ".join(md_text(x, 160) for x in files[:10]))
+                if c.get("assign_comment"):
+                    lines.append("   - Work waits until the issue is assigned to you. The scout's draft request: "
+                                 f"\"{md_text(c['assign_comment'], 600)}\"")
+            lines.append("")
+        return lines
 
     # ----- publish-time retest --------------------------------------------------------
     def retest(self, slug, merge):
@@ -4732,12 +4870,20 @@ class Driver:
             except RuntimeError as e:
                 print(f"answer: {e}", file=sys.stderr)
                 return 2
+        if getattr(self.args, "pick", None):
+            try:
+                self.picks = self.pick_setup(self.args.pick)
+            except RuntimeError as e:
+                print(f"pick: {e}", file=sys.stderr)
+                return 2
         code = EXIT_DONE
         try:
             self.preflight()
             queue = []
             if self.answer_cand:
                 queue = [("resume", str(self.answer_cand[0]))]
+            elif self.picks:
+                queue = [("pick", c) for c in self.picks]
             elif self.args.resume:
                 queue = [("resume", s["_dir"]) for s in self.all_states() if s.get("status") == "stopped"]
             while len(self.done) < self.run_limit():
@@ -4748,10 +4894,16 @@ class Driver:
                                               f">= {self.prof.get('MAX_OPEN', 10)}")
                     break
                 if not queue:
-                    queue = [("new", c) for c in self.scout()]
-                    if not queue:
+                    if self.picks:
+                        break                      # a --pick run never scouts
+                    found = self.scout()
+                    if not found:
                         self.request_stop("soft", "no good candidates left")
                         break
+                    if self.run_mode == "pause":
+                        self.pause(found)
+                        break
+                    queue = [("new", c) for c in found]
                 kind, item = queue.pop(0)
                 if self.answer_cand and kind == "resume" and item == str(self.answer_cand[0]):
                     self.answer_write(*self.answer_cand)
@@ -4759,6 +4911,8 @@ class Driver:
                     if kind == "resume":
                         self.work_candidate({}, resume_dir=item)
                     else:
+                        if kind == "pick":
+                            self.unlist(item["slug"])
                         self.work_candidate(item)
                 except StopRun:
                     raise
@@ -4770,7 +4924,9 @@ class Driver:
                                 question=f"the driver hit an error on this candidate: "
                                 f"{type(e).__name__}: {one_line(e, 200)}")
             if not self.stop_kind:
-                self.stop_kind, self.stop_reason = "done", f"candidate limit reached ({self.run_limit()})"
+                self.stop_kind, self.stop_reason = "done", (
+                    f"the picked candidates are done ({len(self.picks)})" if self.picks
+                    else f"candidate limit reached ({self.run_limit()})")
         except StopRun:
             pass
         except Exception as e:
@@ -4880,6 +5036,8 @@ class Driver:
             banner.append("> **Still running or kept, check these:** " + "; ".join(leftovers) + ".")
         if any(st == "stopped" for _, st in self.done):
             banner.append(f"> Resume with: `{self.resume_cmd()}`")
+        if self.scouted is not None and self.scouted["candidates"]:
+            banner.append(f"> Pick from the scouted list below with `contrib-run --repo {self.repo} --pick SLUG [SLUG ...]`.")
         try:
             self.write_summary()
             banner.append(f"> Summary: [runs/{self.run_id}/SUMMARY.md](runs/{self.run_id}/SUMMARY.md).")
@@ -4945,6 +5103,12 @@ def main():
     ap.add_argument("--issue-less", action="store_true",
                     help="scout only fixes that no open issue reports; drop issue candidates, keep at most one")
     ap.add_argument("--resume", action="store_true", help="first pick up stopped candidates")
+    ap.add_argument("--mode", choices=RUN_MODES,
+                    help="autonomous works what the scout finds (the default); pause stops after the scout and "
+                         "lists its candidates in QUEUE.md for --pick. Overrides the profile's RUN_MODE for this run")
+    ap.add_argument("--pick", nargs="+", metavar="SLUG",
+                    help="work these candidates from the list a pause run saved, in this order, with no new scout "
+                         "(the limit becomes their number)")
     ap.add_argument("--model", default="opus")
     ap.add_argument("--scout-model", default="sonnet")
     ap.add_argument("--claude", default="claude", help="the claude binary (a stub for tests)")
@@ -4965,6 +5129,8 @@ def main():
     args = ap.parse_args()
     if args.issue_less and args.answer:
         ap.error("--issue-less does nothing with --answer, which continues only the answered candidate")
+    if args.pick and (args.answer or args.resume or args.issue_less or args.topic):
+        ap.error("--pick works only the candidates it names: not with --answer, --resume, --issue-less or --topic")
     sys.exit(Driver(args).main())
 
 
