@@ -968,3 +968,32 @@ events on the issue's timeline, and the snapshot held open items and comments on
 - The driver does not judge declines itself: whether a closed PR was turned down or just
   abandoned by its author takes reading the thread, so the list is evidence for the
   session, not a filter.
+
+## Finding issue-less fixes (2026-11-19, found in a pydantic scout run)
+
+An `--issue-less` scout on pydantic read one module, found nothing and returned an empty
+list, saying a full scan was out of reach without running code. scout.md named where an
+issue-less fix may come from (the profile's known gaps, or the kind of small fix it allows)
+but not how to find one, and the pydantic profile lists no gaps. Outside fixes merged there
+recently were mostly found by reading: a case a recent fix missed, or code that contradicts
+its own docs.
+
+- scout.md gains "Finding an issue-less fix": three leads, read at the base in the profile's
+  scope. What a recent fix missed (`git log -n 200` of the fixes, then the twin of each: a
+  sibling function or type, the other direction, another mode, a second copy), checked
+  against the fix's own PR thread so a twin left out on purpose is dropped. Code that
+  contradicts its docstring, error message, annotation or docs, kept only when the code is
+  the wrong side (a words-only change has no test that fails before). Known-bug markers
+  (expected-failure or skipped tests that name wrong behaviour, TODO or FIXME), searched
+  with `git grep` at the base, because the clone's checkout is older than the base.
+- A kept lead names its trigger, wrong result and lines, and says it was read, not run;
+  stage A reproduces it before any fix.
+- In an issue-less run the scout works through at least the last 20 fix commits (or all, if
+  fewer) and a marker search before it may answer with an empty list, and puts the number of
+  leads checked in next.json's summary. The driver now logs the scout's summary, so the run
+  log shows how far it looked. Normal runs keep issues first and do not pay for this.
+- The scout's prompt now says which paths the final gate refuses (the profile's SETUP_KEY),
+  and its system prompt names the profile's blocked commands (`deny_text(runs=False)`, worded
+  for a stage that reads and does not run). Both reached stages A and C only, so a scout
+  could pick a fix the gate would refuse (81 of pydantic's last 277 commits touch
+  pydantic-core), and lost turns to denied interpreter calls in earlier pydantic runs.
