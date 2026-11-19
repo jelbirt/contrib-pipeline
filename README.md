@@ -96,7 +96,9 @@ This is set up for one machine and has not been tuned for others:
 | `contrib-one/DESIGN.md` | The full design and the record of every review round. |
 | `notes/` | Findings from the first real run and the whole-pipeline review. |
 | `docs/` | Case studies of real runs. |
-| `.github/workflows/tests.yml` | CI: the unit checks on every push. |
+| `scripts/` | `checks.sh` is the green bar; `new-worktree.sh` and `rm-worktree.sh` make and remove one worktree per workstream. |
+| `.claude/` | For sessions working on this repo: a commit guard that runs `checks.sh` and keeps commits off `main`, and a `worktree-cleanup` skill. |
+| `.github/workflows/tests.yml` | CI: `scripts/checks.sh` on every push. |
 
 ## Install
 
@@ -169,17 +171,17 @@ sets `FORK_CI=1`, shows you the PR title and body, and runs `contrib-push` only 
 From the repo root:
 
 ```bash
-tests/smoke/units.sh
-bash tests/smoke/suite.sh
+scripts/checks.sh          # shell syntax, then tests/smoke/units.sh
+scripts/checks.sh --full   # also tests/smoke/suite.sh
 ```
 
-CI runs `units.sh` on every push (Ubuntu 24.04, with bubblewrap, so the sandbox checks run
-for real). The suite runs only locally, because it needs the xerj pipeline clone.
+CI runs `scripts/checks.sh` on every push (Ubuntu 24.04, with bubblewrap, so the sandbox
+checks run for real). The suite runs only locally, because it needs the xerj pipeline clone.
 
 The suite needs no GitHub access and no real Claude, but it copies the xerj pipeline clone
 (the xerj profile's `REPO_DIR`, with an `upstream` remote) and needs bwrap and socat. It
-prints `SUITE PASS` and leaves its files in `~/contrib-smoke/<stamp>`. Both commands must
-pass before every commit.
+prints `SUITE PASS` and leaves its files in `~/contrib-smoke/<stamp>`. `scripts/checks.sh --full`
+must pass before every commit.
 
 ## License
 

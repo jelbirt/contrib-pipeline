@@ -26,7 +26,8 @@ jobs:
           mkdir -p "$HOME/.rustup" "$HOME/.cargo/bin"
 
       # The runner's Python 3.12 matches the driver's target; the driver uses only the stdlib.
-      - name: Unit files
+      # The green bar lives in one place, scripts/checks.sh, and CI adds no check of its own.
+      - name: Green bar
         env:
           CONTRIB_REQUIRE_BWRAP: "1"   # a missing bwrap fails instead of skipping the jail checks
-        run: tests/smoke/units.sh
+        run: scripts/checks.sh
