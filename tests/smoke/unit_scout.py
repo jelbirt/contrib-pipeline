@@ -45,6 +45,7 @@ def run(issue_less, **prof):
     d.run_dir = t / f"run-{issue_less}"
     d.repo, d.repo_dir, d.upstream = "own/repo", t / "clone", "upstream/main"
     d.prof, d.prof_md, d.assign_first = {"CONTRIBUTOR": "me", **prof}, "", True
+    d.commands = bool(d.prof.get("TEST_CMD", "").strip())     # as Driver.__init__ sets it
     d.args = SimpleNamespace(topic="", scout_model="sonnet", issue_less=issue_less, limit=3)
     logs, prompts, systems = [], [], []
     d.log = lambda msg, *a, **k: logs.append(msg)
