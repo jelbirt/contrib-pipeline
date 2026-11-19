@@ -889,3 +889,31 @@ when it passes, the flowchart falls back at display time, and rule_changes names
 `short` or `why`. The Left out row and the notes list say the rest are in PROFILE-RULES.md, a
 learn that listed no rules no longer says sources failed, labels keep letters outside ASCII,
 and SPEC.md describes the new layout. Mutants for each of these fail their own check.
+
+## Snapshot digests (2026-11-18, found in a pydantic scout run)
+
+The scout of run 2026-11-18-142946 read 16 issue titles out of 300. gh writes each snapshot as
+one line of JSON (1.8 MB for 300 pydantic issues), which the Read tool cuts short and Grep can
+only return whole, and the pydantic profile denies `python` and `python3` in sessions on purpose
+(`SESSION_DENY`), so the scout could not parse it. The denial stays; the driver now makes the
+snapshot readable instead. On every snapshot `write_digests` writes, next to the JSON:
+
+- `issues.txt`, `prs.txt` and `mine.txt`: one line per item (number, dates, comments,
+  assignees, labels or changed files, title), 47 KB for 300 issues, so one Read lists them all.
+- `issues/<N>.md` and `prs/<N>.md`: one item in full, with the comments or changed files gh
+  returned. A Grep of `prs/` for a path finds every PR in the snapshot that changes that file.
+- An index says so at the top when its list reached gh's `--limit` (300 issues, 200 PRs, 50
+  of the user's own), as pydantic's issues do: older items are then missing, and stage A asks
+  for a gh read when its issue has no file.
+- A `.ignore` (`!gh/`) beside `gh/`. The ledger's .gitignore hides `gh/` and the Grep tool
+  honours it, so a Grep of the scout or candidate folder found nothing in `gh/` and said
+  nothing, the unsafe answer for an overlap check (seen with ripgrep 15). The `.ignore` is
+  itself kept out of the ledger's git and still read.
+
+Text others wrote (bodies, comments) is quoted line by line with `> ` and stripped of control
+and format characters, keeping its indentation, so no line of it can pass for a header the
+driver wrote. Items without an integer number are skipped, and the per-item folders are
+rebuilt on each snapshot, so the refresh before stage C leaves no file from a closed issue. The
+scout, A and C prompts read the text files; C no longer names `gh/search-*.json`, which nothing
+writes. A session's own gh reads are still saved as gh prints them, and the xerj profile still
+names `gh/prs.json`, which still exists. Unit checks: tests/smoke/unit_digest.py.

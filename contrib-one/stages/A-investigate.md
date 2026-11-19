@@ -7,8 +7,11 @@ You may write tests in this stage, but not the fix.
 The scout's `why` and any fix it suggests are a hypothesis from a short look, not a finding:
 confirm them from the code before relying on them.
 
-1. **Recheck the claim and overlap** from `gh/` (fresh snapshot for this candidate). Read
-   every open PR whose files or title touch the same area. Any overlap: `abandon`.
+1. **Recheck the claim and overlap** from `gh/` (fresh snapshot for this candidate): the
+   issue's own file in `gh/issues/` for a new claim or assignee (no file: the issue is older
+   than the snapshot reaches, so ask for a `gh issue view` read), then `gh/prs.txt` and a Grep
+   of `gh/prs/` for the files you expect to change. Read every open PR whose files or title
+   touch the same area. Any overlap: `abandon`.
 2. **Find the code.** Read the paths the candidate names and their callers. Read
    `git log` for those files: if a maintainer chose the current behaviour on purpose, note the
    commit and weigh that.

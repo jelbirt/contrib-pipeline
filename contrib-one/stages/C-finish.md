@@ -38,8 +38,9 @@ Get an independent review, act on it, and write the PR body.
    it as the user will: a reader outside this area should understand the problem, the
    choice and each decision without opening `details.md`. Cut it to the word limit.
 7. **Overlap, one last time.** The driver refreshed `gh/` just before this stage. Read
-   `gh/prs.json` (and any `gh/search-*.json`) for an open PR that is not the user's and
-   touches the same behaviour, issue or listed gap. If one appeared since stage A, stop
+   `gh/prs.txt` and Grep `gh/prs/` for each file your branch changes, looking for an open PR
+   that is not the user's and touches the same behaviour, issue or listed gap. If one
+   appeared since stage A, stop
    with `needs-you` and name it; do not finish a duplicate.
 8. Leave the worktree clean: everything committed.
 
