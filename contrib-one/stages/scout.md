@@ -36,6 +36,36 @@ the snapshot: ask for a `gh search issues` read with the fix's terms before you 
 `"issue": null`, write a `source` such as `gap: <what>` with no issue or PR number or link in
 it (the driver drops a candidate whose source cites one), and give one candidate at most.
 
+### Finding an issue-less fix
+No issue points at it, and you cannot run code, so find it by reading. Work these leads at
+the base, in the paths the profile's scope allows (if it names none, the repo's main source
+and test folders), leaving out any your prompt says the final gate refuses:
+1. **What a recent fix missed.** List the recent fixes (`git -C <clone> log <remote>/<branch>
+   --no-merges -n 200 --format='%h %ad %s' --date=short -- <paths>`), and read the diff of
+   each one that fixes wrong behaviour (`git -C <clone> show <sha>`). A fix often repairs one
+   path and leaves its twin: the same check missing in a sibling function or another type it
+   handles, the other direction (read and write, encode and decode), another mode or option,
+   or a second copy of the same logic. Find the twin and read at the base that it still has
+   the same flaw. Before you keep a twin, ask for the fix's own PR thread (`gh pr view <n>
+   --comments`, with the number from its subject, or a `gh search prs` read) and drop the twin
+   if a maintainer left it out on purpose. Keep that number out of `source`.
+2. **Code that contradicts its own word.** A docstring, error message, type annotation or
+   docs page that promises one result while the code it describes gives another. Keep it
+   only when the code is the wrong side (other docs, tests or callers agree with the
+   promise): a change to the words alone has no test that fails before.
+3. **Known-bug markers.** Tests marked as expected to fail, or skipped with a reason that
+   names wrong behaviour, and TODO or FIXME comments that name a wrong result. Search the
+   base, not the clone's checkout, which is older (`git -C <clone> grep -n -E '<pattern>'
+   <remote>/<branch> -- <paths>`). Skip ones that wait on a design decision or a later
+   release.
+
+For a lead you keep, name the input that triggers it, the wrong result, and the lines at the
+base that cause it. Say in `why` that the failure is read from the code, not run; stage A
+reproduces it before any fix. In a run that takes issue-less fixes only, one module read is
+not a search: work through at least the last 20 fix commits in scope (or all of them if
+there are fewer) and a marker search before you answer with an empty list, and say in
+`next.json`'s summary how many leads you checked.
+
 ## Every candidate must pass all of these (drop it otherwise)
 - **Unclaimed:** no "I'll take this" in the last 14 days, no assignee other than the
   contributor named in your prompt, no linked open PR.
@@ -76,4 +106,5 @@ what is wrong and the fix they propose, following the profile on tone and any di
 attribution, no em dashes. The driver stops that candidate there and shows the user the draft.
 
 An empty list is a valid answer: it means no good candidate, and the run stops cleanly.
-Then write `next.json` with `{"action": "stage-done", "summary": "N candidates"}`.
+Then write `next.json` with `{"action": "stage-done", "summary": "N candidates"}` (in a run that
+takes issue-less fixes only, add the leads checked: `"0 candidates; 23 leads checked"`).

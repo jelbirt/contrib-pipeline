@@ -2932,17 +2932,19 @@ class Driver:
             self.log(f"session {stage}: turn ends")
         return res
 
-    def deny_text(self):
+    def deny_text(self, runs=True):
         """The profile's SESSION_DENY commands, named in the prompt so a session does not reach for one
-        (for instance an interpreter, to read a JSON file) and lose a turn to the denial."""
+        (for instance an interpreter, to read a JSON file) and lose a turn to the denial. runs=False is
+        for the scout, which reads code and may ask only for gh reads."""
         words = self.prof.get("SESSION_DENY", "").split()
         if not words:
             return []
+        how = ("the driver runs the repo's own tools for you (see \"Asking the driver\")" if runs
+               else "this stage reads code and does not run it")
         return ["## Commands blocked for you here\n\n"
                 + ", ".join(f"`{w}`" for w in words)
-                + " are blocked in your shell for this repo, with any arguments: the driver runs the repo's "
-                "own tools for you (see \"Asking the driver\"). To read or search a file, JSON included, use "
-                "the Read and Grep tools, not a script."]
+                + f" are blocked in your shell for this repo, with any arguments: {how}. To read or search a "
+                "file, JSON included, use the Read and Grep tools, not a script."]
 
     def c_final_checks(self, act, f):
         """After stage C says it is done: the driver's final checks, one fix-up turn if they fail, and
@@ -4532,13 +4534,19 @@ class Driver:
         if self.assign_first:
             prompt += (" In this repo, work on an issue starts only once the issue is assigned to the contributor: "
                        "add assign_comment to each issue candidate not assigned to them yet.")
+        keys = self.prof.get("SETUP_KEY", "").split()
+        if keys:
+            prompt += (" The final gate refuses a branch that changes " + ", ".join(f"`{k}`" for k in keys)
+                       + " (every run uses their base version): list no candidate that needs a change there, "
+                       "and leave those paths out of your git log and marker searches.")
         if issue_less:
             prompt += (" This run takes issue-less fixes only: list no open issue, and no fix for a defect an "
                        "open issue already reports. At most one candidate.")
         system = "\n\n---\n\n".join([(SKILL / "rules" / "common.md").read_text(), self.prof_md,
-                                     (SKILL / "stages" / "scout.md").read_text()])
+                                     *self.deny_text(runs=False), (SKILL / "stages" / "scout.md").read_text()])
         nxt = sdir / "next.json"
         self.cand = None
+        act = None
         try:
             for _ in range(4):
                 self.check_stop(between=True)
@@ -4563,6 +4571,8 @@ class Driver:
             self.cand = None
             self.archive_transcripts(home)
             shutil.rmtree(self.session_tmp(home, make=False), ignore_errors=True)
+        if act and act.get("action") == "stage-done" and act.get("summary"):
+            self.log(f"scout: {one_line(act['summary'], 200)}")
         raw = read_session_file(sdir / "candidates.json")
         try:
             cands = json.loads(raw) if raw else []
