@@ -51,8 +51,8 @@ check("issue index: header, limit note, one line per valid issue", len(idx) == 4
       and idx[1] == "# 2 listed: gh's limit of 2 was reached, so older ones are not here. "
       "Ask the driver for a gh read of any other.")
 check("issue index line has dates, comment count, assignee, labels, title on one line",
-      idx[2] == "#5 | 2026-11-17 | upd 2026-11-18 | 2 comments | assigned: bob | bug, pending | Broken thing")
-check("issue with null fields still listed", idx[3].startswith("#6 | - | upd - | 0 comments | assigned: - | - | No body"))
+      idx[2] == "#5 | 2026-11-17 | upd 2026-11-18 | 2 comments | assigned: bob | bug, pending | linked ? | Broken thing")
+check("issue with null fields still listed", idx[3].startswith("#6 | - | upd - | 0 comments | assigned: - | - | linked ? | No body"))
 check(".ignore beside gh/ lets a Grep of the folder above see it; a symlink there is replaced",
       (t / ".ignore").read_text() == "!gh/\n" and not (t / ".ignore").is_symlink()
       and (outside / "keep.md").read_text() == "keep\n")

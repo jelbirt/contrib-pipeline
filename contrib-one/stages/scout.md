@@ -7,8 +7,9 @@ Find contribution candidates in the repo and rank them. Research only: you chang
   and the user's own recent PRs, one line each. Snapshots taken by the driver just now.
   Read `gh/issues.txt` whole: it lists every issue in the snapshot, not a sample (its top
   lines say when gh's limit left older ones out).
-- `gh/issues/<number>.md` and `gh/prs/<number>.md`: one issue with its body and every
-  comment, or one PR with its body and every changed file. Read them for the issues you
+- `gh/issues/<number>.md` and `gh/prs/<number>.md`: one issue with its body, every comment
+  and a `## Linked from` list (the issues and PRs here that mention it, with their state and
+  labels), or one PR with its body and every changed file. Read them for the issues you
   shortlist and the PRs that may overlap. To find the open PRs that change a file, Grep
   `gh/prs/` for its path, with `[` and `(` escaped (the pattern is a regex). (`gh/*.json`
   hold the same data on one very long line each; use the text files.)
@@ -45,6 +46,17 @@ it (the driver drops a candidate whose source cites one), and give one candidate
 - **Not owner-only:** no roadmap epic, release work, or "maintainers will handle" label.
 - **Fits the profile's scope:** a fix one PR can carry, with a test that fails before.
 - **Not already fixed on the base:** check the code at the base, not only the issue text.
+- **Not declined before:** maintainers have not already turned this change down or put it
+  off. For an issue, read its `## Linked from` list. Every closed, unmerged PR and every
+  issue closed as not planned on it may hold their answer: ask for its comments and reviews
+  (`gh pr view <n> --comments` shows both; `gh issue view <n> --comments`), and read a label
+  such as `deferred` or `wontfix` as an answer. For an issue-less fix, ask for `gh search
+  issues` and `gh search prs` reads with `--state closed` and the fix's terms, and read what
+  they find the same way. Drop a candidate, quoting the maintainer in `why`, when a
+  maintainer declined it, deferred it to a later release, or called the behaviour expected,
+  unless something material changed since; then say what. A PR its author left, one a stale
+  bot closed, or one turned down only for how it made the change is not a decline: keep the
+  candidate and say so in `why`.
 
 ## Output
 Write `candidates.json`: a list, best first, at most 5, each:
