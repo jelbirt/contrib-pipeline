@@ -27,6 +27,14 @@ the driver with a `gh` request and end your turn.
    fix it says needs no issue). **At most one issue-less candidate per run**, and only if you
    can name the user-visible failure it causes.
 
+When your prompt says the run takes issue-less fixes only, skip source 1. Before you list a
+fix, search `gh/issues.txt` and Grep `gh/issues/` for the behaviour it changes: a fix for a
+defect an open issue already reports belongs to that issue, so drop it rather than list it
+without the issue. If `gh/issues.txt` says gh's limit was reached, older issues are not in
+the snapshot: ask for a `gh search issues` read with the fix's terms before you list it. Set
+`"issue": null`, write a `source` such as `gap: <what>` with no issue or PR number or link in
+it (the driver drops a candidate whose source cites one), and give one candidate at most.
+
 ## Every candidate must pass all of these (drop it otherwise)
 - **Unclaimed:** no "I'll take this" in the last 14 days, no assignee other than the
   contributor named in your prompt, no linked open PR.

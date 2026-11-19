@@ -29,9 +29,12 @@ setsid nohup ~/.claude/skills/contrib-one/bin/contrib-run --repo <owner/name> --
 ```
 
 Flags: `--limit N` candidates to finish (default 3), `--hours H` deadline, `--topic "..."`
-to steer the scout, `--resume` to pick up stopped candidates first, `--answer SLUG "TEXT"` to
-answer a needs-you candidate's question and continue only that candidate, `--model` and
-`--scout-model` (defaults `opus` and `sonnet`).
+to steer the scout, `--issue-less` to work one fix that no open issue reports (the scout
+skips open issues, the driver drops any candidate that names one, and the limit becomes 1;
+with `--resume`, a stopped candidate takes that one slot and the scout runs only when none is
+stopped; not with `--answer`), `--resume` to pick up stopped candidates first, `--answer SLUG
+"TEXT"` to answer a needs-you candidate's question and continue only that candidate,
+`--model` and `--scout-model` (defaults `opus` and `sonnet`).
 
 Tell the user how to stop it: `touch ~/contrib-queue/STOP` lets the current stage finish (a stage
 can take an hour) then shuts down; `touch ~/contrib-queue/STOP-NOW` interrupts. Either way the shutdown routine

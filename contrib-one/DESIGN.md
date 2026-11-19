@@ -917,3 +917,26 @@ rebuilt on each snapshot, so the refresh before stage C leaves no file from a cl
 scout, A and C prompts read the text files; C no longer names `gh/search-*.json`, which nothing
 writes. A session's own gh reads are still saved as gh prints them, and the xerj profile still
 names `gh/prs.json`, which still exists. Unit checks: tests/smoke/unit_digest.py.
+
+## Issue-less runs (2026-11-19, found in a pydantic scout run)
+
+A profile with `ASSIGN_FIRST=1` stops every issue candidate after the scout until the
+contributor is assigned, and on some repos outside contributors are rarely assigned. A
+`--topic` asking for issue-less fixes did not help: the scout prompt ranks open issues first,
+and the 2026-11-19 pydantic scout picked issue #12116 anyway. `--issue-less` makes it a run
+setting. The scout's prompt says the run takes issue-less fixes only, and `scout.md` says to
+check the snapshot so that a defect an open issue already reports is not passed off without
+its issue (which would get around the repo's assignment rule); when the snapshot hit gh's
+issue limit, the scout also asks for a `gh search issues` read. The driver holds the line even
+if the scout does not: it keeps a candidate only when its issue field is empty (null, false or a
+word such as "none"; any other value counts as an issue, readable or not) and its source cites
+no issue or PR (`#12`, `owner/repo#12`, `GH-12`, `issue 12`, an issues URL; wording such as
+"issue-less" does not count), and clears the issue field of what it keeps. A second review
+found the first version of this check let a source such as `see #12` or an issue field such as
+`12 (open)` through, so it now drops anything it cannot read as "no issue". The run works one
+candidate, as the one-issue-less-candidate rule above asks: `run_limit()` is 1 and `scout()`
+runs once per run, so a later scout turn, or a stale `candidates.json`, cannot add a second.
+With `--resume`, a stopped candidate takes that slot (it still passes the assignment check), and
+the resume command an issue-less run prints keeps `--issue-less`, so resuming it does not turn
+into a normal run of `--limit` candidates. `--answer` with the flag is refused, since an
+answered candidate is the only one that run works. Unit checks: tests/smoke/unit_scout.py.

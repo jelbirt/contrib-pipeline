@@ -1203,6 +1203,21 @@ def issue_number(x):
     return int(m.group(1)) if m and int(m.group(1)) > 0 else -1
 
 
+ISSUE_REF = re.compile(r"(?<![&\w])#\d|[\w.-]/[\w.-]+#\d|\bgh-\d|\bissues?\W{0,3}#?\d|/issues/\d", re.I)
+NO_ISSUE = {"", "none", "null", "n/a", "-", "false", "no", "no issue"}
+
+
+def names_issue(c):
+    """True unless a scout candidate plainly names no issue. Its issue field must be empty (null,
+    false, or a word such as "none"): any other value counts, readable or not. Its source must
+    cite no issue or PR ("#12", "owner/repo#12", "GH-12", "issue 12", an issues URL); wording
+    such as "issue-less fix" or "gap: ..." does not count."""
+    x = c.get("issue")
+    if not (x is None or x is False or (isinstance(x, str) and x.strip().lower() in NO_ISSUE)):
+        return True
+    return bool(ISSUE_REF.search(str(c.get("source") or "")))
+
+
 def counts_note(c):
     """A test run's counts for its index note. When the report calls every test skipped, no test passed
     (a runner may report expected failures as skipped too), so the note says that in words: a session
@@ -1857,9 +1872,18 @@ class Driver:
                 f.write(lock_id + "\n")
         return rc
 
+    def resume_cmd(self):
+        """The command that resumes this run's stopped candidates; an issue-less run's keeps the
+        flag, so the resumed run still takes one candidate and scouts no issue."""
+        flag = " --issue-less" if getattr(self.args, "issue_less", False) else ""
+        return f"contrib-run --repo {self.repo} --resume{flag}"
+
     def run_limit(self):
-        """How many candidates this run works: answering a candidate runs only that one."""
-        return 1 if getattr(self, "answer_cand", None) else self.args.limit
+        """How many candidates this run works: answering a candidate runs only that one, and an
+        issue-less run takes one at most."""
+        if getattr(self, "answer_cand", None) or getattr(self.args, "issue_less", False):
+            return 1
+        return self.args.limit
 
     # ----- preflight -----------------------------------------------------------------
     def preflight(self):
@@ -4373,6 +4397,11 @@ class Driver:
         return status
 
     def scout(self):
+        issue_less = bool(getattr(self.args, "issue_less", False))
+        if issue_less and getattr(self, "issue_less_scouted", False):
+            self.log("scout: not run again; an issue-less run scouts once and takes one candidate at most")
+            return []
+        self.issue_less_scouted = issue_less
         home = self.run_dir / "scout"
         sdir = home / "session"
         sdir.mkdir(parents=True, exist_ok=True)
@@ -4390,6 +4419,9 @@ class Driver:
         if self.assign_first:
             prompt += (" In this repo, work on an issue starts only once the issue is assigned to the contributor: "
                        "add assign_comment to each issue candidate not assigned to them yet.")
+        if issue_less:
+            prompt += (" This run takes issue-less fixes only: list no open issue, and no fix for a defect an "
+                       "open issue already reports. At most one candidate.")
         system = "\n\n---\n\n".join([(SKILL / "rules" / "common.md").read_text(), self.prof_md,
                                      (SKILL / "stages" / "scout.md").read_text()])
         nxt = sdir / "next.json"
@@ -4423,14 +4455,25 @@ class Driver:
             cands = json.loads(raw) if raw else []
         except ValueError:
             cands = []
-        out = []
+        out, dropped = [], 0
         for c in cands if isinstance(cands, list) else []:
             if isinstance(c, dict) and isinstance(c.get("slug"), str) and c["slug"] not in known:
+                if issue_less and names_issue(c):
+                    dropped += 1
+                    continue
                 out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "issue_less",
                                               "assign_comment") if k in c})
+                if issue_less:
+                    out[-1]["issue"] = None       # whatever else it wrote, it is not an issue number
                 terms = c.get("search_terms")
                 if isinstance(terms, list):
                     out[-1]["search_terms"] = [one_line(t, 60) for t in terms[:3] if isinstance(t, str) and t.strip()]
+        if issue_less:
+            if dropped:
+                self.log(f"scout: dropped {dropped} issue candidate(s); this run takes issue-less fixes only")
+            if len(out) > 1:
+                self.log(f"scout: kept 1 of {len(out)} issue-less candidates; at most one per run")
+            out = out[:1]
         return out
 
     # ----- publish-time retest --------------------------------------------------------
@@ -4683,7 +4726,7 @@ class Driver:
                 self.state(status="stopped", stop_reason=reason, stop_kind=self.stop_kind, stopped=now(),
                            cleanup=note, last_good_sha=self.git("rev-parse", "--verify", "--quiet", s.get("branch", "-"),
                                                                 check=False) or None,
-                           resume=f"contrib-run --repo {self.repo} --resume")
+                           resume=self.resume_cmd())
                 self.archive_transcripts(self.cand)
                 self.done.append((self.cand.name, "stopped"))
         except Exception as e:
@@ -4713,7 +4756,7 @@ class Driver:
         if leftovers:
             banner.append("> **Still running or kept, check these:** " + "; ".join(leftovers) + ".")
         if any(st == "stopped" for _, st in self.done):
-            banner.append(f"> Resume with: `contrib-run --repo {self.repo} --resume`")
+            banner.append(f"> Resume with: `{self.resume_cmd()}`")
         try:
             self.write_summary()
             banner.append(f"> Summary: [runs/{self.run_id}/SUMMARY.md](runs/{self.run_id}/SUMMARY.md).")
@@ -4776,6 +4819,8 @@ def main():
     ap.add_argument("--limit", type=int, default=3, help="candidates to finish this run")
     ap.add_argument("--hours", type=float, default=8.0, help="deadline from now")
     ap.add_argument("--topic", default="", help="steer the scout")
+    ap.add_argument("--issue-less", action="store_true",
+                    help="scout only fixes that no open issue reports; drop issue candidates, keep at most one")
     ap.add_argument("--resume", action="store_true", help="first pick up stopped candidates")
     ap.add_argument("--model", default="opus")
     ap.add_argument("--scout-model", default="sonnet")
@@ -4794,7 +4839,10 @@ def main():
                          "approves nothing")
     ap.add_argument("--approve-profile", metavar="ID", help="approve the learned rules with this id, then exit")
     ap.add_argument("--learn-model", default="opus")
-    sys.exit(Driver(ap.parse_args()).main())
+    args = ap.parse_args()
+    if args.issue_less and args.answer:
+        ap.error("--issue-less does nothing with --answer, which continues only the answered candidate")
+    sys.exit(Driver(args).main())
 
 
 if __name__ == "__main__":
