@@ -940,3 +940,31 @@ With `--resume`, a stopped candidate takes that slot (it still passes the assign
 the resume command an issue-less run prints keeps `--issue-less`, so resuming it does not turn
 into a normal run of `--limit` candidates. `--answer` with the flag is refused, since an
 answered candidate is the only one that run works. Unit checks: tests/smoke/unit_scout.py.
+
+## Declined before (2026-11-19, found in a pydantic scout run)
+
+The scout picked pydantic#12116 and drafted a request to be assigned. The issue looked open,
+unclaimed and real, but the maintainer had already answered it elsewhere: an earlier fix
+(#12117) was labelled `deferred` with "this will only be possible to do in v3", and a later
+report (#13208) was closed as not planned with "this can be changed of course, but not in
+v2". Neither shows in the issue's own comments. GitHub records them only as cross-reference
+events on the issue's timeline, and the snapshot held open items and comments only.
+
+- The snapshot now reads those events for every listed issue (`fetch_issue_history`: one
+  GraphQL read per 40 issues; a batch that fails on an unknown number is retried one issue
+  at a time, while any other failure, such as a rate limit or a timeout, marks the rest as
+  not read and stops, so a refused API is not asked 300 more times. An issue that was not
+  read says so and names the `gh api .../timeline --paginate` read to ask for). It keeps
+  the items in this repo, with state (merged, closed unmerged, closed: not planned) and
+  labels, in `gh/history.json`.
+- Each `gh/issues/<n>.md` gets a `## Linked from` list, and each `gh/issues.txt` line a
+  `linked N (K closed unmerged or not planned)` field, so a likely answer shows in the
+  index the scout reads whole.
+- scout.md and A-investigate.md gain a "not declined before" check: read the comments and
+  reviews of each closed, unmerged PR and not-planned issue on that list; for an
+  issue-less fix, search closed issues and PRs with its terms. A maintainer's decline,
+  deferral to a later release, or "expected behaviour" drops the candidate, quoted; a PR its
+  author left, a stale-bot close, or a no to one approach only does not.
+- The driver does not judge declines itself: whether a closed PR was turned down or just
+  abandoned by its author takes reading the thread, so the list is evidence for the
+  session, not a filter.

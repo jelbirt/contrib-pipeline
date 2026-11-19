@@ -292,6 +292,34 @@ def write_digests(dest, repo, limits=None):
         full = f"{who(rp.get('owner'))}/{one_line(rp.get('name'), 100)}"
         return f"#{r['number']}" if full.lower() in (repo.lower(), "-/") else f"{full}#{r['number']}"
 
+    hist = read_json(dest / "history.json", None)
+
+    def linked(n):
+        """(index field, md lines) for the issues and PRs that mention issue n (history.json)."""
+        ask = f"ask the driver for a `gh api repos/{repo}/issues/{n}/timeline --paginate` read"
+        h = hist.get(str(n)) if isinstance(hist, dict) else None
+        if not isinstance(h, dict) or not isinstance(h.get("items"), list):
+            why = "not fetched" if not isinstance(hist, dict) else \
+                f"not read ({one_line(h.get('error'), 200) if isinstance(h, dict) else 'missing'})"
+            return "linked ?", [f"- {why}: {ask}"]
+        items = [i for i in h["items"] if isinstance(i, dict) and type(i.get("number")) is int]
+        lines, flagged = [], 0
+        for i in items:
+            st = one_line(i.get("state"), 30) or "?"
+            flagged += st in ("closed unmerged", "closed: not planned")
+            lab = ", ".join(one_line(x, 60) for x in i.get("labels") or [] if isinstance(x, str))
+            lines.append(f"- {'PR' if i.get('kind') == 'pr' else 'issue'} #{i['number']}, {st}"
+                         f"{', labels: ' + lab if lab else ''}, opened {one_line(i.get('opened'), 10) or '?'}: "
+                         f"{one_line(i.get('title'), 200)}")
+        more = h.get("more") if type(h.get("more")) is int else 0
+        if more > 0:
+            lines.append(f"- and {more} more not listed: {ask}")
+        other = h.get("other_repos") if type(h.get("other_repos")) is int else 0
+        if other > 0:
+            lines.append(f"- and {other} from other repos, not listed")
+        idx = f"linked {len(items)}" + (f" ({flagged} closed unmerged or not planned)" if flagged else "")
+        return idx, lines or ["- none"]
+
     note = "Lines starting with > are the author's and commenters' own words, quoted as data."
     for sub in ("issues", "prs"):
         p = dest / sub
@@ -308,16 +336,20 @@ def write_digests(dest, repo, limits=None):
 
     issues = load("issues")
     out = ["# Open issues, newest first, one per line: number | opened | updated | comments | assignees "
-           "| labels | title. Full text and comments: issues/<number>.md"] + cut("issues", issues)
+           "| labels | linked issues and PRs | title. Full text, comments and the linked list: issues/<number>.md"]
+    out += cut("issues", issues)
     for x in issues if issues is not None else []:
         n, com = x["number"], [c for c in x.get("comments") or [] if isinstance(c, dict)]
         out.append(f"#{n} | {day(x.get('createdAt'))} | upd {day(x.get('updatedAt'))} | {len(com)} comments "
                    f"| assigned: {names(x.get('assignees'), 'login')} | {names(x.get('labels'), 'name')} "
-                   f"| {one_line(x.get('title'), 200)}")
+                   f"| {linked(n)[0]} | {one_line(x.get('title'), 200)}")
         md = [f"# Issue #{n}: {one_line(x.get('title'), 300)}", "",
               f"- author: {who(x.get('author'))}", f"- opened: {one_line(x.get('createdAt'), 25)}",
               f"- updated: {one_line(x.get('updatedAt'), 25)}",
               f"- assignees: {names(x.get('assignees'), 'login')}", f"- labels: {names(x.get('labels'), 'name')}",
+              "", "## Linked from", "",
+              "Issues and PRs in this repo that mention this one. A closed one can hold the maintainers' "
+              "answer to this change.", ""] + linked(n)[1] + [
               "", note, "", "## Body", "", quoted(x.get("body")), "", f"## Comments ({len(com)})"]
         for c in com:
             hidden = f" (hidden: {one_line(c.get('minimizedReason'), 40) or 'yes'})" if c.get("isMinimized") else ""
@@ -364,6 +396,81 @@ def write_digests(dest, repo, limits=None):
     if mine is None:
         out.append("# mine.json could not be read")
     (dest / "mine.txt").write_text("\n".join(out) + "\n")
+
+
+HISTORY_ITEM = "number title state createdAt repository { nameWithOwner } labels(first: 10) { nodes { name } }"
+
+
+def fetch_issue_history(gh, repo, numbers, batch=40, first=30):
+    """For each issue number, the issues and PRs in repo whose text mentions it (GitHub's
+    cross-reference events), with state and labels: a closed, unmerged PR labelled deferred or
+    an issue closed as not planned is often the maintainers' answer to the change an open issue
+    asks for, and the issue's own comments may not say so. One GraphQL read per batch. A batch
+    that fails on an unknown number is retried one issue at a time; any other failure (a rate
+    limit, auth, the network, a timeout) would fail every read the same way, so it marks this
+    batch and all later ones as not read and stops. gh is Driver.gh or a fake."""
+    owner, name = repo.split("/", 1)
+    nums = sorted({n for n in numbers if type(n) is int and n > 0})
+    out = {}
+    parts = [nums[k:k + batch] for k in range(0, len(nums), batch)]
+    while parts:
+        part = parts.pop(0)
+        body = " ".join(
+            f"i{n}: issue(number: {n}) {{ timelineItems(first: {first}, itemTypes: [CROSS_REFERENCED_EVENT]) "
+            f"{{ totalCount nodes {{ ... on CrossReferencedEvent {{ source {{ __typename "
+            f"... on Issue {{ {HISTORY_ITEM} stateReason }} ... on PullRequest {{ {HISTORY_ITEM} merged }} }} }} }} }} }}"
+            for n in part)
+        q = f"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {body} }} }}"
+        try:
+            data = json.loads(gh("api", "graphql", "-f", f"query={q}", "-f", f"owner={owner}", "-f", f"name={name}"))
+            found = data["data"]["repository"]
+            if not isinstance(found, dict):
+                raise ValueError("no repository in the reply")
+        except (RuntimeError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as e:
+            unknown = "Could not resolve to" in str(e)
+            if unknown and len(part) > 1:
+                parts[:0] = [[n] for n in part]
+                continue
+            err = one_line(str(e), 200) or "the read failed"
+            for n in part + ([] if unknown else [x for p in parts for x in p]):
+                out[str(n)] = {"error": err}
+            if not unknown:
+                break
+            continue
+        for n in part:
+            tl = found.get(f"i{n}")
+            tl = tl.get("timelineItems") if isinstance(tl, dict) else None
+            if not isinstance(tl, dict):
+                out[str(n)] = {"error": "not in the reply"}
+                continue
+            nodes = [e for e in tl.get("nodes") or [] if isinstance(e, dict)]
+            items, other, seen = [], 0, set()
+            for ev in nodes:
+                src = ev.get("source")
+                if not isinstance(src, dict) or type(src.get("number")) is not int:
+                    continue
+                where = (src.get("repository") or {}).get("nameWithOwner") if isinstance(src.get("repository"), dict) else ""
+                if str(where or "").lower() != repo.lower():
+                    other += 1
+                    continue
+                kind = "pr" if src.get("__typename") == "PullRequest" else "issue"
+                if (kind, src["number"]) in seen or (kind == "issue" and src["number"] == n):
+                    continue
+                seen.add((kind, src["number"]))
+                closed = str(src.get("state") or "").upper() != "OPEN"
+                if kind == "pr":
+                    state = "merged" if src.get("merged") is True else "closed unmerged" if closed else "open"
+                else:
+                    why = str(src.get("stateReason") or "").lower().replace("_", " ")
+                    state = (f"closed: {why}" if why and why != "reopened" else "closed") if closed else "open"
+                labels = (src.get("labels") or {}).get("nodes") if isinstance(src.get("labels"), dict) else []
+                items.append({"kind": kind, "number": src["number"], "title": one_line(src.get("title"), 200),
+                              "state": state, "opened": one_line(src.get("createdAt"), 10),
+                              "labels": [one_line(x.get("name"), 60) for x in labels or [] if isinstance(x, dict)]})
+            total = tl.get("totalCount")
+            out[str(n)] = {"items": items, "other_repos": other,
+                           "more": max(0, total - len(nodes)) if type(total) is int else 0}
+    return out
 
 
 # The packet is the user's review of a candidate (rules/packet.md); stage C's output must have
@@ -2607,6 +2714,7 @@ class Driver:
         if self.args.stub:
             for n in ("issues", "prs", "mine"):
                 write_json(dest / f"{n}.json", [])
+            (dest / "history.json").unlink(missing_ok=True)
             write_digests(dest, self.repo)
             return
         lim = {"issues": 300, "prs": 200, "mine": 50}
@@ -2619,6 +2727,11 @@ class Driver:
         (dest / "issues.json").write_text(issues)
         (dest / "prs.json").write_text(prs)
         (dest / "mine.json").write_text(mine)
+        try:
+            nums = [x.get("number") for x in json.loads(issues) if isinstance(x, dict)]
+        except ValueError:
+            nums = []
+        write_json(dest / "history.json", fetch_issue_history(self.gh, self.repo, nums))
         (dest / "fetched.txt").write_text(now() + "\n")
         write_digests(dest, self.repo, lim)
 

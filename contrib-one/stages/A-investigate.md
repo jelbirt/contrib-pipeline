@@ -9,9 +9,18 @@ confirm them from the code before relying on them.
 
 1. **Recheck the claim and overlap** from `gh/` (fresh snapshot for this candidate): the
    issue's own file in `gh/issues/` for a new claim or assignee (no file: the issue is older
-   than the snapshot reaches, so ask for a `gh issue view` read), then `gh/prs.txt` and a Grep
+   than the snapshot reaches, so ask for `gh issue view <n> --comments` and `gh api
+   repos/<repo>/issues/<n>/timeline --paginate` reads), then `gh/prs.txt` and a Grep
    of `gh/prs/` for the files you expect to change. Read every open PR whose files or title
-   touch the same area. Any overlap: `abandon`.
+   touch the same area. Any overlap: `abandon`. Then check that maintainers have not
+   declined this change before: read the `## Linked from` list in the issue's file (or the
+   timeline read), and the comments and reviews of every closed, unmerged PR and not-planned
+   issue on it (`gh pr view <n> --comments` shows both; `gh issue view <n> --comments`). An
+   issue-less candidate gets `gh search issues` and `gh search prs` reads with `--state
+   closed` and its terms instead. A maintainer who declined it, deferred it to a later
+   release, or called the behaviour expected: `abandon`, quoting them, unless something
+   material changed since. A PR its author left, one a stale bot closed, or one turned down
+   only for how it made the change is not a decline.
 2. **Find the code.** Read the paths the candidate names and their callers. Read
    `git log` for those files: if a maintainer chose the current behaviour on purpose, note the
    commit and weigh that.
