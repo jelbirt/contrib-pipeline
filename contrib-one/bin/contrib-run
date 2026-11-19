@@ -1203,15 +1203,19 @@ def issue_number(x):
     return int(m.group(1)) if m and int(m.group(1)) > 0 else -1
 
 
-ISSUE_REF = re.compile(r"\bissues?\s*#?\d|/issues/\d|^\s*#\d", re.I)
+ISSUE_REF = re.compile(r"(?<![&\w])#\d|[\w.-]/[\w.-]+#\d|\bgh-\d|\bissues?\W{0,3}#?\d|/issues/\d", re.I)
+NO_ISSUE = {"", "none", "null", "n/a", "-", "false", "no", "no issue"}
 
 
 def names_issue(c):
-    """True when a scout candidate points at an issue: a positive issue number, or an issue
-    field or source that names one ("issue #12", "#12", an issues URL). Wording such as
-    "issue-less fix" or "gap: ..." does not count."""
-    n = issue_number(c.get("issue"))
-    return bool(n and n > 0) or any(ISSUE_REF.search(str(c.get(k) or "")) for k in ("issue", "source"))
+    """True unless a scout candidate plainly names no issue. Its issue field must be empty (null,
+    false, or a word such as "none"): any other value counts, readable or not. Its source must
+    cite no issue or PR ("#12", "owner/repo#12", "GH-12", "issue 12", an issues URL); wording
+    such as "issue-less fix" or "gap: ..." does not count."""
+    x = c.get("issue")
+    if not (x is None or x is False or (isinstance(x, str) and x.strip().lower() in NO_ISSUE)):
+        return True
+    return bool(ISSUE_REF.search(str(c.get("source") or "")))
 
 
 def counts_note(c):
@@ -1867,6 +1871,12 @@ class Driver:
             with open(stamp, "a") as f:
                 f.write(lock_id + "\n")
         return rc
+
+    def resume_cmd(self):
+        """The command that resumes this run's stopped candidates; an issue-less run's keeps the
+        flag, so the resumed run still takes one candidate and scouts no issue."""
+        flag = " --issue-less" if getattr(self.args, "issue_less", False) else ""
+        return f"contrib-run --repo {self.repo} --resume{flag}"
 
     def run_limit(self):
         """How many candidates this run works: answering a candidate runs only that one, and an
@@ -4716,7 +4726,7 @@ class Driver:
                 self.state(status="stopped", stop_reason=reason, stop_kind=self.stop_kind, stopped=now(),
                            cleanup=note, last_good_sha=self.git("rev-parse", "--verify", "--quiet", s.get("branch", "-"),
                                                                 check=False) or None,
-                           resume=f"contrib-run --repo {self.repo} --resume")
+                           resume=self.resume_cmd())
                 self.archive_transcripts(self.cand)
                 self.done.append((self.cand.name, "stopped"))
         except Exception as e:
@@ -4746,7 +4756,7 @@ class Driver:
         if leftovers:
             banner.append("> **Still running or kept, check these:** " + "; ".join(leftovers) + ".")
         if any(st == "stopped" for _, st in self.done):
-            banner.append(f"> Resume with: `contrib-run --repo {self.repo} --resume`")
+            banner.append(f"> Resume with: `{self.resume_cmd()}`")
         try:
             self.write_summary()
             banner.append(f"> Summary: [runs/{self.run_id}/SUMMARY.md](runs/{self.run_id}/SUMMARY.md).")
@@ -4829,7 +4839,10 @@ def main():
                          "approves nothing")
     ap.add_argument("--approve-profile", metavar="ID", help="approve the learned rules with this id, then exit")
     ap.add_argument("--learn-model", default="opus")
-    sys.exit(Driver(ap.parse_args()).main())
+    args = ap.parse_args()
+    if args.issue_less and args.answer:
+        ap.error("--issue-less does nothing with --answer, which continues only the answered candidate")
+    sys.exit(Driver(args).main())
 
 
 if __name__ == "__main__":

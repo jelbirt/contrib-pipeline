@@ -32,8 +32,8 @@ fix, search `gh/issues.txt` and Grep `gh/issues/` for the behaviour it changes: 
 defect an open issue already reports belongs to that issue, so drop it rather than list it
 without the issue. If `gh/issues.txt` says gh's limit was reached, older issues are not in
 the snapshot: ask for a `gh search issues` read with the fix's terms before you list it. Set
-`"issue": null`, write a `source` such as `gap: <what>` that names no issue, and give one
-candidate at most.
+`"issue": null`, write a `source` such as `gap: <what>` with no issue or PR number or link in
+it (the driver drops a candidate whose source cites one), and give one candidate at most.
 
 ## Every candidate must pass all of these (drop it otherwise)
 - **Unclaimed:** no "I'll take this" in the last 14 days, no assignee other than the

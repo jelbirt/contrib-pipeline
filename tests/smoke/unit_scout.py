@@ -25,12 +25,20 @@ CANDS = [
     {"slug": "url-source", "title": "U", "source": "https://github.com/o/r/issues/5", "why": "w"},
     {"slug": "hash-issue", "title": "N", "source": "gap: n", "issue": "#123", "why": "w"},
     {"slug": "word-issue", "title": "W", "source": "gap: w", "issue": "issue 12", "why": "w"},
+    {"slug": "see-source", "title": "E", "source": "gap: x (see #12116)", "issue": None, "why": "w"},
+    {"slug": "repo-source", "title": "R", "source": "o/r#12116", "why": "w"},
+    {"slug": "gh-source", "title": "G", "source": "GH-12116", "why": "w"},
+    {"slug": "dash-source", "title": "D", "source": "issue-12116", "why": "w"},
+    {"slug": "note-issue", "title": "O", "source": "gap: o", "issue": "12116 (open)", "why": "w"},
+    {"slug": "list-issue", "title": "L", "source": "gap: l", "issue": [12116], "why": "w"},
+    {"slug": "dict-issue", "title": "J", "source": "gap: j", "issue": {"number": 12116}, "why": "w"},
     {"slug": "known-slug", "title": "K", "source": "gap: k", "why": "w"},
     {"slug": "free-1", "title": "A", "source": "issue-less: gap in a", "issue": False, "why": "w"},
     {"slug": "free-2", "title": "B", "source": "small fix", "issue": "none", "why": "w"},
     {"slug": "free-3", "title": "C", "source": "Issueless small fix", "why": "w"},
 ]
-ISSUE_SLUGS = ["has-issue", "issue-source", "mid-source", "hash-source", "url-source", "hash-issue", "word-issue"]
+ISSUE_SLUGS = ["has-issue", "issue-source", "mid-source", "hash-source", "url-source", "hash-issue", "word-issue",
+               "see-source", "repo-source", "gh-source", "dash-source", "note-issue", "list-issue", "dict-issue"]
 
 def run(issue_less):
     d = m.Driver.__new__(m.Driver)
@@ -77,12 +85,24 @@ check("a second scout call returns nothing and starts no session", again == [] a
 check("the second call is logged", any("not run again" in l for l in logs))
 
 check("names_issue reads a bare issue number", m.names_issue({"issue": "12"}) and m.names_issue({"issue": 12}))
-check("names_issue leaves gap sources alone", not m.names_issue({"source": "gap: issues list is empty", "issue": None}))
+check("names_issue leaves gap sources alone", not any(m.names_issue({"source": s, "issue": None}) for s in
+      ("gap: issues list is empty", "gap: &#39; in docs", "gap: C# 2 example", "gap: fails on Python 3.12")))
+check("names_issue counts an unreadable issue field", m.names_issue({"issue": 0}) and m.names_issue({"issue": "n/a?"}))
+
+d.repo = "own/repo"
+d.args = SimpleNamespace(issue_less=True)
+check("an issue-less run's resume command keeps the flag",
+      d.resume_cmd() == "contrib-run --repo own/repo --resume --issue-less")
+d.args = SimpleNamespace(issue_less=False)
+check("a normal run's resume command is unchanged", d.resume_cmd() == "contrib-run --repo own/repo --resume")
 
 stage = (Path(sys.argv[1]).resolve().parent.parent / "stages" / "scout.md").read_text()
 check("scout.md says what the prompt's issue-less line means", "takes issue-less fixes only" in stage)
 h = subprocess.run([sys.executable, "-I", sys.argv[1], "--help"], capture_output=True, text=True)
 check("the flag is on the command line", "--issue-less" in h.stdout)
+a = subprocess.run([sys.executable, "-I", sys.argv[1], "--repo", "own/repo", "--issue-less", "--answer", "s", "t"],
+                   capture_output=True, text=True)
+check("the flag is refused with --answer", a.returncode == 2 and "does nothing with --answer" in a.stderr)
 
 print("UNIT SCOUT " + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
