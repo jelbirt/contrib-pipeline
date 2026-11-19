@@ -917,3 +917,20 @@ rebuilt on each snapshot, so the refresh before stage C leaves no file from a cl
 scout, A and C prompts read the text files; C no longer names `gh/search-*.json`, which nothing
 writes. A session's own gh reads are still saved as gh prints them, and the xerj profile still
 names `gh/prs.json`, which still exists. Unit checks: tests/smoke/unit_digest.py.
+
+## Issue-less runs (2026-11-19, found in a pydantic scout run)
+
+A profile with `ASSIGN_FIRST=1` stops every issue candidate after the scout until the
+contributor is assigned, and on some repos outside contributors are rarely assigned. A
+`--topic` asking for issue-less fixes did not help: the scout prompt ranks open issues first,
+and the 2026-11-19 pydantic scout picked issue #12116 anyway. `--issue-less` makes it a run
+setting. The scout's prompt says the run takes issue-less fixes only, and `scout.md` says to
+check the snapshot so that a defect an open issue already reports is not passed off without
+its issue (which would get around the repo's assignment rule); when the snapshot hit gh's
+issue limit, the scout also asks for a `gh search issues` read. The driver holds the line even
+if the scout does not: it drops any candidate that names an issue (a positive issue number, or
+an issue reference such as `issue #12`, `#12` or an issues URL in its issue or source field;
+wording such as "issue-less" does not count) and clears the issue field of the rest. The run
+works one candidate, as the one-issue-less-candidate rule above asks: `run_limit()` is 1 and
+`scout()` runs once per run, so a later scout turn, or a stale `candidates.json`, cannot add a
+second. Unit checks: tests/smoke/unit_scout.py.

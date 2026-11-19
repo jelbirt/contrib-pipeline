@@ -1203,6 +1203,17 @@ def issue_number(x):
     return int(m.group(1)) if m and int(m.group(1)) > 0 else -1
 
 
+ISSUE_REF = re.compile(r"\bissues?\s*#?\d|/issues/\d|^\s*#\d", re.I)
+
+
+def names_issue(c):
+    """True when a scout candidate points at an issue: a positive issue number, or an issue
+    field or source that names one ("issue #12", "#12", an issues URL). Wording such as
+    "issue-less fix" or "gap: ..." does not count."""
+    n = issue_number(c.get("issue"))
+    return bool(n and n > 0) or any(ISSUE_REF.search(str(c.get(k) or "")) for k in ("issue", "source"))
+
+
 def counts_note(c):
     """A test run's counts for its index note. When the report calls every test skipped, no test passed
     (a runner may report expected failures as skipped too), so the note says that in words: a session
@@ -1858,8 +1869,11 @@ class Driver:
         return rc
 
     def run_limit(self):
-        """How many candidates this run works: answering a candidate runs only that one."""
-        return 1 if getattr(self, "answer_cand", None) else self.args.limit
+        """How many candidates this run works: answering a candidate runs only that one, and an
+        issue-less run takes one at most."""
+        if getattr(self, "answer_cand", None) or getattr(self.args, "issue_less", False):
+            return 1
+        return self.args.limit
 
     # ----- preflight -----------------------------------------------------------------
     def preflight(self):
@@ -4373,6 +4387,11 @@ class Driver:
         return status
 
     def scout(self):
+        issue_less = bool(getattr(self.args, "issue_less", False))
+        if issue_less and getattr(self, "issue_less_scouted", False):
+            self.log("scout: not run again; an issue-less run scouts once and takes one candidate at most")
+            return []
+        self.issue_less_scouted = issue_less
         home = self.run_dir / "scout"
         sdir = home / "session"
         sdir.mkdir(parents=True, exist_ok=True)
@@ -4390,6 +4409,9 @@ class Driver:
         if self.assign_first:
             prompt += (" In this repo, work on an issue starts only once the issue is assigned to the contributor: "
                        "add assign_comment to each issue candidate not assigned to them yet.")
+        if issue_less:
+            prompt += (" This run takes issue-less fixes only: list no open issue, and no fix for a defect an "
+                       "open issue already reports. At most one candidate.")
         system = "\n\n---\n\n".join([(SKILL / "rules" / "common.md").read_text(), self.prof_md,
                                      (SKILL / "stages" / "scout.md").read_text()])
         nxt = sdir / "next.json"
@@ -4423,14 +4445,25 @@ class Driver:
             cands = json.loads(raw) if raw else []
         except ValueError:
             cands = []
-        out = []
+        out, dropped = [], 0
         for c in cands if isinstance(cands, list) else []:
             if isinstance(c, dict) and isinstance(c.get("slug"), str) and c["slug"] not in known:
+                if issue_less and names_issue(c):
+                    dropped += 1
+                    continue
                 out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "issue_less",
                                               "assign_comment") if k in c})
+                if issue_less:
+                    out[-1]["issue"] = None       # whatever else it wrote, it is not an issue number
                 terms = c.get("search_terms")
                 if isinstance(terms, list):
                     out[-1]["search_terms"] = [one_line(t, 60) for t in terms[:3] if isinstance(t, str) and t.strip()]
+        if issue_less:
+            if dropped:
+                self.log(f"scout: dropped {dropped} issue candidate(s); this run takes issue-less fixes only")
+            if len(out) > 1:
+                self.log(f"scout: kept 1 of {len(out)} issue-less candidates; at most one per run")
+            out = out[:1]
         return out
 
     # ----- publish-time retest --------------------------------------------------------
@@ -4776,6 +4809,8 @@ def main():
     ap.add_argument("--limit", type=int, default=3, help="candidates to finish this run")
     ap.add_argument("--hours", type=float, default=8.0, help="deadline from now")
     ap.add_argument("--topic", default="", help="steer the scout")
+    ap.add_argument("--issue-less", action="store_true",
+                    help="scout only fixes that no open issue reports; drop issue candidates, keep at most one")
     ap.add_argument("--resume", action="store_true", help="first pick up stopped candidates")
     ap.add_argument("--model", default="opus")
     ap.add_argument("--scout-model", default="sonnet")
