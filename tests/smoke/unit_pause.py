@@ -64,7 +64,7 @@ def driver(mode="autonomous", pick=None, limit=3, scouted=(), cap=None):
     d.ledger_commit = lambda msg: None
     d.shutdown = lambda: True
     d.git = lambda *a, **k: "f" * 40
-    d.all_states = lambda: [{"_dir": str(p)} for p in sorted((LEDGER / "candidates").iterdir())]
+    d.cand = None
     def open_count():
         return (0, 10) if cap is not None and len(d.done) >= cap else (0, 0)
     d.open_count = open_count
@@ -72,9 +72,12 @@ def driver(mode="autonomous", pick=None, limit=3, scouted=(), cap=None):
         d.scouts.append(1)
         return [dict(c) for c in scouted]
     d.scout = scout
-    def work(c, resume_dir=None):
-        d.worked.append(c["slug"])
-        d.done.append((c["slug"], "ready"))
+    def work(c, resume_dir=None, pick=False):   # the real one unlists a pick once its state is written
+        slug = Path(resume_dir).name if resume_dir else c["slug"]
+        if pick:
+            d.unlist(slug)
+        d.worked.append(slug)
+        d.done.append((slug, "ready"))
     d.work_candidate = work
     return d
 
@@ -169,6 +172,66 @@ check("pick: the last one empties the list", d.main() == m.EXIT_DONE
       and json.loads(SAVED.read_text())["candidates"] == [])
 check("QUEUE.md: an empty list shows no section", d.scouted_lines() == [])
 check("pick: an empty list is refused, saying how to make one", refused(["fix-thing-2"]))
+
+def listed():
+    return [c["slug"] for c in json.loads(SAVED.read_text())["candidates"]]
+def save_list(*cands):
+    SAVED.write_text(json.dumps({"repo": REPO, "run": "run-0", "scouted": "t", "candidates": list(cands)}))
+def put_state(slug, **st):
+    (LEDGER / "candidates" / slug).mkdir(parents=True, exist_ok=True)
+    (LEDGER / "candidates" / slug / "state.json").write_text(json.dumps({"repo": REPO, **st}))
+
+# The real work_candidate: an error before the ledger holds the pick leaves it on the list, with no folder.
+save_list({"slug": "real-a", "title": "A", "issue": "x"}, {"slug": "real-b", "title": "B", "issue": 7})
+d = driver(pick=["real-b"]); del d.work_candidate
+def git_fails(*a, **k):
+    raise RuntimeError("no upstream")
+d.git = git_fails
+check("pick: an error before the candidate is in the ledger stops the run hard", d.main() == m.EXIT_HARD)
+check("pick: and the pick stays on the list, with no folder squatting its name",
+      listed() == ["real-a", "real-b"] and not (LEDGER / "candidates" / "real-b").exists())
+
+# The real work_candidate: a pick leaves the list once its state is written.
+d = driver(pick=["real-a"]); del d.work_candidate
+d.assign_first = True                     # an unreadable issue is then dropped right after the state write
+d.reject = lambda *a, **k: None
+d.finish = lambda status, **k: d.done.append(("real-a", status))
+check("pick: the real work_candidate runs the pick", d.main() == m.EXIT_DONE and d.done == [("real-a", "abandoned")])
+check("pick: it leaves the list only with its state written",
+      listed() == ["real-b"] and json.loads((LEDGER / "candidates" / "real-a" / "state.json").read_text())["status"] == "running")
+
+# An issue a later run took under another name.
+put_state("issue-7-other", issue=7, status="ready")
+check("pick: an issue already in the ledger under another name is refused", refused(["real-b"]))
+check("QUEUE.md: and the list says so", "already in the ledger as issue-7-other, so a pick is refused" in "\n".join(d.scouted_lines()))
+put_state("issue-7-other", repo="other/repo", issue=7, status="ready")
+check("pick: the same number in another repo is not the same issue", m.Driver.pick_setup(d, ["real-b"])[0]["slug"] == "real-b")
+
+# A resume in pause mode works the stopped candidates and does not scout over the list.
+put_state("stopped-a", status="stopped")
+before = SAVED.read_text()
+d = driver("pause", scouted=FOUND); d.args.resume = True
+check("pause: a resume ends done", d.main() == m.EXIT_DONE)
+check("pause: a resume works the stopped candidates and does not scout",
+      d.worked == ["stopped-a"] and d.scouts == [] and SAVED.read_text() == before)
+check("pause: a resume's stop reason says it does not scout",
+      d.stop_reason == "pause mode: resumed 1 stopped candidate; a resume does not scout")
+d = driver("autonomous", scouted=FOUND, limit=2); d.args.resume = True
+check("autonomous: a resume still scouts after its stopped candidates",
+      d.main() == m.EXIT_DONE and d.worked == ["stopped-a", "Fix_Thing"] and d.scouts == [1])
+shutil.rmtree(LEDGER / "candidates" / "stopped-a")
+
+# A stop asked for during the scout keeps its kind and reason; the list is still saved.
+d = driver("pause", scouted=FOUND[:1])
+plain = d.scout
+def scout_then_stop():
+    found = plain()
+    d.request_stop("soft", "STOP file")
+    return found
+d.scout = scout_then_stop
+check("pause: a stop asked for during the scout ends the run soft", d.main() == m.EXIT_SOFT)
+check("pause: with the stop's own reason", d.stop_reason == "STOP file")
+check("pause: and the list is still saved", json.loads(SAVED.read_text())["run"] == "run-1" and listed() == ["fix-thing"])
 
 # ----- the command line --------------------------------------------------------------------------
 h = subprocess.run([sys.executable, "-I", sys.argv[1], "--help"], capture_output=True, text=True)

@@ -45,8 +45,10 @@ set it) and overridden for one run by `--mode autonomous|pause`:
   list to the user (title, issue, why, size, confidence, files, and the assignment request draft
   where there is one) and let them choose. Then start the work the same way, with `--pick SLUG
   [SLUG ...]` in place of `--limit`: it works those candidates in the order given, never scouts,
-  and refuses a slug that is not on the list. A picked candidate leaves the list when its work
-  starts; the rest stay until the next pause run replaces the list. Stage A rechecks claims and
+  and refuses a slug that is not on the list or whose issue a later run already took. A picked
+  candidate leaves the list when its work starts; the rest stay until the next pause run
+  replaces the list. A `--resume` in pause mode works only the stopped candidates and does not
+  scout. Stage A rechecks claims and
   overlapping PRs before any fix, so an older list is safe to pick from. `--pick` does not go
   with `--answer`, `--resume`, `--issue-less` or `--topic`.
 

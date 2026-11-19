@@ -4206,18 +4206,18 @@ class Driver:
             n += 1
         return slug
 
-    def work_candidate(self, c, resume_dir=None):
+    def work_candidate(self, c, resume_dir=None, pick=False):
         if resume_dir:
             self.cand = Path(resume_dir)
             slug = self.cand.name
         else:
+            base = self.git("rev-parse", self.upstream)   # before any folder: a failure leaves none
             slug = self.new_slug(c.get("slug"))
             self.cand = LEDGER / "candidates" / slug
         for d in ("results", "gh", "sessions", "session"):
             (self.cand / d).mkdir(parents=True, exist_ok=True)
         n = None
         if not resume_dir:
-            base = self.git("rev-parse", self.upstream)
             n = issue_number(c.get("issue"))
             self.state(slug=slug, repo=self.repo, title=one_line(c.get("title"), 200),
                        source=one_line(c.get("source"), 200), issue=n if n and n > 0 else None,
@@ -4225,6 +4225,8 @@ class Driver:
                        branch=self.prof.get("BRANCH_PREFIX", "fix/") + slug, clone=str(self.clone()),
                        search_terms=c.get("search_terms", []),
                        run=self.run_id, started=now(), candidate=c)
+            if pick:
+                self.unlist(c.get("slug"))   # only now: the ledger holds it, so it is never in neither
         else:
             self.state(status="running", run=self.run_id, stop_reason=None, stop_kind=None)
         s = self.st()
@@ -4661,8 +4663,15 @@ class Driver:
         self.scouted = self.save_scouted(cands)
         n = len(self.scouted["candidates"])
         self.log("pause mode: scouted " + ", ".join(c["slug"] for c in self.scouted["candidates"]))
-        self.stop_kind, self.stop_reason = "done", (f"pause mode: {n} scouted candidate{'s' if n != 1 else ''} "
-                                                    "wait for your pick")
+        with self.lock:
+            if not self.stop_kind:   # a stop asked for during the scout keeps its kind and reason
+                self.stop_kind, self.stop_reason = "done", (f"pause mode: {n} scouted candidate"
+                                                            f"{'s' if n != 1 else ''} wait for your pick")
+
+    def pause_resume(self):
+        """A --resume in pause mode works the stopped candidates and ends: scouting would replace
+        the list the user has not picked from yet."""
+        return bool(self.args.resume) and self.run_mode == "pause"
 
     def pick_setup(self, slugs):
         """--pick: the named candidates from the saved list, in the order given. Refuses a name the
@@ -4673,7 +4682,7 @@ class Driver:
             raise RuntimeError(f"no scouted candidates wait for a pick in {self.repo}; a pause run "
                                "(--mode pause, or RUN_MODE=pause in the profile) makes the list")
         by = {c["slug"]: c for c in cands if isinstance(c, dict) and isinstance(c.get("slug"), str)}
-        known = {Path(s["_dir"]).name for s in self.all_states()}
+        worked = self.ledger_issues().get(self.repo, {})
         out = []
         for s in slugs:
             if any(c["slug"] == s for c in out):
@@ -4681,9 +4690,24 @@ class Driver:
             if s not in by:
                 raise RuntimeError(f"{s} is not on the list scouted {one_line(saved.get('scouted'), 40)}, "
                                    f"which holds: {', '.join(by)}")
-            if s in known:
-                raise RuntimeError(f"{s} is already in the ledger (candidates/{s}): a run took it after the scout")
+            if (LEDGER / "candidates" / s).exists() or (WORK / "clones" / s).exists():
+                raise RuntimeError(f"{s} is already in the ledger (candidates/{s} or clones/{s}): "
+                                   "a run took the name after the scout")
+            n = issue_number(by[s].get("issue"))
+            if n and n > 0 and n in worked:
+                raise RuntimeError(f"{s} is issue #{n}, already in the ledger as {worked[n]}: "
+                                   "a run took the issue under another name after the scout")
             out.append(by[s])
+        return out
+
+    @staticmethod
+    def ledger_issues():
+        """{repo: {issue number: folder}} for every candidate in the ledger with an issue."""
+        out = {}
+        for f in sorted((LEDGER / "candidates").glob("*/state.json")):
+            st = read_json(f, None)
+            if isinstance(st, dict) and type(st.get("issue")) is int and st["issue"] > 0:
+                out.setdefault(str(st.get("repo")), {})[st["issue"]] = f.parent.name
         return out
 
     def unlist(self, slug):
@@ -4710,6 +4734,7 @@ class Driver:
                     lists.append((s, cands))
         if not lists:
             return []
+        worked = Driver.ledger_issues()
         lines = [f"## Scouted, waiting for your pick ({sum(len(c) for _, c in lists)})", ""]
         for s, cands in lists:
             base = md_text(str(s.get("base_sha") or "")[:10], 10)
@@ -4723,6 +4748,9 @@ class Driver:
                 n = issue_number(c.get("issue"))
                 facts = [f"issue #{n}" if n and n > 0 else "no issue"]
                 facts += [f"{k} {md_text(c[k], 20)}" for k in ("size", "confidence") if c.get(k)]
+                if n and n > 0 and n in worked.get(s["repo"], {}):
+                    facts.append(f"already in the ledger as {md_text(worked[s['repo']][n], 80)}, "
+                                 "so a pick is refused")
                 lines.append(f"{i}. **{md_text(c.get('title'), 200) or c['slug']}** (`{c['slug']}`): "
                              + ", ".join(facts))
                 lines.append(f"   - Why: {md_text(c.get('why'), 600)}")
@@ -4894,8 +4922,8 @@ class Driver:
                                               f">= {self.prof.get('MAX_OPEN', 10)}")
                     break
                 if not queue:
-                    if self.picks:
-                        break                      # a --pick run never scouts
+                    if self.picks or self.pause_resume():
+                        break                      # a --pick run, or a resume in pause mode, never scouts
                     found = self.scout()
                     if not found:
                         self.request_stop("soft", "no good candidates left")
@@ -4911,9 +4939,7 @@ class Driver:
                     if kind == "resume":
                         self.work_candidate({}, resume_dir=item)
                     else:
-                        if kind == "pick":
-                            self.unlist(item["slug"])
-                        self.work_candidate(item)
+                        self.work_candidate(item, pick=kind == "pick")
                 except StopRun:
                     raise
                 except Exception as e:
@@ -4926,6 +4952,8 @@ class Driver:
             if not self.stop_kind:
                 self.stop_kind, self.stop_reason = "done", (
                     f"the picked candidates are done ({len(self.picks)})" if self.picks
+                    else f"pause mode: resumed {len(self.done)} stopped candidate{'s' if len(self.done) != 1 else ''}; "
+                         "a resume does not scout" if self.pause_resume()
                     else f"candidate limit reached ({self.run_limit()})")
         except StopRun:
             pass

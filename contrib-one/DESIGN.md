@@ -1022,12 +1022,18 @@ candidates first, for more oversight of the work that will be done.
   leads with the pause and shows the same list.
 - `--pick SLUG [SLUG ...]` works the named candidates in the order given and never scouts; the
   limit becomes the number picked. It refuses a slug that is not on the list, one named twice,
-  one a later run already took, and an empty list (saying a pause run makes one). A candidate
-  leaves the list when its work starts, so a pick the run did not reach (a stop, the open-PR
-  cap) stays on it. The rest stay until the next pause run replaces the list; an autonomous run
-  leaves it alone. Stage A already rechecks claims and overlapping PRs before any fix, so an
+  a name a later run already took (a folder in the ledger or the work folder, the test the
+  folder naming uses), an issue a later run took under another name (`QUEUE.md` marks it), and
+  an empty list (saying a pause run makes one). A candidate leaves the list only once the
+  ledger holds it, so a pick the run did not reach (a stop, the open-PR cap, an error before
+  its first state write) stays on it, and the base commit is read before the candidate's
+  folder is made, so that error leaves no folder to squat the name. The rest stay until the
+  next pause run replaces the list; an autonomous run leaves it alone. Stage A already rechecks claims and overlapping PRs before any fix, so an
   older list is safe to pick from. `--pick` is refused with `--answer`, `--resume`,
   `--issue-less` and `--topic`, which each choose the work another way.
+- A `--resume` in pause mode works the stopped candidates and ends without scouting: a scout
+  would replace the list before the user picked from it. A stop asked for during a pause run's
+  scout keeps its kind, reason and exit code; the list is still saved.
 - No command drops a candidate from the list for now; the next pause run replaces it.
 
 Unit checks: tests/smoke/unit_pause.py. The stub suite runs a pause run, an unknown pick, a
