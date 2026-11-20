@@ -98,6 +98,7 @@ listed() { python3 -c "import json;print(' '.join(c['slug'] for c in json.load(o
 STUB_PREFIX=smkp STUB_CANDS=3 run --limit 3; want rc $rc 0; want "list saved" "$(listed)" "smkp-0 smkp-1 smkp-2"
 want "nothing worked" "$(ls $CONTRIB_LEDGER/candidates | grep -c '^smkp-')" 0
 want "QUEUE.md shows the list" "$(grep -c '^## Scouted, waiting for your pick (3)$' $CONTRIB_LEDGER/QUEUE.md)" 1
+want "the banner says how to pick" "$(grep -c '^> Pick from the scouted list below with' $CONTRIB_LEDGER/QUEUE.md)" 1
 want "the list is in the ledger's git" "$(git -C $CONTRIB_LEDGER ls-files repos/xerj-org-xerj/scouted.json | wc -l)" 1
 run --pick nope; want "a slug not on the list is refused" $rc 2
 run --pick smkp-2 smkp-0; want "pick rc" $rc 0

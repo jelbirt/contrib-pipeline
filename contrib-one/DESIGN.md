@@ -1032,7 +1032,11 @@ candidates first, for more oversight of the work that will be done.
   older list is safe to pick from. `--pick` is refused with `--answer`, `--resume`,
   `--issue-less` and `--topic`, which each choose the work another way.
 - A `--resume` in pause mode works the stopped candidates and ends without scouting: a scout
-  would replace the list before the user picked from it. A stop asked for during a pause run's
+  would replace the list before the user picked from it. So does a `--resume` that finishes a
+  picked candidate on any profile: a pick's state says `picked`, so after `--mode pause` on an
+  autonomous profile the plain `--resume` the banner prints cannot go on to scout and work
+  candidates the user never chose. A pick run that stops names the picks it did not reach in
+  its banner, with a ready `--pick` command for them. A stop asked for during a pause run's
   scout keeps its kind, reason and exit code; the list is still saved.
 - No command drops a candidate from the list for now; the next pause run replaces it.
 

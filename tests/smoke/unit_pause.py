@@ -106,8 +106,16 @@ check("pause: the list is saved with the folder names the candidates will get",
 check("pause: the list records its run, time and base", saved.get("run") == "run-1" and saved.get("repo") == REPO
       and saved.get("base_sha") == "f" * 40 and saved.get("scouted"))
 check("pause: the stop reason says how many wait", d.stop_reason == "pause mode: 4 scouted candidates wait for your pick")
+check("pause: the banner says how to pick",
+      d.pick_lines() == ["> Pick from the scouted list below with `contrib-run --repo own/repo --pick SLUG [SLUG ...]`."])
 check("pause: the scout's other fields are kept", saved["candidates"][0]["files"] == ["a/b.rs", "c|d.rs"]
       and saved["candidates"][0]["assign_comment"] == "may I take this?")
+
+keep = SAVED.read_text()
+(m.WORK / "clones" / "clone-held").mkdir(parents=True)
+check("pause: a name a clone in the work folder holds is not saved",
+      [c["slug"] for c in d.save_scouted([{"slug": "clone-held", "title": "x"}])["candidates"]] == ["clone-held-2"])
+(m.WORK / "clones" / "clone-held").rmdir(); SAVED.write_text(keep)
 
 d.write_summary()
 summary = (d.run_dir / "SUMMARY.md").read_text()
@@ -151,6 +159,9 @@ check("pick: a slug named twice is refused", refused(["cand-4", "cand-4"]))
 (LEDGER / "candidates" / "taken-2").mkdir()
 check("pick: a slug a later run took is refused", refused(["taken-2"]))
 (LEDGER / "candidates" / "taken-2").rmdir()
+(m.WORK / "clones" / "taken-2").mkdir(parents=True)
+check("pick: a slug whose clone a later run made is refused", refused(["taken-2"]))
+(m.WORK / "clones" / "taken-2").rmdir()
 
 d = driver(pick=["cand-4", "fix-thing"])
 check("pick: the run ends done", d.main() == m.EXIT_DONE)
@@ -158,6 +169,7 @@ check("pick: the picked ones are worked in the order given, with no scout",
       d.worked == ["cand-4", "fix-thing"] and d.scouts == [])
 check("pick: the limit is the number picked", d.run_limit() == 2)
 check("pick: the stop reason names the picks", d.stop_reason == "the picked candidates are done (2)")
+check("pick: with every pick reached, the banner adds no pick line", d.pick_lines() == [])
 check("pick: the picked ones leave the list, the rest stay",
       [c["slug"] for c in json.loads(SAVED.read_text())["candidates"]] == ["fix-thing-2", "taken-2"])
 check("pick: the worked candidate is the saved one, fields and all", d.picks[1]["files"] == ["a/b.rs", "c|d.rs"])
@@ -166,6 +178,9 @@ d = driver(pick=["taken-2", "fix-thing-2"], cap=1)
 check("pick: the open-PR cap still stops the run", d.main() == m.EXIT_SOFT and d.worked == ["taken-2"])
 check("pick: a pick the run did not reach stays on the list",
       [c["slug"] for c in json.loads(SAVED.read_text())["candidates"]] == ["fix-thing-2"])
+check("pick: and the banner names it with a ready --pick command",
+      d.pick_lines() == ["> Picks this run did not reach, still on the list: "
+                         "`contrib-run --repo own/repo --pick fix-thing-2`."])
 
 d = driver(pick=["fix-thing-2"])
 check("pick: the last one empties the list", d.main() == m.EXIT_DONE
@@ -199,6 +214,8 @@ d.finish = lambda status, **k: d.done.append(("real-a", status))
 check("pick: the real work_candidate runs the pick", d.main() == m.EXIT_DONE and d.done == [("real-a", "abandoned")])
 check("pick: it leaves the list only with its state written",
       listed() == ["real-b"] and json.loads((LEDGER / "candidates" / "real-a" / "state.json").read_text())["status"] == "running")
+check("pick: its state says it was picked, so a resume of it never scouts",
+      json.loads((LEDGER / "candidates" / "real-a" / "state.json").read_text()).get("picked") is True)
 
 # An issue a later run took under another name.
 put_state("issue-7-other", issue=7, status="ready")
@@ -215,11 +232,36 @@ check("pause: a resume ends done", d.main() == m.EXIT_DONE)
 check("pause: a resume works the stopped candidates and does not scout",
       d.worked == ["stopped-a"] and d.scouts == [] and SAVED.read_text() == before)
 check("pause: a resume's stop reason says it does not scout",
-      d.stop_reason == "pause mode: resumed 1 stopped candidate; a resume does not scout")
+      d.stop_reason == "resumed 1 stopped candidate; a resume in pause mode or of a pick does not scout")
 d = driver("autonomous", scouted=FOUND, limit=2); d.args.resume = True
 check("autonomous: a resume still scouts after its stopped candidates",
       d.main() == m.EXIT_DONE and d.worked == ["stopped-a", "Fix_Thing"] and d.scouts == [1])
-shutil.rmtree(LEDGER / "candidates" / "stopped-a")
+# After a --mode pause run on an autonomous profile, a stopped pick's --resume must not scout either.
+put_state("stopped-p", status="stopped", picked=True)
+d = driver("autonomous", scouted=FOUND, limit=3); d.args.resume = True
+check("autonomous: a resume that finishes a picked candidate does not scout",
+      d.main() == m.EXIT_DONE and d.worked == ["stopped-a", "stopped-p"] and d.scouts == [])
+check("autonomous: and its stop reason says why",
+      d.stop_reason == "resumed 2 stopped candidates; a resume in pause mode or of a pick does not scout")
+shutil.rmtree(LEDGER / "candidates" / "stopped-a"); shutil.rmtree(LEDGER / "candidates" / "stopped-p")
+
+# The real scout(): the fields a pick is made on survive its filter (guards the merge with the probe work).
+d = driver("pause"); del d.scout
+d.run_dir = t / "runs" / "scout-real"; d.prof = {"MAX_OPEN": "10", "CONTRIBUTOR": "me"}; d.prof_md = ""
+d.assign_first = False; d.args.scout_model = "sonnet"
+d.check_stop = lambda *a, **k: None
+d.snapshot = lambda dest: dest.mkdir(parents=True, exist_ok=True)
+d.all_states = lambda: []
+d.archive_transcripts = lambda home: None
+d.session_tmp = lambda home, make=True: t / "tmp"
+def scout_session(role, sdir, *a, **k):
+    (sdir / "candidates.json").write_text(json.dumps([dict(FOUND[0], slug="real-scout")]))
+    (sdir / "next.json").write_text(json.dumps({"action": "stage-done", "summary": "1 candidate"}))
+    return {}
+d.session = scout_session
+got = d.scout()
+check("scout: confidence and files survive its filter",
+      len(got) == 1 and got[0].get("confidence") == "high" and got[0].get("files") == ["a/b.rs", "c|d.rs"])
 
 # A stop asked for during the scout keeps its kind and reason; the list is still saved.
 d = driver("pause", scouted=FOUND[:1])

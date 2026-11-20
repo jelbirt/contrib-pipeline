@@ -47,9 +47,10 @@ set it) and overridden for one run by `--mode autonomous|pause`:
   [SLUG ...]` in place of `--limit`: it works those candidates in the order given, never scouts,
   and refuses a slug that is not on the list or whose issue a later run already took. A picked
   candidate leaves the list when its work starts; the rest stay until the next pause run
-  replaces the list. A `--resume` in pause mode works only the stopped candidates and does not
-  scout. Stage A rechecks claims and
-  overlapping PRs before any fix, so an older list is safe to pick from. `--pick` does not go
+  replaces the list. A `--resume` in pause mode, or one that finishes a picked candidate, works
+  only the stopped candidates and does not scout. When a pick run stops, its banner gives the
+  `--resume` for the stopped pick and a `--pick` command for the picks it did not reach. Stage A
+  rechecks claims and overlapping PRs before any fix, so an older list is safe to pick from. `--pick` does not go
   with `--answer`, `--resume`, `--issue-less` or `--topic`.
 
 Tell the user how to stop it: `touch ~/contrib-queue/STOP` lets the current stage finish (a stage

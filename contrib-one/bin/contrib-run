@@ -1383,6 +1383,7 @@ class Driver:
     run_mode = "autonomous"
     picks = None                 # --pick: the scouted candidates this run works, in order
     scouted = None               # pause mode: the list this run saved for your pick
+    resume_picks = False         # --resume: a stopped candidate was picked, so the resume never scouts
     env_dir = None
     last_counts = None
 
@@ -4224,7 +4225,7 @@ class Driver:
                        status="running", stage="A", stages_done=[], base_sha=base,
                        branch=self.prof.get("BRANCH_PREFIX", "fix/") + slug, clone=str(self.clone()),
                        search_terms=c.get("search_terms", []),
-                       run=self.run_id, started=now(), candidate=c)
+                       run=self.run_id, started=now(), candidate=c, **({"picked": True} if pick else {}))
             if pick:
                 self.unlist(c.get("slug"))   # only now: the ledger holds it, so it is never in neither
         else:
@@ -4669,9 +4670,26 @@ class Driver:
                                                             f"{'s' if n != 1 else ''} wait for your pick")
 
     def pause_resume(self):
-        """A --resume in pause mode works the stopped candidates and ends: scouting would replace
-        the list the user has not picked from yet."""
-        return bool(self.args.resume) and self.run_mode == "pause"
+        """A --resume in pause mode, or one that finishes a picked candidate, works the stopped
+        candidates and ends. Scouting would replace the list the user has not picked from yet, or
+        (on an autonomous profile after a --mode pause run) work candidates the user never chose."""
+        return bool(self.args.resume) and (self.run_mode == "pause" or self.resume_picks)
+
+    def pick_lines(self):
+        """Banner lines: how to pick from a list this run saved, and the picks it did not reach
+        (still on the list, so another --pick starts them; a stopped pick is a --resume)."""
+        out = []
+        if self.scouted is not None and self.scouted["candidates"]:
+            out.append(f"> Pick from the scouted list below with `contrib-run --repo {self.repo} --pick SLUG [SLUG ...]`.")
+        if self.picks:
+            saved = read_json(self.scouted_file(), None)
+            left = ({c.get("slug") for c in saved["candidates"] if isinstance(c, dict)}
+                    if isinstance(saved, dict) and isinstance(saved.get("candidates"), list) else set())
+            rest = [c["slug"] for c in self.picks if c["slug"] in left]
+            if rest:
+                out.append(f"> Picks this run did not reach, still on the list: "
+                           f"`contrib-run --repo {self.repo} --pick {' '.join(rest)}`.")
+        return out
 
     def pick_setup(self, slugs):
         """--pick: the named candidates from the saved list, in the order given. Refuses a name the
@@ -4913,7 +4931,9 @@ class Driver:
             elif self.picks:
                 queue = [("pick", c) for c in self.picks]
             elif self.args.resume:
-                queue = [("resume", s["_dir"]) for s in self.all_states() if s.get("status") == "stopped"]
+                stopped = [s for s in self.all_states() if s.get("status") == "stopped"]
+                queue = [("resume", s["_dir"]) for s in stopped]
+                self.resume_picks = any(s.get("picked") is True for s in stopped)
             while len(self.done) < self.run_limit():
                 self.check_stop(between=True)
                 mine, ready = self.open_count()
@@ -4952,8 +4972,8 @@ class Driver:
             if not self.stop_kind:
                 self.stop_kind, self.stop_reason = "done", (
                     f"the picked candidates are done ({len(self.picks)})" if self.picks
-                    else f"pause mode: resumed {len(self.done)} stopped candidate{'s' if len(self.done) != 1 else ''}; "
-                         "a resume does not scout" if self.pause_resume()
+                    else f"resumed {len(self.done)} stopped candidate{'s' if len(self.done) != 1 else ''}; "
+                         "a resume in pause mode or of a pick does not scout" if self.pause_resume()
                     else f"candidate limit reached ({self.run_limit()})")
         except StopRun:
             pass
@@ -5064,8 +5084,10 @@ class Driver:
             banner.append("> **Still running or kept, check these:** " + "; ".join(leftovers) + ".")
         if any(st == "stopped" for _, st in self.done):
             banner.append(f"> Resume with: `{self.resume_cmd()}`")
-        if self.scouted is not None and self.scouted["candidates"]:
-            banner.append(f"> Pick from the scouted list below with `contrib-run --repo {self.repo} --pick SLUG [SLUG ...]`.")
+        try:
+            banner.extend(self.pick_lines())
+        except Exception as e:
+            leftovers.append(f"pick lines error: {one_line(e, 200)}")
         try:
             self.write_summary()
             banner.append(f"> Summary: [runs/{self.run_id}/SUMMARY.md](runs/{self.run_id}/SUMMARY.md).")
