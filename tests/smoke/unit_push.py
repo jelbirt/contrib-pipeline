@@ -204,6 +204,29 @@ def t_lock(src=None):
     return rc == 1 and "ledger lock" in out and not opened(gh) and not fork_branch(p, slug)
 
 
+def held_by(repo, slug, tip, src):
+    """Run contrib-push while the run lock is held by a run that names repo, as contrib-run does."""
+    LEDGER.mkdir(exist_ok=True)
+    with open(LEDGER / ".run.lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps({"repo": repo, "pid": 1}) + "\n"); f.flush()
+        return run(slug, tip, src=src)
+
+
+def t_lock_other(src=None):
+    """A run of another repo holds the run lock: this repo's publish goes on."""
+    slug, tip, p = world()
+    rc, out, gh = held_by("q-org/q", slug, tip, src)
+    return rc == 0 and opened(gh) and fork_branch(p, slug) == tip and "does not touch p-org/p" in out
+
+
+def t_lock_same(src=None):
+    """A run of this repo (any letter case) holds it: refused, nothing opened."""
+    slug, tip, p = world()
+    rc, out, gh = held_by("P-org/P", slug, tip, src)
+    return rc == 1 and "of P-org/P holds the ledger lock" in out and not opened(gh) and not fork_branch(p, slug)
+
+
 def t_fork_ci(src=None):
     slug, tip, p = world()
     rc, out, gh = run("--fork-ci", slug, tip, src=src)
@@ -292,7 +315,7 @@ def t_record_fails(src=None):
 
 
 CHECKS = [t_ok, t_moved, t_no_force, t_published, t_not_ready, t_verdict, t_verdict_retested,
-          t_retest_stale, t_title, t_lock, t_fork_ci, t_fork_owner, t_owner_publish, t_ungated,
+          t_retest_stale, t_title, t_lock, t_lock_other, t_lock_same, t_fork_ci, t_fork_owner, t_owner_publish, t_ungated,
           t_gate_other_head, t_gate_failed, t_retest_covers, t_fork_ci_ungated, t_has_pr,
           t_retest_failed, t_retest_other_head, t_record_fails]
 for c in CHECKS:
@@ -321,7 +344,9 @@ MUTANTS = [
     (t_verdict, "        gate_check(w, s, rev)\n", "\n"),
     (t_retest_stale, ' and rt.get("merged_with") == base_now:', ":"),
     (t_title, 'if not title or "\\n" in title or len(title) > 200:', "if False:"),
-    (t_lock, "        ledger_free()\n", "\n"),
+    (t_lock, '        ledger_free(w["REPO"])\n', "\n"),
+    (t_lock_same, "if holder and holder.lower() != repo.lower():", "if holder:"),
+    (t_lock_other, "if holder and holder.lower() != repo.lower():", "if False:"),
     (t_fork_owner, "if not m or m.group(1).lower() != w[\"CONTRIBUTOR\"].lower():", "if not m:"),
 ]
 for c, old, new in MUTANTS:

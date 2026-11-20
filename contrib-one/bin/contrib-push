@@ -49,8 +49,10 @@ def where(slug):
     return w
 
 
-def ledger_free():
-    """Refuse while an unattended run holds the ledger lock, as a retest does."""
+def ledger_free(repo):
+    """Refuse while a run of this repo, or a run that does not name its repo, holds the run lock.
+    A run of another repo works only its own repo's candidates and pipeline clone, so its lock
+    does not stop this publish; the ledger commit at the end waits on the ledger write lock."""
     p = LEDGER / ".run.lock"
     if not p.exists():
         return
@@ -58,7 +60,15 @@ def ledger_free():
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            raise Stop("a contrib-run holds the ledger lock; wait for it to finish")
+            holder = ""
+            try:
+                holder = str(json.loads(f.readline() or "{}").get("repo") or "")
+            except (ValueError, AttributeError):
+                pass
+            if holder and holder.lower() != repo.lower():
+                print(f"a {holder} run holds the run lock; it does not touch {repo}, so this publish goes on")
+                return
+            raise Stop(f"a contrib-run{' of ' + holder if holder else ''} holds the ledger lock; wait for it to finish")
         fcntl.flock(f, fcntl.LOCK_UN)
 
 
@@ -130,7 +140,7 @@ def main():
             raise Stop(f"{slug} is already published: {s.get('pr')}")
         if s.get("status") != "ready":
             raise Stop(f"{slug} is {s.get('status')!r}, not ready")
-        ledger_free()
+        ledger_free(w["REPO"])
         fork = fork_name(w)          # both modes: origin is the contributor's own fork
         # Only a commit that passed the final gate or a retest goes out, in either mode: after a
         # rebase or a follow-up commit, contrib-run --retest first.
