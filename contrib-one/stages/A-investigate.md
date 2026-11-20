@@ -8,6 +8,10 @@ The scout's `why` and any fix it suggests are a hypothesis from a short look, no
 confirm them from the code before relying on them. When state.json's `candidate` has a
 `probe`, the scout's test (its `test`) failed on the base as a new file at its `path` (log at
 its `log`): start from that test, and check that it still fails in your clone, for that reason.
+When `candidate.lead` is true, the user handed this bug over directly with `--lead`: their
+`why` is the starting point and is verified the same way. If the code does not bear it out,
+ask them (`needs-you`) rather than abandoning their lead. A lead has no `search_terms`:
+take them from its `why` for the closed issue and PR searches in step 1.
 
 1. **Recheck the claim and overlap** from `gh/` (fresh snapshot for this candidate): the
    issue's own file in `gh/issues/` for a new claim or assignee (no file: the issue is older
@@ -33,7 +37,7 @@ its `log`): start from that test, and check that it still fails in your clone, f
 4. **Reproduce.** Write the failing test first (the profile names the patterns), commit it
    alone on the branch, and ask the driver to run it with `"expect": "fail"`. Use a live
    check only where the profile offers one. A candidate that does not reproduce is
-   abandoned, with the evidence.
+   abandoned, with the evidence (a lead: `needs-you` with the evidence instead, see above).
 5. **Weigh approaches.** List two or three ways to fix it. For each: what changes, risk,
    cost on the hot path, how it matches the reference. Then spawn one `Agent` (the
    general-purpose type) as an independent critic: give it the problem, the code pointers

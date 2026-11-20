@@ -44,6 +44,7 @@ SOFT_DISK_GB, HARD_DISK_GB, HARD_MEM_MB, HARD_MEM_SECS = 32, 26, 2048, 300
 MAX_TURNS = {"A": 8, "B": 10, "C": 6}
 MAX_REQUESTS_PER_TURN = 12
 PROBE_MAX_BYTES = 32000          # one scout probe: a short test file
+LEAD_MAX_CHARS = 4000            # --lead: the user's description of one bug
 TURN_TIMEOUT = 45 * 60          # one Claude turn
 REQUEST_TIMEOUT = 75 * 60       # one build or test request
 STAGE_BUDGET = 90 * 60          # soft stop when less than this is left before the deadline
@@ -1408,6 +1409,8 @@ class Driver:
     assign_first = False
     run_mode = "autonomous"
     picks = None                 # --pick: the scouted candidates this run works, in order
+    lead = None                  # --lead: the one candidate the user described, worked with no scout
+    lead_written = False         # its state is in the ledger, so a stop makes it a --resume
     scouted = None               # pause mode: the list this run saved for your pick
     resume_picks = False         # --resume: a stopped candidate was picked, so the resume never scouts
     env_dir = None
@@ -2030,8 +2033,10 @@ class Driver:
 
     def run_limit(self):
         """How many candidates this run works: answering a candidate runs only that one, an
-        issue-less run takes one at most, and a --pick run takes the ones picked."""
-        if getattr(self, "answer_cand", None) or getattr(self.args, "issue_less", False):
+        issue-less run takes one at most, a --lead run takes the one described, and a --pick run
+        takes the ones picked."""
+        if (getattr(self, "answer_cand", None) or getattr(self.args, "issue_less", False)
+                or getattr(self, "lead", None)):
             return 1
         if self.picks:
             return len(self.picks)
@@ -4363,6 +4368,8 @@ class Driver:
                        branch=self.prof.get("BRANCH_PREFIX", "fix/") + slug, clone=str(self.clone()),
                        search_terms=c.get("search_terms", []),
                        run=self.run_id, started=now(), candidate=c, **({"picked": True} if pick else {}))
+            if c.get("lead") is True:
+                self.lead_written = True     # from here a stopped lead is a --resume, not a rerun
             if pick:
                 self.unlist(c.get("slug"))   # only now: the ledger holds it, so it is never in neither
         else:
@@ -4474,11 +4481,15 @@ class Driver:
             return self.finish("abandoned", reason=why)
         draft = one_line((c or {}).get("assign_comment"), 1500)
         f = self.cand / "session" / "assign-comment.md"
+        lead = (c or {}).get("lead") is True
         if draft or not f.exists():
-            f.write_text((draft or "(the scout drafted no comment: write one)") + "\n")
+            f.write_text((draft or ("(no draft: this came from --lead; write the request to be assigned yourself)"
+                                    if lead else "(the scout drafted no comment: write one)")) + "\n")
         return self.finish("needs-you", asked_by="assign", context="session/assign-comment.md",
                            question=f"issue #{n} is not assigned to @{me}, and this repo wants that before any fix "
-                           "work. Post the comment drafted in session/assign-comment.md on the issue yourself; "
+                           "work. " + ("Ask on the issue to be assigned yourself (session/assign-comment.md holds no "
+                                      "draft, since no scout ran); " if lead else
+                                      "Post the comment drafted in session/assign-comment.md on the issue yourself; ") +
                            "once a maintainer assigns you, answer this candidate to start the work.")
 
     def archive_transcripts(self, home):
@@ -4848,8 +4859,8 @@ class Driver:
                                                             f"{'s' if n != 1 else ''} wait for your pick")
 
     def pause_resume(self):
-        """A --resume in pause mode, or one that finishes a picked candidate, works the stopped
-        candidates and ends. Scouting would replace the list the user has not picked from yet, or
+        """A --resume in pause mode, or one that finishes a picked candidate or a --lead, works the
+        stopped candidates and ends. Scouting would replace the list the user has not picked from yet, or
         (on an autonomous profile after a --mode pause run) work candidates the user never chose."""
         return bool(self.args.resume) and (self.run_mode == "pause" or self.resume_picks)
 
@@ -4867,6 +4878,9 @@ class Driver:
             if rest:
                 out.append(f"> Picks this run did not reach, still on the list: "
                            f"`contrib-run --repo {self.repo} --pick {' '.join(rest)}`.")
+        if self.lead and not self.lead_written:
+            out.append("> The lead was not started and is not in the ledger: run the same "
+                       f"`contrib-run --repo {self.repo} --lead ...` command again.")
         return out
 
     def pick_setup(self, slugs):
@@ -4895,6 +4909,30 @@ class Driver:
                                    "a run took the issue under another name after the scout")
             out.append(by[s])
         return out
+
+    def lead_setup(self, text, issue=None, slug=None):
+        """--lead: one candidate from the user's own description, worked with no scout. The text is
+        the user's claim, not a finding: stage A verifies it as it would a scout's. An issue number
+        links it to that issue, so assignment first applies as it does to any issue candidate."""
+        text = str(text or "").strip()
+        if not text:
+            raise RuntimeError("the lead is empty: say what is wrong and where")
+        if len(text) > LEAD_MAX_CHARS:
+            raise RuntimeError(f"the lead is {len(text)} characters; keep it under {LEAD_MAX_CHARS}")
+        first = text.splitlines()[0]
+        name = slug_word(slug) if slug is not None else slug_word(" ".join(first.split()[:8]))
+        if not name:
+            raise RuntimeError("no usable name for the candidate: give --slug with letters or digits")
+        if slug is not None and ((LEDGER / "candidates" / name).exists() or (WORK / "clones" / name).exists()):
+            raise RuntimeError(f"--slug {name} is taken: candidates/{name} or its clone exists; choose another")
+        if issue is not None:
+            if not 0 < issue < 10 ** 9:
+                raise RuntimeError(f"--issue {issue} is not an issue number")
+            worked = self.ledger_issues().get(self.repo, {})
+            if issue in worked:
+                raise RuntimeError(f"issue #{issue} is already in the ledger as {worked[issue]}")
+        return {"slug": name, "title": one_line(first, 200), "source": "the user, with --lead",
+                "issue": issue, "why": text, "probe": None, "lead": True}
 
     @staticmethod
     def ledger_issues():
@@ -5100,6 +5138,13 @@ class Driver:
             except RuntimeError as e:
                 print(f"pick: {e}", file=sys.stderr)
                 return 2
+        if getattr(self.args, "lead", None) is not None:
+            try:
+                self.lead = self.lead_setup(self.args.lead, getattr(self.args, "issue", None),
+                                            getattr(self.args, "slug", None))
+            except RuntimeError as e:
+                print(f"lead: {e}", file=sys.stderr)
+                return 2
         code = EXIT_DONE
         try:
             self.preflight()
@@ -5108,6 +5153,8 @@ class Driver:
                 queue = [("resume", str(self.answer_cand[0]))]
             elif self.picks:
                 queue = [("pick", c) for c in self.picks]
+            elif self.lead:
+                queue = [("new", self.lead)]
             elif self.args.resume:
                 stopped = [s for s in self.all_states() if s.get("status") == "stopped"]
                 others = sorted({str(s.get("repo")) for s in stopped if not self.mine(s)})
@@ -5116,7 +5163,8 @@ class Driver:
                     self.log(f"resume: stopped candidates of {', '.join(others)} are left alone; "
                              "each repo's resume is its own --repo")
                 queue = [("resume", s["_dir"]) for s in stopped]
-                self.resume_picks = any(s.get("picked") is True for s in stopped)
+                self.resume_picks = any(s.get("picked") is True or (s.get("candidate") or {}).get("lead") is True
+                                        for s in stopped)
             while len(self.done) < self.run_limit():
                 self.check_stop(between=True)
                 mine, ready = self.open_count()
@@ -5125,8 +5173,8 @@ class Driver:
                                               f">= {self.prof.get('MAX_OPEN', 10)}")
                     break
                 if not queue:
-                    if self.picks or self.pause_resume():
-                        break                      # a --pick run, or a resume in pause mode, never scouts
+                    if self.picks or self.lead or self.pause_resume():
+                        break                      # --pick, --lead, or a resume in pause mode: never scouts
                     found = self.scout()
                     if not found:
                         self.request_stop("soft", "no good candidates left")
@@ -5154,7 +5202,8 @@ class Driver:
                                 f"{type(e).__name__}: {one_line(e, 200)}")
             if not self.stop_kind:
                 self.stop_kind, self.stop_reason = "done", (
-                    f"the picked candidates are done ({len(self.picks)})" if self.picks
+                    "the candidate you described with --lead is done" if self.lead
+                    else f"the picked candidates are done ({len(self.picks)})" if self.picks
                     else f"resumed {len(self.done)} stopped candidate{'s' if len(self.done) != 1 else ''}; "
                          "a resume in pause mode or of a pick does not scout" if self.pause_resume()
                     else f"candidate limit reached ({self.run_limit()})")
@@ -5350,6 +5399,12 @@ def main():
     ap.add_argument("--pick", nargs="+", metavar="SLUG",
                     help="work these candidates from the list a pause run saved, in this order, with no new scout "
                          "(the limit becomes their number)")
+    ap.add_argument("--lead", metavar="TEXT",
+                    help="work one candidate from your own description of a bug (what is wrong and where), with no "
+                         "scout; stage A verifies it before any fix")
+    ap.add_argument("--issue", type=int, metavar="N",
+                    help="with --lead: the issue it fixes (assignment first then applies, as for any issue candidate)")
+    ap.add_argument("--slug", help="with --lead: the candidate's ledger name (default: from the lead's first words)")
     ap.add_argument("--model", default="opus")
     ap.add_argument("--scout-model", default="sonnet")
     ap.add_argument("--claude", default="claude", help="the claude binary (a stub for tests)")
@@ -5372,6 +5427,11 @@ def main():
         ap.error("--issue-less does nothing with --answer, which continues only the answered candidate")
     if args.pick and (args.answer or args.resume or args.issue_less or args.topic):
         ap.error("--pick works only the candidates it names: not with --answer, --resume, --issue-less or --topic")
+    if args.lead is not None and (args.pick or args.answer or args.resume or args.issue_less or args.topic):
+        ap.error("--lead works only the candidate it describes: not with --pick, --answer, --resume, --issue-less "
+                 "or --topic")
+    if args.lead is None and (args.issue is not None or args.slug is not None):
+        ap.error("--issue and --slug go with --lead")
     sys.exit(Driver(args).main())
 
 
