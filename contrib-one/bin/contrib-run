@@ -2135,7 +2135,7 @@ class Driver:
         else:
             mine = len(json.loads(self.gh("pr", "list", "-R", self.repo, "--author", self.prof["CONTRIBUTOR"],
                                           "--state", "open", "--json", "number", "--limit", "100")))
-        ready = sum(1 for s in self.all_states() if s.get("status") == "ready")
+        ready = sum(1 for s in self.all_states() if s.get("status") == "ready" and self.mine(s))
         return mine, ready
 
     # ----- ledger --------------------------------------------------------------------
@@ -2165,6 +2165,11 @@ class Driver:
             st["build_kept"] = False
             write_json(Path(d) / "state.json", st)
             self.log(f"dropped the kept build folder of {name} ({age / 86400:.1f} days old)")
+
+    def mine(self, s):
+        """True for a candidate of this run's repo. A run resumes, counts and saves the clones of only
+        its own repo's candidates: each one's branches, pipeline clone and profile belong to its repo."""
+        return (s.get("repo") or "").lower() == self.repo.lower()
 
     def all_states(self):
         out = []
@@ -2294,14 +2299,21 @@ class Driver:
                 name, status = self.report_head(s["_dir"])
                 name = name or packet_head("# " + one_line(s.get("title"), 200))[0] or slug
                 head = f"- [{name}](candidates/{slug}/session/packet.md) (`{slug}`)"
+                # The ledger holds every repo's candidates; each command names the candidate's own repo.
+                repo = s.get("repo") if re.fullmatch(r"[\w.-]+/[\w.-]+", str(s.get("repo") or "")) else self.repo
                 if key == "needs-you":
                     lines += [f"{head}, stage {md_text(s.get('stage'), 10) or '?'}",
                               f"  - **Question:** {md_text(s.get('question'), 800)}",
-                              f"  - Answer with `contrib-run --repo {self.repo} --answer {slug} \"...\"`"]
+                              f"  - Answer with `contrib-run --repo {repo} --answer {slug} \"...\"`"]
                     continue
                 note = (status if key == "ready" else None) or md_text(
                     s.get("reason") or s.get("stop_reason") or s.get("summary"), 200)
                 lines.append(f"{head}{(': ' + note) if note else ''}")
+                if key == "stopped":
+                    cmd = s.get("resume")
+                    if not re.fullmatch(r"contrib-run --repo [\w.-]+/[\w.-]+ --resume( --issue-less)?", str(cmd or "")):
+                        cmd = f"contrib-run --repo {repo} --resume"
+                    lines.append(f"  - Resume with `{cmd}`")
             lines.append("")
         (LEDGER / "QUEUE.md").write_text("\n".join(lines).rstrip() + "\n")
 
@@ -4330,6 +4342,10 @@ class Driver:
 
     def work_candidate(self, c, resume_dir=None, pick=False):
         if resume_dir:
+            s0 = read_json(Path(resume_dir) / "state.json", {})
+            if not self.mine(s0):        # before anything is written to it
+                raise RuntimeError(f"{Path(resume_dir).name} belongs to {s0.get('repo')!r}, not {self.repo}; "
+                                   f"resume it with --repo {s0.get('repo')}")
             self.cand = Path(resume_dir)
             slug = self.cand.name
         else:
@@ -4601,6 +4617,8 @@ class Driver:
             st = json.loads((cand / "state.json").read_text())
         except (OSError, ValueError):
             raise RuntimeError(f"no candidate {slug} in the ledger")
+        if not self.mine(st):
+            raise RuntimeError(f"{slug} belongs to {st.get('repo')!r}; run --answer with --repo {st.get('repo')}")
         if st.get("status") == "stopped" and st.get("answer_pending"):
             raise RuntimeError(f"{slug} already has your answer and was stopped before it finished; "
                                "continue it with --resume")
@@ -4609,8 +4627,6 @@ class Driver:
         if self.assign_first and isinstance(st.get("issue"), int) and not self.is_assigned(st["issue"]):
             raise RuntimeError(f"issue #{st['issue']} is not assigned to @{self.prof['CONTRIBUTOR']} yet; post the "
                                "comment in session/assign-comment.md and answer once a maintainer assigns you")
-        if (st.get("repo") or "").lower() != self.repo.lower():
-            raise RuntimeError(f"{slug} belongs to {st.get('repo')!r}; run --answer with --repo {st.get('repo')}")
         clone = st.get("clone")
         if clone and Path(clone).exists():
             raise RuntimeError(f"{slug}'s clone is still at {clone}: the driver could not save it, so its "
@@ -5094,9 +5110,13 @@ class Driver:
                 queue = [("pick", c) for c in self.picks]
             elif self.args.resume:
                 stopped = [s for s in self.all_states() if s.get("status") == "stopped"]
+                others = sorted({str(s.get("repo")) for s in stopped if not self.mine(s)})
+                stopped = [s for s in stopped if self.mine(s)]
+                if others:
+                    self.log(f"resume: stopped candidates of {', '.join(others)} are left alone; "
+                             "each repo's resume is its own --repo")
                 queue = [("resume", s["_dir"]) for s in stopped]
-                self.resume_picks = any(s.get("picked") is True and (s.get("repo") or "").lower() == self.repo.lower()
-                                        for s in stopped)   # only this repo's picks; another repo's pick says nothing here
+                self.resume_picks = any(s.get("picked") is True for s in stopped)
             while len(self.done) < self.run_limit():
                 self.check_stop(between=True)
                 mine, ready = self.open_count()
@@ -5271,9 +5291,14 @@ class Driver:
         return not leftovers
 
     def recover_stale(self):
-        """A previous run that could not shut down (sleep, wsl --shutdown, power loss)."""
+        """A previous run that could not shut down (sleep, wsl --shutdown, power loss). Saving a
+        clone copies its branches into this repo's pipeline clone, so another repo's candidate keeps
+        its clone, marked stopped, and the next run of its own repo saves it."""
         for s in self.all_states():
+            own = self.mine(s)
             if s.get("status") != "running":
+                if not own:
+                    continue
                 self.cand = Path(s["_dir"])
                 if s.get("status") == "stopped" and self.clone().exists():
                     try:
@@ -5285,7 +5310,7 @@ class Driver:
                 self.cand = None
                 continue
             self.cand = Path(s["_dir"])
-            self.log(f"recovering stale candidate {self.cand.name}")
+            self.log(f"recovering stale candidate {self.cand.name}" + ("" if own else f" of {s.get('repo')}"))
             node = s.get("node") or {}
             for k in ("pid", "bridge"):
                 pid = node.get(k)
@@ -5296,12 +5321,15 @@ class Driver:
                 shutil.rmtree(d, ignore_errors=True)
             self.state(node=None)
             self.sweep([self.clone(), self.bins()])
-            try:
-                note = self.save_clone()
-            except Exception as e:
-                note = f"clone kept: {one_line(e, 200)}"
+            if not own:
+                note = f"clone kept for the next {s.get('repo')} run to save" if self.clone().exists() else "no clone"
+            else:
+                try:
+                    note = self.save_clone()
+                except Exception as e:
+                    note = f"clone kept: {one_line(e, 200)}"
             self.state(status="stopped", stop_reason="previous run ended without shutting down (sleep or power loss?)",
-                       stop_kind="hard", cleanup=note, resume=f"contrib-run --repo {self.repo} --resume")
+                       stop_kind="hard", cleanup=note, resume=f"contrib-run --repo {self.repo if own else s.get('repo')} --resume")
             self.cand = None
         for d in (WORK / "nodes").iterdir():
             shutil.rmtree(d, ignore_errors=True)
@@ -5315,7 +5343,7 @@ def main():
     ap.add_argument("--topic", default="", help="steer the scout")
     ap.add_argument("--issue-less", action="store_true",
                     help="scout only fixes that no open issue reports; drop issue candidates, keep at most one")
-    ap.add_argument("--resume", action="store_true", help="first pick up stopped candidates")
+    ap.add_argument("--resume", action="store_true", help="first pick up this repo's stopped candidates")
     ap.add_argument("--mode", choices=RUN_MODES,
                     help="autonomous works what the scout finds (the default); pause stops after the scout and "
                          "lists its candidates in QUEUE.md for --pick. Overrides the profile's RUN_MODE for this run")

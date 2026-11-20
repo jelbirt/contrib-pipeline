@@ -1091,3 +1091,30 @@ candidates first, for more oversight of the work that will be done.
 Unit checks: tests/smoke/unit_pause.py. The stub suite runs a pause run, an unknown pick, a
 pick of two in reverse order, and an autonomous override; tests/smoke/env.sh strips `RUN_MODE`
 from the suite's copy of the profiles so the other cases stay autonomous.
+
+## Each run touches only its own repo's candidates (2026-11-20, found reviewing pause mode)
+
+One ledger serves every repo, but a candidate's branches live in its own repo's pipeline clone
+and its stages run under its own repo's profile. Three places walked every candidate without
+asking whose it was, and one asked too late:
+
+- `--resume` queued every stopped candidate in the ledger, so a run of one repo would work
+  another repo's stopped candidate with the wrong test commands, rules and pipeline clone.
+  It now queues only this repo's, and logs the repos whose stopped candidates it left alone.
+  `work_candidate` refuses another repo's folder as a backstop, before writing anything to it.
+- Stale recovery saved every left-behind clone, and saving copies the clone's branches into
+  this repo's pipeline clone and then deletes the clone: another repo's work would land where
+  its own runs never look. Now another repo's stale candidate is still marked stopped (its jail
+  processes and node are still stopped too) but keeps its clone, and its resume command names
+  its own repo. The next run of that repo finds it stopped with a clone and saves it there.
+  Another repo's stopped candidate is not touched at all.
+- The open-PR cap counted every repo's ready packets against this repo's `MAX_OPEN`, while
+  the open PRs it adds are only this repo's. It now counts this repo's ready packets.
+- `--answer` already refused another repo's candidate, but only after the assignment check,
+  which reads the issue number in this run's repo. The repo check now comes first.
+
+QUEUE.md lists every repo's candidates, so its commands name each candidate's own repo: the
+`--answer` line of a needs-you candidate (it used this run's repo) and a new `--resume` line
+under each stopped one (from its state's `resume`, else built from its repo).
+
+Repo names compare without case, as GitHub does. Unit checks: tests/smoke/unit_resume.py.
