@@ -118,5 +118,7 @@ want "no smk refs in the real clone" "$(smk_refs "$REAL_REPO" | wc -l)" 0
 want "no smk commits in the real clone" "$(smk_refs "$SMOKE_REPO" | while read -r o _; do git -C "$REAL_REPO" cat-file -e "$o" 2>/dev/null && echo "$o"; done | wc -l)" 0
 want "real clone's config unchanged" "$([ "$(git -C "$REAL_REPO" config --list --local)" = "$real_cfg" ] && echo yes || echo no)" yes
 want "preflight gc ran on the copy" "$(git -C "$SMOKE_REPO" config gc.auto)" 0
-case_ "leftovers"; want processes "$(pgrep -af 'stub-claude|bin/contrib-run --repo' | grep -vc 'pgrep\|eval ')" 0
+# Only this checkout's driver and stub: a real run on the machine starts from the skill
+# link (~/.claude/skills/contrib-one), so it is not a leftover of the suite.
+case_ "leftovers"; want processes "$(pgrep -af -- "$ROOT/contrib-one/(tests/stub-claude|bin/contrib-run --repo)" | grep -vc 'pgrep\|eval ')" 0
 if [ $fails -eq 0 ]; then rm -rf "$SMOKE_REPO"; echo "SUITE PASS"; exit 0; else echo "SUITE FAIL ($fails)"; exit 1; fi
