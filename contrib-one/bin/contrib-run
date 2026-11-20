@@ -9,6 +9,7 @@ person. Design: ../DESIGN.md.
 """
 import argparse
 import collections
+import contextlib
 import gzip
 import datetime
 import fcntl
@@ -40,6 +41,7 @@ LEDGER = Path(os.environ.get("CONTRIB_LEDGER", HOME / "contrib-queue"))
 WORK = Path(os.environ.get("CONTRIB_WORK", HOME / "contrib-work"))
 TOKEN_FILE = Path(os.environ.get("CONTRIB_TOKEN_FILE", HOME / ".config" / "contrib" / "claude-token"))
 EXIT_DONE, EXIT_SOFT, EXIT_HARD, EXIT_SHUTDOWN_FAILED, EXIT_BUSY = 0, 10, 20, 30, 40
+LEDGER_LOCK_WAIT = 120   # seconds a ledger commit waits for another's to finish
 SOFT_DISK_GB, HARD_DISK_GB, HARD_MEM_MB, HARD_MEM_SECS = 32, 26, 2048, 300
 MAX_TURNS = {"A": 8, "B": 10, "C": 6}
 MAX_REQUESTS_PER_TURN = 12
@@ -1446,15 +1448,24 @@ class Driver:
             d.mkdir(parents=True, exist_ok=True)
         if not (LEDGER / "rejects.md").exists():
             (LEDGER / "rejects.md").write_text("# Rejected candidates\n\n")
-        self.lockf = open(LEDGER / ".run.lock", "w")
-        try:
-            fcntl.flock(self.lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            if not getattr(args, "approve_profile", None):
-                print("another contrib-run holds the ledger lock; not starting", file=sys.stderr)
-                sys.exit(EXIT_BUSY)
-            print("a run holds the ledger lock; waiting for it to finish before approving", file=sys.stderr, flush=True)
-            fcntl.flock(self.lockf, fcntl.LOCK_EX)
+        # The run lock: one run at a time, for its whole length. Its file names the holder's repo so
+        # contrib-push can publish another repo's candidate meanwhile; "a+" so a contender's open
+        # never empties that line. --commit-ledger takes only the ledger write lock (ledger_commit).
+        self.lockf = None
+        if not getattr(args, "commit_ledger", None):
+            self.lockf = open(LEDGER / ".run.lock", "a+")
+            try:
+                fcntl.flock(self.lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if not getattr(args, "approve_profile", None):
+                    print("another contrib-run holds the ledger lock; not starting", file=sys.stderr)
+                    sys.exit(EXIT_BUSY)
+                print("a run holds the ledger lock; waiting for it to finish before approving", file=sys.stderr, flush=True)
+                fcntl.flock(self.lockf, fcntl.LOCK_EX)
+            self.lockf.seek(0)
+            self.lockf.truncate()
+            self.lockf.write(json.dumps({"repo": self.repo, "pid": os.getpid()}) + "\n")
+            self.lockf.flush()
         self.run_id = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
         self.run_dir = LEDGER / "runs" / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -2060,7 +2071,9 @@ class Driver:
         for d in (WORK / "snap").glob("*"):
             self.drop_copy(d)
         self.trim_kept_builds()
-        self.ensure_ledger_ignores()
+        with self.ledger_lock("untracking ignored ledger files") as got:   # git rm --cached writes the index
+            if got:
+                self.ensure_ledger_ignores()
         gb = c_free_gb()
         self.session_tmp(self.run_dir / "scout", make=False)   # the longest scratch path fits the sockets
         if gb < int(self.prof.get("START_GB", 32)) and not (self.args.stub and not self.args.real_requests):
@@ -2266,17 +2279,48 @@ class Driver:
                 return r / ".git"
         return None
 
+    @contextlib.contextmanager
+    def ledger_lock(self, what):
+        """Hold the ledger write lock (`.ledger.lock`) for one change to the ledger's index, so a run's
+        commits and a --commit-ledger (a publish while another repo's run goes on) never meet there.
+        Yields False, after logging, when the lock stayed busy for LEDGER_LOCK_WAIT seconds."""
+        with open(LEDGER / ".ledger.lock", "a") as lk:
+            end = time.time() + LEDGER_LOCK_WAIT
+            while True:
+                try:
+                    fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.time() > end:
+                        self.log(f"{what} skipped: the ledger write lock stayed busy for {LEDGER_LOCK_WAIT}s")
+                        yield False
+                        return
+                    time.sleep(0.5)
+            yield True
+
     def ledger_commit(self, msg):
+        """Commit the ledger under the ledger write lock. False when nothing could be committed: the
+        lock stayed busy, the ledger held something unsafe, or git failed (each is logged)."""
+        with self.ledger_lock("ledger commit") as got:
+            return bool(got) and self.ledger_commit_locked(msg)
+
+    def ledger_commit_locked(self, msg):
         self.ensure_ledger_ignores()
         self.record_sessions()
         bad = self.ledger_unsafe() or self.ledger_nested_git()
         if bad:
             self.log(f"ledger commit skipped: found {bad}; remove it by hand after looking at it")
-            return
+            return False
         g = ["git", *GIT_SAFE, "-c", "diff.ignoreSubmodules=all", "-c", "core.untrackedCache=false",
              "-c", "submodule.recurse=false", "-C", str(LEDGER)]
-        subprocess.run([*g, "add", "-A"], capture_output=True, env=self.git_env())
-        subprocess.run([*g, "commit", "-qm", one_line(msg, 200)], capture_output=True, env=self.git_env())
+        r = subprocess.run([*g, "add", "-A"], capture_output=True, text=True, env=self.git_env())
+        if r.returncode == 0:
+            r = subprocess.run([*g, "commit", "-qm", one_line(msg, 200)], capture_output=True, text=True,
+                               env=self.git_env())
+            if r.returncode == 0 or "nothing to commit" in r.stdout:
+                return True
+        self.log(f"ledger commit failed: {one_line(r.stderr or r.stdout, 300)}")
+        return False
 
     def rebuild_queue(self, banner=None):
         groups = {}
@@ -5074,7 +5118,9 @@ class Driver:
                 return 1
         if self.args.commit_ledger:
             try:
-                self.ledger_commit(self.args.commit_ledger)
+                if self.ledger_commit(self.args.commit_ledger) is False:
+                    print(f"commit-ledger: nothing was committed; the reason is in {LEDGER / 'runs' / (self.run_id + '.log')}", file=sys.stderr)
+                    return EXIT_SOFT
             except Exception as e:
                 print(f"commit-ledger: {type(e).__name__}: {e}", file=sys.stderr)
                 return EXIT_SOFT
