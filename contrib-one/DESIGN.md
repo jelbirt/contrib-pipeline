@@ -1043,3 +1043,51 @@ each open with a reproduction someone ran.
 - The scout's system prompt gains a Probes section built from the profile (its test command
   and globs). After the scout, the probe clone and its build copy are removed and the
   driver's probe state is reset, so a later stage's requests cannot reach the probe clone.
+
+## Pause mode: pick before any work starts (2026-11-19, asked for before a xerj run)
+
+A run went straight from the scout to work: it took the scout's ranked list best first, with
+no point where the user could see the list and choose, and the candidates it did not reach
+were left only in that run's `scout/record/candidates.json`. The user asked for two modes as
+a setting, the autonomous one as built and one that stops after the scout and shows the
+candidates first, for more oversight of the work that will be done.
+
+- `RUN_MODE` in the profile, `autonomous` (the default when unset, so every existing profile
+  runs as before) or `pause`; any other value is refused by name. `--mode autonomous|pause`
+  overrides it for one run. xerj's profile sets `pause`; pydantic's stays autonomous.
+- A pause run scouts as before (same checks, same five at most, one in an issue-less run),
+  then stops with exit 0 before any candidate starts: no clone, branch or build. It saves the
+  list in `repos/<owner>-<name>/scouted.json` (tracked in the ledger's git), with the run id,
+  the time and the base commit, and each candidate under the folder name it will get (made
+  unique against the ledger and against the list). A scout that finds nothing leaves the old
+  list as it was. The scout's `confidence` and `files` are now kept with each candidate, since
+  the list is where the user reads them.
+  A candidate's `probe` record from the scout probes above is kept with it the same way,
+  so a pick hands stage A the probe an autonomous run would.
+- `QUEUE.md` shows the list first, under "Scouted, waiting for your pick", with each
+  candidate's title, slug, issue, size, confidence, why, source, files and the assignment
+  request draft, all made markdown-inert, and the command to pick. The run's `SUMMARY.md`
+  leads with the pause and shows the same list.
+- `--pick SLUG [SLUG ...]` works the named candidates in the order given and never scouts; the
+  limit becomes the number picked. It refuses a slug that is not on the list, one named twice,
+  a name a later run already took (a folder in the ledger or the work folder, the test the
+  folder naming uses), an issue a later run took under another name (`QUEUE.md` marks it), and
+  an empty list (saying a pause run makes one). A candidate leaves the list only once the
+  ledger holds it, so a pick the run did not reach (a stop, the open-PR cap, an error before
+  its first state write) stays on it, and the base commit is read before the candidate's
+  folder is made, so that error leaves no folder to squat the name. The rest stay until the
+  next pause run replaces the list; an autonomous run leaves it alone. Stage A already rechecks claims and overlapping PRs before any fix, so an
+  older list is safe to pick from. `--pick` is refused with `--answer`, `--resume`,
+  `--issue-less` and `--topic`, which each choose the work another way.
+- A `--resume` in pause mode works the stopped candidates and ends without scouting: a scout
+  would replace the list before the user picked from it. So does a `--resume` that finishes a
+  picked candidate of this repo on any profile (another repo's stopped pick does not count): a pick's state says `picked`, so after `--mode pause` on an
+  autonomous profile the plain `--resume` the banner prints cannot go on to scout and work
+  candidates the user never chose. A pick run that stops names the picks it did not reach in
+  its banner, with a ready `--pick` command for them. A stop asked for during a pause run's
+  scout keeps its kind, reason and exit code; the list is still saved.
+- No command drops a candidate from the list for now; the next pause run replaces it.
+
+Unit checks: tests/smoke/unit_pause.py. The stub suite runs a pause run, an unknown pick, a
+pick of two in reverse order, and an autonomous override; tests/smoke/env.sh strips `RUN_MODE`
+from the suite's copy of the profiles so the other cases stay autonomous.

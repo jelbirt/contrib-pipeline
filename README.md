@@ -156,6 +156,10 @@ setsid nohup ~/contrib-pipeline/contrib-one/bin/contrib-run --repo <owner/name> 
 - Answer a needs-you question with
   `~/contrib-pipeline/contrib-one/bin/contrib-run --repo <owner/name> --answer SLUG "text"`;
   continue stopped work by adding `--resume` to a run.
+- Two run modes, set by `RUN_MODE` in the profile and overridden for one run with
+  `--mode autonomous|pause`. `autonomous` (the default) works what the scout finds. `pause`
+  scouts, lists the candidates at the top of `QUEUE.md`, and stops before any work; then
+  `--pick SLUG [SLUG ...]` works the ones you choose, in that order.
 - Results: `~/contrib-queue/QUEUE.md`, each run's `runs/<run-id>/SUMMARY.md`, and each
   candidate's `candidates/<slug>/session/packet.md`.
 

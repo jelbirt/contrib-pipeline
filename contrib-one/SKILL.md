@@ -36,6 +36,23 @@ stopped; not with `--answer`), `--resume` to pick up stopped candidates first, `
 "TEXT"` to answer a needs-you candidate's question and continue only that candidate,
 `--model` and `--scout-model` (defaults `opus` and `sonnet`).
 
+Two run modes, set per repo by `RUN_MODE` in the profile (`autonomous` when the profile does not
+set it) and overridden for one run by `--mode autonomous|pause`:
+- `autonomous`: the run works what the scout finds, best first, until `--limit` is met.
+- `pause`: the run scouts, saves the ranked list in
+  `~/contrib-queue/repos/<owner>-<name>/scouted.json`, lists it at the top of `QUEUE.md` under
+  "Scouted, waiting for your pick", and stops with exit 0 before any candidate starts. Read the
+  list to the user (title, issue, why, size, confidence, files, and the assignment request draft
+  where there is one) and let them choose. Then start the work the same way, with `--pick SLUG
+  [SLUG ...]` in place of `--limit`: it works those candidates in the order given, never scouts,
+  and refuses a slug that is not on the list or whose issue a later run already took. A picked
+  candidate leaves the list when its work starts; the rest stay until the next pause run
+  replaces the list. A `--resume` in pause mode, or one that finishes a picked candidate of this repo, works
+  only the stopped candidates and does not scout. When a pick run stops, its banner gives the
+  `--resume` for the stopped pick and a `--pick` command for the picks it did not reach. Stage A
+  rechecks claims and overlapping PRs before any fix, so an older list is safe to pick from. `--pick` does not go
+  with `--answer`, `--resume`, `--issue-less` or `--topic`.
+
 Tell the user how to stop it: `touch ~/contrib-queue/STOP` lets the current stage finish (a stage
 can take an hour) then shuts down; `touch ~/contrib-queue/STOP-NOW` interrupts. Either way the shutdown routine
 runs: nothing is deleted that cannot be recovered, and `--resume` continues.
@@ -48,6 +65,8 @@ runs: nothing is deleted that cannot be recovered, and `--resume` continues.
   `state.json`, `results/` and `gh/`, and the session's `session/packet.md` (the user's review,
   in the shape `rules/packet.md` sets), `session/details.md` (the full record behind it),
   `session/PR_BODY.md` and `session/evidence/`. The work itself is on the branch, kept in the pipeline clone (the profile's `REPO_DIR`).
+- A pause run's list: the "Scouted, waiting for your pick" section of `QUEUE.md`, the same list
+  in the run's `SUMMARY.md`, and the record in `repos/<owner>-<name>/scouted.json`.
 - Exit codes: 0 done, 10 soft stop, 20 hard stop, 30 shutdown could not clean everything
   (QUEUE.md's banner says what is left).
 

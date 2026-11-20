@@ -87,12 +87,33 @@ kinds() { python3 -c "import sys,json;print(' '.join(r['kind'] for r in map(json
 want "session runs" "$(kinds False)" "test test check"
 want "gate runs" "$(kinds True)" "check test test"
 want "gate runs only the test file no replay covers" "$(python3 -c "import json;print([r['req']['paths'] for r in map(json.loads,open('$idx')) if r['id'].endswith('-changed')])")" "[['other_test.py']]"
+case_ "pause, then pick"
+# RUN_MODE=pause in the profile: the run saves the scout's list and works none of it; --pick works
+# named ones from that list in the order given, and --mode autonomous overrides the profile. It runs
+# last: its three ready packets would put the cases above at the open-PR cap, so it lifts the cap
+# for itself (the profile's last MAX_OPEN wins) and puts it back at the end.
+printf 'RUN_MODE=pause\nMAX_OPEN=20\n' >> "$PROFILE"
+SC=$CONTRIB_LEDGER/repos/xerj-org-xerj/scouted.json
+listed() { python3 -c "import json;print(' '.join(c['slug'] for c in json.load(open('$SC'))['candidates']))"; }
+STUB_PREFIX=smkp STUB_CANDS=3 run --limit 3; want rc $rc 0; want "list saved" "$(listed)" "smkp-0 smkp-1 smkp-2"
+want "nothing worked" "$(ls $CONTRIB_LEDGER/candidates | grep -c '^smkp-')" 0
+want "QUEUE.md shows the list" "$(grep -c '^## Scouted, waiting for your pick (3)$' $CONTRIB_LEDGER/QUEUE.md)" 1
+want "the banner says how to pick" "$(grep -c '^> Pick from the scouted list below with' $CONTRIB_LEDGER/QUEUE.md)" 1
+want "the list is in the ledger's git" "$(git -C $CONTRIB_LEDGER ls-files repos/xerj-org-xerj/scouted.json | wc -l)" 1
+run --pick nope; want "a slug not on the list is refused" $rc 2
+run --pick smkp-2 smkp-0; want "pick rc" $rc 0
+want status "$(field smkp-2 status) $(field smkp-0 status)" "ready ready"
+want "worked in the order picked" "$(grep -o 'clones/smkp-[0-9]' $STUB_LOG | uniq | tr '\n' ' ')" "clones/smkp-2 clones/smkp-0 "
+want "the unpicked one stays" "$(listed)" smkp-1
+STUB_PREFIX=smko run --mode autonomous --limit 1; want "--mode autonomous rc" $rc 0; want status "$(field smko-0 status)" ready
+want "an autonomous run leaves the list" "$(listed)" smkp-1
+sed -i '/^RUN_MODE=/d; /^MAX_OPEN=20$/d' "$PROFILE"
 case_ "ledger"
 want "ledger clean" "$(git -C $CONTRIB_LEDGER status --porcelain | wc -l)" 0
 for d in session gh transcripts bundle; do want "$d files tracked" "$(git -C $CONTRIB_LEDGER ls-files | grep -c "/$d/")" 0; done
 want "record copies present" "$(git -C $CONTRIB_LEDGER ls-files candidates/smkh-0/record | grep -c 'packet.md')" 1
 case_ "pipeline clone"
-want "branches saved in the suite's copy" "$(git -C "$SMOKE_REPO" for-each-ref 'refs/heads/fix/smk*' | wc -l)" 9
+want "branches saved in the suite's copy" "$(git -C "$SMOKE_REPO" for-each-ref 'refs/heads/fix/smk*' | wc -l)" 12
 want "no smk refs in the real clone" "$(smk_refs "$REAL_REPO" | wc -l)" 0
 want "no smk commits in the real clone" "$(smk_refs "$SMOKE_REPO" | while read -r o _; do git -C "$REAL_REPO" cat-file -e "$o" 2>/dev/null && echo "$o"; done | wc -l)" 0
 want "real clone's config unchanged" "$([ "$(git -C "$REAL_REPO" config --list --local)" = "$real_cfg" ] && echo yes || echo no)" yes
