@@ -1150,3 +1150,32 @@ called the fix an overlap with an open PR it did not touch. Two changes.
 Unit checks: tests/smoke/unit_lock.py, the four overlap cases in tests/smoke/unit_check.py and
 `lock_other`/`lock_same` in tests/smoke/unit_push.py; each guard has a mutant that its check
 catches.
+
+## Handing over a bug directly: --lead (2026-11-20, found working a pydantic bug)
+
+A bug the owner found (or one found in a session and chosen by the owner) had no way into a
+run. Work started only from a scout: `--pick` takes slugs from the list a pause scout saved, and
+an autonomous run works what its own scout finds. So the one way to work a known bug was to
+rerun the scout with a topic aimed at it, which proves nothing (a scout told what to find finds
+it), costs a scout session, and leaves a run record that reads as if the scout found the bug.
+
+`--lead "TEXT"` starts one candidate from the owner's description and never scouts, in either
+run mode. The candidate records `source` as the user and `lead: true`, with the text as its
+`why`. Stage A treats it as it treats a scout's claim: verified from the code before any fix; if
+the code does not bear it out, stage A asks the owner (`needs-you`) rather than abandoning a lead
+they chose. `--slug` names it; by default the first words of the text do. `--issue N` links it to
+an issue, and the driver then runs the usual assignment-first check; without it the candidate is
+issue-less, and stage A's overlap recheck still reads the open issues and PRs. The driver refuses
+an empty lead, one over 4000 characters, an issue number this repo's ledger already holds (at any
+status, abandoned included: leave out `--issue` to work it again), an explicit `--slug` that is
+taken (it is not silently renamed), and `--lead` with `--pick`, `--answer`, `--resume`,
+`--issue-less` or `--topic`.
+
+A review pass found the edges. A stopped lead resumed with the banner's `--resume` would have
+gone on to scout in autonomous mode, as a stopped pick once did; `resume_picks` now counts a lead
+too, so that resume works the stopped candidates and ends. A lead the run never reached (the
+open-PR cap or a STOP came first) is not in the ledger, so `--resume` cannot find it: the banner
+says to run the same `--lead` again. Stage A's step 4 ("does not reproduce: abandoned") now
+defers to the lead rule (`needs-you`), and a lead, which carries no `search_terms`, takes its
+search terms from its `why`. On an assignment-first repo the stop for `--lead --issue N` says
+no scout drafted a comment, rather than pointing at a draft that does not exist.

@@ -160,6 +160,8 @@ setsid nohup ~/contrib-pipeline/contrib-one/bin/contrib-run --repo <owner/name> 
   `--mode autonomous|pause`. `autonomous` (the default) works what the scout finds. `pause`
   scouts, lists the candidates at the top of `QUEUE.md`, and stops before any work; then
   `--pick SLUG [SLUG ...]` works the ones you choose, in that order.
+- A bug you found yourself goes straight in with `--lead "what is wrong and where"`: the run
+  works that one candidate with no scout, and stage A verifies it before any fix.
 - Results: `~/contrib-queue/QUEUE.md`, each run's `runs/<run-id>/SUMMARY.md`, and each
   candidate's `candidates/<slug>/session/packet.md`.
 

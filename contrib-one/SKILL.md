@@ -47,11 +47,23 @@ set it) and overridden for one run by `--mode autonomous|pause`:
   [SLUG ...]` in place of `--limit`: it works those candidates in the order given, never scouts,
   and refuses a slug that is not on the list or whose issue a later run already took. A picked
   candidate leaves the list when its work starts; the rest stay until the next pause run
-  replaces the list. A `--resume` in pause mode, or one that finishes a picked candidate of this repo, works
+  replaces the list. A `--resume` in pause mode, or one that finishes a picked candidate or a lead of this repo, works
   only this repo's stopped candidates and does not scout. When a pick run stops, its banner gives the
   `--resume` for the stopped pick and a `--pick` command for the picks it did not reach. Stage A
   rechecks claims and overlapping PRs before any fix, so an older list is safe to pick from. `--pick` does not go
   with `--answer`, `--resume`, `--issue-less` or `--topic`.
+
+When the user hands you a bug they found themselves (or one you found together and they chose),
+start it directly with `--lead "TEXT"` in place of `--limit`: TEXT says what is wrong and where
+(a repro, if there is one). The run works that one candidate and never scouts, in either mode.
+`--slug NAME` names it (by default the lead's first words do), and `--issue N` links it to the
+issue it fixes, so assignment first applies as for any issue candidate. Stage A verifies the lead
+from the code before any fix, and asks the user (`needs-you`) if the code does not bear it out.
+Never rerun the scout with a topic aimed at a bug you already know, just to get it onto a list:
+that proves nothing and leaves a misleading record. `--lead` does not go with `--pick`,
+`--answer`, `--resume`, `--issue-less` or `--topic`, and refuses an issue already in this repo's
+ledger and a `--slug` already taken. A stopped lead is a `--resume`, which works it and does not
+scout; a lead the run never started is run again with the same `--lead`.
 
 Tell the user how to stop it: `touch ~/contrib-queue/STOP` lets the current stage finish (a stage
 can take an hour) then shuts down; `touch ~/contrib-queue/STOP-NOW` interrupts. Either way the shutdown routine
