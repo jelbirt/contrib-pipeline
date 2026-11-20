@@ -23,6 +23,10 @@ ID = ["-c", "user.name=u", "-c", "user.email=u@l", "-c", "commit.gpgsign=false"]
 def git(*a):
     return subprocess.run(["git", *ID, "-C", str(LEDGER), *a], capture_output=True, text=True).stdout.strip()
 git("init", "-q")
+# The driver commits with plain git, so the ledger repo needs its own
+# identity: a CI runner has no global one.
+git("config", "user.name", "u"); git("config", "user.email", "u@l")
+git("config", "commit.gpgsign", "false")
 (LEDGER / ".gitignore").write_text("*.lock\n")
 git("add", "-A"); git("commit", "-qm", "start")
 REPO, OTHER = "own/repo", "other/repo"
