@@ -206,7 +206,9 @@ build. What changed from the sections above:
   `gh/`; the session writes only `session/` (`next.json`, `plan.md`, `packet.md`,
   `PR_BODY.md`, `evidence/`). The driver reads session files without following links.
 - **One run at a time.** A ledger lock (`.run.lock`) refuses a second run (exit 40), and
-  the build guard holds one global lock, so builds never overlap across projects.
+  the build guard holds one global lock, so builds never overlap across projects. The lock
+  file names the repo of the run that holds it; `contrib-push` goes on when that is another
+  repo, and each ledger commit takes a short write lock (`.ledger.lock`) of its own.
 - **Publish.** `contrib-check` has seven verdicts (adds `needs-look` and `retest-merge`),
   checks assignees, claim comments, same-topic PRs found by the scout's `search_terms`, and
   ratchet lines the base already removed, and exits 2 when it cannot decide.
@@ -1119,6 +1121,36 @@ under each stopped one (from its state's `resume`, else built from its repo).
 
 Repo names compare without case, as GitHub does. Unit checks: tests/smoke/unit_resume.py.
 
+## Publishing while another repo's run is going (2026-11-20, found publishing xerj #3321)
+
+A xerj publish waited five minutes behind a pydantic scout run, and then `contrib-check`
+called the fix an overlap with an open PR it did not touch. Two changes.
+
+- **The run lock no longer blocks another repo's publish.** `.run.lock` stays one run at a
+  time (`recover_stale` and the pipeline clones rely on it), but the run now writes its repo
+  into the lock file, and `contrib-push` refuses only when the holder is the same repo (or
+  unknown, as with an older driver). Ledger commits, the run's and `--commit-ledger`'s, now
+  take `.ledger.lock` for the length of one commit, so `--commit-ledger` no longer needs
+  the run lock and a publish of one repo can be recorded while another repo's run is going.
+  A commit that cannot get the write lock in 120 seconds is skipped and logged; the next
+  commit picks its files up. The run's start-up untracking of ignored files (`git rm --cached`)
+  takes the same lock, and a ledger commit whose `git add` or `git commit` fails now says so
+  (logged, and `--commit-ledger` exits 10) instead of reporting success.
+- **A PR that already conflicts with main is not an overlap.** `contrib-check` trial-merges
+  each open PR that shares a file. When it conflicts, the check now compares the conflict
+  blocks against this branch with the blocks against this branch's base. When every block is
+  the same, the PR conflicts with main alone (a stale base, as #2957 was) and this branch
+  adds nothing to it: the check prints that and does not count the PR. A block that differs,
+  or appears only against this branch, is still `overlap`. Blocks compare as bytes split on
+  `\n`, so a change of encoding or line ending still counts. A conflict with no markers (a
+  delete, a rename, a binary file) always counts. Accepted risk: blocks compare as a multiset,
+  so an identical block that moved elsewhere in the file reads as stale; that needs a branch
+  that reverts and moves the PR's exact lines, and was only produced by hand.
+
+Unit checks: tests/smoke/unit_lock.py, the four overlap cases in tests/smoke/unit_check.py and
+`lock_other`/`lock_same` in tests/smoke/unit_push.py; each guard has a mutant that its check
+catches.
+
 ## Handing over a bug directly: --lead (2026-11-20, found working a pydantic bug)
 
 A bug the owner found (or one found in a session and chosen by the owner) had no way into a
@@ -1147,4 +1179,3 @@ says to run the same `--lead` again. Stage A's step 4 ("does not reproduce: aban
 defers to the lead rule (`needs-you`), and a lead, which carries no `search_terms`, takes its
 search terms from its `why`. On an assignment-first repo the stop for `--lead --issue N` says
 no scout drafted a comment, rather than pointing at a draft that does not exist.
-

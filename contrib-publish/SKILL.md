@@ -80,6 +80,11 @@ merges, and prints one verdict, worst first:
 | `retest-merge` | merges cleanly, but the base changed this branch's `AREAS` or a `SETUP_KEY` file | `contrib-run --repo "$REPO" --retest <slug> --merge`; no rebase |
 | `unchanged` | nothing that matters moved | nothing; the packet's results stand |
 
+A PR that conflicts with this branch only where it already conflicts with this branch's base is
+reported as `already conflicts with this branch's base` and not counted as an overlap.
+`contrib-push` goes on while another repo's run holds the run lock; it waits only for a run of
+the same repo.
+
 A retest re-runs the final gate's checks in the jail, one heavy job at a time under the
 guard: in commands mode the gate checks, the replayed tests and the changed test files (with
 `--merge`, on the dependencies of the base it merged); otherwise `cargo fmt --check`, the

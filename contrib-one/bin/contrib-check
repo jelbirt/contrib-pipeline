@@ -17,6 +17,7 @@ Prints facts, then one verdict line, worst first:
 Exit 0 for unchanged, 1 for anything that needs work or a decision, 2 if the check failed.
 """
 import datetime, json, os, re, shlex, subprocess, sys
+from collections import Counter
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent
@@ -60,6 +61,38 @@ def merge_tree(repo_dir, a, b):
     if r.returncode not in (0, 1):
         fail(f"merge-tree {a} {b}: {r.stderr.strip()[:300]}")
     return r.stdout.strip().splitlines()[1:] if r.returncode == 1 else []
+
+
+def conflict_blocks(repo_dir, a, b):
+    """The conflict blocks of a trial merge, by path: each block is its (ours, theirs) text with the
+    marker labels dropped, so one clash reads the same from two merges. A conflicted path with no
+    markers (a delete, a rename, a binary file) maps to None."""
+    r = subprocess.run(["git", "-C", repo_dir, "-c", "merge.conflictStyle=merge", "merge-tree", "--write-tree",
+                        "--name-only", "--no-messages", a, b], capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        fail(f"merge-tree {a} {b}: {r.stderr.strip()[:300]}")
+    if r.returncode == 0:
+        return {}
+    lines = r.stdout.strip().splitlines()
+    out = {}
+    for path in dict.fromkeys(lines[1:]):
+        blob = subprocess.run(["git", "-C", repo_dir, "cat-file", "blob", f"{lines[0]}:{path}"], capture_output=True)
+        blocks, cur, side = [], None, 0
+        # Bytes, split on \n only: a change of encoding or line ending is still a change. Git writes
+        # the markers with the file's own line ending, so only they lose a trailing \r.
+        for line in blob.stdout.split(b"\n") if blob.returncode == 0 else []:
+            bare = line.rstrip(b"\r")
+            if bare.startswith(b"<<<<<<<"):
+                cur, side = ([], []), 0
+            elif cur is not None and bare == b"=======":
+                side = 1
+            elif cur is not None and bare.startswith(b">>>>>>>"):
+                blocks.append((b"\n".join(cur[0]), b"\n".join(cur[1])))
+                cur = None
+            elif cur is not None:
+                cur[side].append(line)
+        out[path] = blocks or None
+    return out
 
 
 CLAIM_WORDS = ("i'll take", "i will take", "working on", "i'm on it", "im on it", "/assign", "assign me",
@@ -194,6 +227,7 @@ def main():
                         "closingIssuesReferences"))
     code_files = set(mine) - doc_files
     quiet = []
+    own_base = git("merge-base", main_ref, branch)
     for pr in prs:
         if (pr.get("headRefName") == branch and (pr.get("author") or {}).get("login") == me
                 and (pr.get("headRepositoryOwner") or {}).get("login") == me):
@@ -224,7 +258,18 @@ def main():
             # A PR cut from an older base also "conflicts" in files neither change touched;
             # only clashes in this branch's own files mean the two changes meet.
             clash = [c for c in merge_tree(repo_dir, branch, prref) if c in mine]
+            stale = []
+            if clash:
+                # A PR that already conflicts with this branch's own base conflicts with every branch
+                # cut from it. Count only the conflict blocks this branch's commits add to those.
+                ours, theirs = conflict_blocks(repo_dir, branch, prref), conflict_blocks(repo_dir, own_base, prref)
+                stale = [c for c in clash if ours.get(c) and theirs.get(c)
+                         and not Counter(ours[c]) - Counter(theirs[c])]
+                clash = [c for c in clash if c not in stale]
             subprocess.run(["git", "-C", repo_dir, "update-ref", "-d", prref], capture_output=True)
+            if stale:
+                print(f"#{pr['number']} {pr['title']} ({pr['author']['login']}) already conflicts with this "
+                      f"branch's base in {', '.join(stale)}; this branch adds no conflict there")
             if clash:
                 new = after(pr.get("createdAt"), since)
                 code_clash = set(clash) - doc_files
@@ -234,7 +279,7 @@ def main():
                       f"({pr['author']['login']}): {', '.join(clash)}  <- {what}")
                 if code_clash:
                     verdicts.append("overlap")
-            else:
+            elif not stale:
                 quiet.append(pr["number"])
 
     # 2b. a PR on the same topic that shares no file and names no issue (the #2960 case)

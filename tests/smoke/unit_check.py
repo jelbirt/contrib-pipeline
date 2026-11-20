@@ -192,6 +192,76 @@ rc, out = run(slug)
 check("areas_bad_regex", rc == 2 and "is not a regex" in out)
 
 
+# overlap: a PR that already conflicts with this branch's base is not this branch's overlap
+PRBIN = t / "prbin"; PRBIN.mkdir()
+PRJSON = t / "prs.json"
+(PRBIN / "gh").write_text(f"#!/bin/sh\ncase \"$1 $2\" in\n  \"pr list\") cat {PRJSON} ;;\n  *) echo '[]' ;;\nesac\n")
+(PRBIN / "gh").chmod(0o755)
+PRENV = dict(ENV, PATH=f"{PRBIN}:{os.environ['PATH']}")
+BIG = "engine/crates/a/src/big.rs"
+
+
+def big(changes):
+    ls = [f"l{i}" for i in range(1, 11)]
+    for i, v in changes.items():
+        ls[i - 1] = v
+    return {BIG: "\n".join(ls) + "\n"}
+
+
+def pr_verdict(our_change, src=None, pr_files=None):
+    """Open PR #7 changed line 1 of big.rs on an older base; main then changed the same line, so #7
+    conflicts with main. This branch is cut from main and makes our_change (line, text)."""
+    slug = case(XERJ, {"engine/crates/b/src/lib.rs": "b2\n"})
+    up, clone = t / f"up{n}", t / f"clone{n}"
+    write(up, big({}))
+    git("checkout", "-q", "-b", "pr7", cwd=up); write(up, pr_files or big({1: "P1"}))
+    git("update-ref", "refs/pull/7/head", "HEAD", cwd=up); git("checkout", "-q", "main", cwd=up)
+    write(up, big({1: "M1"}))
+    git("fetch", "-q", "upstream", cwd=clone); git(*ID, "rebase", "-q", "upstream/main", cwd=clone)
+    write(clone, big({1: "M1", our_change[0]: our_change[1]}))
+    PRJSON.write_text(json.dumps([{"number": 7, "title": "older fix", "author": {"login": "other"},
+                                   "createdAt": "2026-01-02T00:00:00Z", "files": [{"path": BIG}],
+                                   "headRefName": "pr7", "headRepositoryOwner": {"login": "other"},
+                                   "closingIssuesReferences": []}]))
+    path = CHK
+    if src is not None:
+        path = t / "mutant"; path.write_text(src)
+    r = subprocess.run([sys.executable, "-I", str(path), slug], capture_output=True, text=True, env=PRENV)
+    out = r.stdout + r.stderr
+    v = [l.split()[1] for l in out.splitlines() if l.startswith("VERDICT ")]
+    return (v[-1] if v else "none"), out
+
+
+def stale_pr_test(src=None):
+    v, out = pr_verdict((9, "OURS"), src=src)
+    return v == "unchanged" and "already conflicts with this branch's base" in out and "CONFLICTS with #7" not in out
+
+
+def real_overlap_test(src=None):
+    v, out = pr_verdict((1, "OURS1"), src=src)
+    return v == "overlap" and "CONFLICTS with #7" in out
+
+
+def deleted_pr_test(src=None):
+    """PR #7 deletes big.rs, which main and this branch both change: a conflict with no markers (a
+    delete, a rename, a binary file) is never called stale."""
+    v, out = pr_verdict((9, "OURS"), src=src, pr_files={BIG: None})
+    return v == "overlap" and "CONFLICTS with #7" in out
+
+
+def line_end_test(src=None):
+    """This branch changes only line 2's ending inside the block where #7 already clashes with main:
+    the blocks differ by that \\r alone, which is still this branch's change."""
+    v, out = pr_verdict((2, "l2\r"), src=src, pr_files=big({1: "P1", 2: "P2"}))
+    return v == "overlap" and "CONFLICTS with #7" in out
+
+
+check("overlap_stale_pr: a PR that conflicts with the base alone is not an overlap", stale_pr_test())
+check("overlap_deleted: a PR that deletes a file this branch changes is an overlap", deleted_pr_test())
+check("overlap_line_end: a change of line ending in the clash is an overlap", line_end_test())
+check("overlap_real: a change to the lines the PR changes is still an overlap", real_overlap_test())
+
+
 # mutants: the script with one guard taken out; the guard's check must now fail
 def mutant(name, old, new, test):
     global ok
@@ -232,5 +302,12 @@ mutant("home", "prof[k] = HOME_WORD.sub(lambda _: str(Path.home()), v) if k in P
 mutant("home_keys", "prof[k] = HOME_WORD.sub(lambda _: str(Path.home()), v) if k in PATH_KEYS else v",
        "prof[k] = HOME_WORD.sub(lambda _: str(Path.home()), v)", home_test)
 mutant("areas_group", 'if key == "AREAS" and groups < 1:', "if False:", group_test)
+mutant("stale_pr", "stale = [c for c in clash if ours.get(c) and theirs.get(c)",
+       "stale = [c for c in clash if False", stale_pr_test)
+mutant("stale_none", """stale = [c for c in clash if ours.get(c) and theirs.get(c)
+                         and not Counter(ours[c]) - Counter(theirs[c])]""",
+       "stale = [c for c in clash if not Counter(ours.get(c)) - Counter(theirs.get(c))]", deleted_pr_test)
+mutant("stale_bytes", 'blob.stdout.split(b"\\n")', "blob.stdout.splitlines()", line_end_test)
+mutant("stale_pr_added", "and not Counter(ours[c]) - Counter(theirs[c])]", "]", real_overlap_test)
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
