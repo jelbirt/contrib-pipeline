@@ -43,6 +43,7 @@ EXIT_DONE, EXIT_SOFT, EXIT_HARD, EXIT_SHUTDOWN_FAILED, EXIT_BUSY = 0, 10, 20, 30
 SOFT_DISK_GB, HARD_DISK_GB, HARD_MEM_MB, HARD_MEM_SECS = 32, 26, 2048, 300
 MAX_TURNS = {"A": 8, "B": 10, "C": 6}
 MAX_REQUESTS_PER_TURN = 12
+PROBE_MAX_BYTES = 32000          # one scout probe: a short test file
 TURN_TIMEOUT = 45 * 60          # one Claude turn
 REQUEST_TIMEOUT = 75 * 60       # one build or test request
 STAGE_BUDGET = 90 * 60          # soft stop when less than this is left before the deadline
@@ -63,6 +64,7 @@ GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c"
             # the packs a clone or a .git copy is reading at that moment. Preflight runs gc in the
             # foreground instead (repo_gc).
             "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
+
 # What the driver copies from a session's folder into the ledger's record/ (the session folder
 # itself is ignored by the ledger's git, so nothing a session plants there reaches git).
 RECORD_TOP = ("packet.md", "details.md", "PR_BODY.md", "plan.md", "next.json", "candidates.json", "rules.json")
@@ -79,6 +81,30 @@ JAIL_TOOLS = {"bwrap", "socat", "cargo", "rustc", "xerj", "es-yaml-runner", "gua
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def rid_of(x):
+    """A request id as the driver names its result files: safe characters only, at most 60."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(x))[:60]
+
+
+def clear_tree(p):
+    """Remove a folder a jailed command could write, and say whether it is gone. A symlink or
+    file left in the folder's place is unlinked, not followed. A folder goes to coreutils:
+    chmod -R opens up whatever the command made unreadable or unwritable and, like rm -rf,
+    follows no symlink it meets inside the tree and works at any depth (Python's rmtree hits its
+    recursion limit near 1,000 levels, and one such tree would refuse every later probe). Nothing
+    can race this: the jail unshares its pid namespace, so every process it started is dead."""
+    p = str(p)
+    try:
+        if os.path.islink(p) or (os.path.lexists(p) and not os.path.isdir(p)):
+            os.unlink(p)
+        elif os.path.lexists(p):
+            for argv in (["chmod", "-R", "u+rwx", "--", p], ["rm", "-rf", "--one-file-system", "--", p]):
+                subprocess.run(argv, capture_output=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return not os.path.lexists(p)
 
 
 def die_with_driver():
@@ -1466,7 +1492,8 @@ class Driver:
         return read_json(self.cand / "state.json", {}) if self.cand else {}
 
     def clone(self):
-        return WORK / "clones" / self.cand.name
+        # The scout's probes run in a throwaway clone of the base, not a candidate's clone.
+        return getattr(self, "probe_clone", None) or WORK / "clones" / self.cand.name
 
     def bins(self):
         return WORK / "bins" / self.cand.name
@@ -3127,7 +3154,7 @@ class Driver:
         if left:
             total, first = len(reqs) + len(left), MAX_REQUESTS_PER_TURN + 1
             # Named as they would run (the rid rule below), so a session's own words never reach the prompt.
-            ids = [re.sub(r"[^A-Za-z0-9_.-]", "_", str(r["id"]))[:60] if isinstance(r, dict) and r.get("id")
+            ids = [rid_of(r["id"]) if isinstance(r, dict) and r.get("id")
                    else "(no id)" for r in left]
             shown = ", ".join(ids[:12]) + (f", and {len(ids) - 12} more" if len(ids) > 12 else "")
             which = (f"request {first} did not run and has no result" if len(left) == 1 else
@@ -3148,13 +3175,15 @@ class Driver:
                 raise StopRun()
             if not isinstance(req, dict):
                 req = {"kind": "invalid"}
-            rid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(req.get("id") or f"r{int(time.time())}-{n}"))[:60]
+            rid = rid_of(req.get("id") or f"r{int(time.time())}-{n}")
             kind = req.get("kind")
             t0 = time.time()
             rc, note, out = 0, "", res_dir / f"{rid}.log"
             self.last_counts = None
             try:
-                if self.commands and kind not in ("test", "check", "gh"):
+                if kind == "probe":
+                    rc, out, note = self.req_probe(rid, req)
+                elif self.commands and kind not in ("test", "check", "gh"):
                     rc, note = 2, f"unknown request kind {kind!r}: this repo's kinds are test, check and gh"
                 elif self.commands and kind == "test":
                     rc, out, note = self.req_cmd_test(rid, req)
@@ -3204,11 +3233,12 @@ class Driver:
                 rc, note = 1, f"driver error: {e}"
             if not Path(out).exists():
                 Path(out).write_text(note + "\n")
-            expect = req.get("expect", "pass" if kind in ("test", "check", "clippy", "yaml", "fmt", "build") else "any")
+            expect = req.get("expect", "fail" if kind == "probe" else
+                             "pass" if kind in ("test", "check", "clippy", "yaml", "fmt", "build") else "any")
             if expect not in ("pass", "fail", "any"):
                 expect = "pass"
             infra = rc in INFRA_EXITS
-            met, note = self.judge_result(kind, expect, rc, out, note)
+            met, note = self.judge_result("test" if kind == "probe" else kind, expect, rc, out, note)
             rec = {"id": rid, "at": now(), "kind": kind, "exit": rc, "expect": expect, "met": met, "infra": infra,
                    "secs": int(time.time() - t0), "log": str(Path(out).relative_to(self.cand)), "note": one_line(note, 500)}
             if self.commands and kind == "test" and not note.startswith("refused:") and not req.get("without"):
@@ -3218,6 +3248,10 @@ class Driver:
                     rec["counts"] = self.last_counts
             elif not self.commands and kind == "test" and rc not in (2,) and not req.get("without"):
                 rec["req"] = {k: req[k] for k in ("crate", "target", "filter") if isinstance(req.get(k), str)}
+            if kind == "probe":
+                rec["probe"] = {"path": one_line(req.get("path"), 200), "source": one_line(req.get("source"), 200)}
+                if self.last_counts is not None:
+                    rec["counts"] = self.last_counts
             with open(index, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             self.log(f"request {rid} ({kind}): exit {rc}, expect {expect}, met {met}")
@@ -3446,9 +3480,10 @@ class Driver:
         rc = self.ensure_setup(rid)
         if rc:
             return rc, out, "the dependency setup failed"
-        base = self.st()["base_sha"]
+        base = self.st()["base_sha"] if rels else None      # a scout probe has no candidate state
         tmp = WORK / "tmp" / f"cmd-{self.cand.name}-{rid}"
-        shutil.rmtree(tmp, ignore_errors=True)
+        if not clear_tree(tmp):          # report/ is writable in the jail, so a run can leave it locked
+            return 2, out, f"refused: the driver could not remove {tmp.name} left by an earlier run; use a new id"
         (tmp / "report").mkdir(parents=True)
         junit = tmp / "report" / "junit.xml"
         try:
@@ -3469,11 +3504,97 @@ class Driver:
                 shutil.copyfile(junit, self.cand / "results" / f"{rid}.junit.xml")
                 self.last_counts = junit_counts(self.cand / "results" / f"{rid}.junit.xml")
         finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            clear_tree(tmp)
         note = "reverted to base for this run: " + ", ".join(rels) if rels else ""
         if self.last_counts:
             note = (note + "; " if note else "") + counts_note(self.last_counts)
         return rc, out, note
+
+    def req_probe(self, rid, req):
+        """A scout probe: a test file the scout wrote in its session folder, laid as a new file into a
+        throwaway clone of the base at a path the profile's TEST_FILES globs match, and run there with
+        the profile's test command in the jail, as a stage's test request is. A probe that fails shows
+        the scout's suspected defect is real on the base. The file as run is kept in results/, where
+        the scout cannot change it. Each probe gets a clone of its own, made fresh and removed whole
+        afterwards: the jail can write the clone, so nothing a probe left there (a symlink, a folder
+        it locked) may reach the next probe or a path the driver acts on."""
+        out = self.cand / "results" / f"{rid}.log"
+        home = getattr(self, "probe_home", None)
+        if home is None or not self.commands:
+            return 2, out, "refused: a probe is a scout request, in repos whose profile has a test command"
+        sdir, src_rel, dest = home / "session", req.get("source"), req.get("path")
+        if (not isinstance(src_rel, str) or src_rel in ("", ".", "..") or "/" in src_rel or "\x00" in src_rel):
+            return 2, out, "refused: source must be the name of a file directly in your session folder"
+        kept = self.cand / "results" / f"{rid}.probe"
+        if os.path.lexists(kept):
+            return 2, out, "refused: a probe with this id already ran; give each probe a new id"
+        src = sdir / src_rel
+        try:
+            fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return 2, out, "refused: source is not a file in your session folder"
+        try:
+            st_ = os.fstat(fd)
+            if not stat.S_ISREG(st_.st_mode):
+                return 2, out, "refused: source is not a file in your session folder"
+            if st_.st_size > PROBE_MAX_BYTES:
+                return 2, out, f"refused: a probe file is at most {PROBE_MAX_BYTES} bytes"
+            data = os.read(fd, PROBE_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
+        globs = self.prof.get("TEST_FILES", "").split()
+        if (not isinstance(dest, str) or dest.startswith(("-", "@")) or any(c in dest for c in "\n\r")
+                or not any(fnmatch.fnmatchcase(dest, g) for g in globs)):
+            return 2, out, ("refused: path must be a test file path the profile's test globs match ("
+                            + ", ".join(globs) + ")")
+        if any(dest == k or dest.startswith(k.rstrip("/") + "/") for k in self.prof.get("SETUP_KEY", "").split()):
+            return 2, out, "refused: path is under a SETUP_KEY path, whose base version every run uses"
+        if not clear_tree(self.clone()):
+            return 2, out, "refused: the driver could not remove the last probe's clone"
+        try:
+            self.make_clone("scout-probe", "contrib-probe", self.setup_base, restore=False)
+            f = self.clone_path(dest)
+            if f is None:
+                return 2, out, "refused: path is not a plain file path inside the clone"
+            if os.path.lexists(f):
+                return 2, out, "refused: the base already has a file at path; give the probe a new file name"
+            if not f.parent.is_dir() or f.parent.is_symlink():
+                return 2, out, "refused: the folder of path does not exist at the base"
+            kept.write_bytes(data)
+            fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            res = self.req_cmd_test(rid, {"paths": [dest], "filter": req.get("filter", ""),
+                                          "expect": req.get("expect", "fail")})
+            if res[2].startswith("refused:"):
+                kept.unlink(missing_ok=True)          # it never ran, so the scout may fix it and use the id again
+            return res
+        finally:
+            if not clear_tree(self.clone()):
+                self.log(f"scout: could not remove the probe clone {self.clone()}; the next probe is refused")
+
+    def probe_text(self):
+        """The scout's probe request, written from the profile."""
+        p = self.prof
+        globs = ", ".join(f"`{g}`" for g in p["TEST_FILES"].split())
+        none = p.get("TEST_EXIT_NONE", "").strip()
+        return "\n".join([
+            "## Probes: checking a suspected defect on the base", "",
+            "You cannot run code, but the driver can. To learn whether a defect you suspect is real, write a "
+            "short test in this repo's test style that asserts the correct behaviour, save it in your session "
+            "folder, and ask for a `probe`: an item in next.json's `requests` (action `run`) with an `id`, "
+            "`source` (the file's name, directly in your session folder) and `path` (where it goes in the clone: a "
+            f"new file name in an existing folder, matching {globs}). `filter` works as for a test request, and "
+            "`expect` defaults to `fail`. Give each probe a new `id`. The driver lays the file into a fresh clone of the base and runs "
+            f"`{p['TEST_CMD']}` on it in its jail: no network, the dependencies read-only. The first probe may "
+            "wait while the dependencies are installed.", "",
+            f"A probe meets `fail` only when the command exits {p['TEST_EXIT_FAIL']} with failing tests and no "
+            "errors" + (f" (exit {none}: no test was found)" if none else "") + ". An import or collection "
+            "error reproduces nothing. Read the log in `results/`: the failure must be your assertion, for the "
+            "reason you suspect. The driver keeps each probe as it ran in `results/<id>.probe`.",
+        ])
 
     def req_check(self, rid, req):
         out = self.cand / "results" / f"{rid}.log"
@@ -4572,38 +4693,57 @@ class Driver:
             prompt += (" The final gate refuses a branch that changes " + ", ".join(f"`{k}`" for k in keys)
                        + " (every run uses their base version): list no candidate that needs a change there, "
                        "and leave those paths out of your git log and marker searches.")
+        probing = bool(self.commands and self.prof.get("TEST_CMD", "").strip() and self.prof.get("TEST_FILES", "").split())
         if issue_less:
             prompt += (" This run takes issue-less fixes only: list no open issue, and no fix for a defect an "
                        "open issue already reports. At most one candidate.")
+            if probing:
+                prompt += (" List it only with a probe that failed on the base, named in its `probe` field: the "
+                           "driver drops an issue-less candidate without one.")
         system = "\n\n---\n\n".join([(SKILL / "rules" / "common.md").read_text(), self.prof_md,
-                                     *self.deny_text(runs=False), (SKILL / "stages" / "scout.md").read_text()])
+                                     *self.deny_text(runs=False), *([self.probe_text()] if probing else []),
+                                     (SKILL / "stages" / "scout.md").read_text()])
         nxt = sdir / "next.json"
         self.cand = None
         act = None
+        kinds = ("gh", "probe") if probing else ("gh",)
+        pclone = WORK / "clones" / "_scout-probe"
         try:
-            for _ in range(4):
+            if probing:
+                self.probe_home, self.probe_clone = home, pclone
+                self.setup_base = self.git("rev-parse", self.upstream)
+            # A probe needs a turn to ask and one to read the result, so a probing scout gets more turns.
+            for _ in range(6 if probing else 4):
                 self.check_stop(between=True)
                 nxt.unlink(missing_ok=True)
                 self.session("scout", sdir, prompt, system, self.args.scout_model, [sdir], None, home)
                 act = read_session_json(nxt)
                 if act and act.get("action") == "run":
-                    self.cand = home          # the scout may only ask for gh reads
+                    self.cand = home          # the scout may only ask for gh reads (and probes)
                     reqs = act.get("requests") if isinstance(act.get("requests"), list) else []
-                    gh = [r for r in reqs if isinstance(r, dict) and r.get("kind") == "gh"]
-                    self.run_requests(gh)
+                    ok = [r for r in reqs if isinstance(r, dict) and r.get("kind") in kinds]
+                    self.run_requests(ok)
                     self.cand = None
-                    prompt = f"Your gh reads are done; see {home}/results/index.jsonl. Finish and write {nxt}."
+                    what = "gh reads and probes" if probing else "gh reads"
+                    prompt = f"Your {what} are done; see {home}/results/index.jsonl. Finish and write {nxt}."
                     if self.cut_note:
                         prompt = self.cut_note + "\n\n" + prompt
-                    if len(gh) < len(reqs):
-                        prompt = (f"{len(reqs) - len(gh)} of your requests were not gh reads and did not run: "
-                                  "the scout may only ask for gh reads.\n\n" + prompt)
+                    if len(ok) < len(reqs):
+                        prompt = (f"{len(reqs) - len(ok)} of your requests were not {what} and did not run: "
+                                  f"the scout may only ask for {what}.\n\n" + prompt)
                     continue
                 break
         finally:
             self.cand = None
             self.archive_transcripts(home)
             shutil.rmtree(self.session_tmp(home, make=False), ignore_errors=True)
+            if probing:
+                try:
+                    if not clear_tree(pclone):
+                        self.log(f"scout: could not remove the probe clone {pclone}; remove it by hand")
+                    self.drop_copy(WORK / "snap" / f"{home.name}.build")
+                finally:
+                    self.probe_home = self.probe_clone = self.setup_base = None
         if act and act.get("action") == "stage-done" and act.get("summary"):
             self.log(f"scout: {one_line(act['summary'], 200)}")
         raw = read_session_file(sdir / "candidates.json")
@@ -4611,17 +4751,37 @@ class Driver:
             cands = json.loads(raw) if raw else []
         except ValueError:
             cands = []
-        out, dropped = [], 0
+        failed = {}       # probe id -> its record, for probes that failed on the base as the scout expected
+        for line in (home / "results" / "index.jsonl").read_text().splitlines() if probing and \
+                (home / "results" / "index.jsonl").is_file() else []:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(rec, dict) and rec.get("kind") == "probe" and rec.get("expect") == "fail" and rec.get("met")
+                    and not str(rec.get("note", "")).startswith("refused:")):
+                failed[rec.get("id")] = rec
+        out, dropped, unproved = [], 0, 0
         for c in cands if isinstance(cands, list) else []:
             if isinstance(c, dict) and isinstance(c.get("slug"), str) and c["slug"] not in known:
                 if issue_less and names_issue(c):
                     dropped += 1
+                    continue
+                rec = failed.get(rid_of(c["probe"])) if isinstance(c.get("probe"), str) and c["probe"] else None
+                if issue_less and probing and rec is None:
+                    unproved += 1
                     continue
                 out.append({k: c[k] for k in ("slug", "title", "source", "issue", "why", "size", "risk", "confidence",
                                               "issue_less", "assign_comment") if k in c})
                 files = c.get("files")
                 if isinstance(files, list):         # shown when a pause run lists the candidates
                     out[-1]["files"] = [one_line(f, 160) for f in files[:10] if isinstance(f, str) and f.strip()]
+                if rec is not None:
+                    kept = home / "results" / f"{rec['id']}.probe"
+                    out[-1]["probe"] = {"id": rec["id"], "path": rec.get("probe", {}).get("path", ""),
+                                        "log": str(home / rec.get("log", "")),
+                                        "test": kept.read_text(errors="replace")[:PROBE_MAX_BYTES]
+                                        if kept.is_file() and not kept.is_symlink() else ""}
                 if issue_less:
                     out[-1]["issue"] = None       # whatever else it wrote, it is not an issue number
                 terms = c.get("search_terms")
@@ -4630,6 +4790,8 @@ class Driver:
         if issue_less:
             if dropped:
                 self.log(f"scout: dropped {dropped} issue candidate(s); this run takes issue-less fixes only")
+            if unproved:
+                self.log(f"scout: dropped {unproved} issue-less candidate(s) with no probe that failed on the base")
             if len(out) > 1:
                 self.log(f"scout: kept 1 of {len(out)} issue-less candidates; at most one per run")
             out = out[:1]
