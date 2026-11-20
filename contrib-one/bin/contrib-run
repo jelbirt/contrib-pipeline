@@ -4933,7 +4933,8 @@ class Driver:
             elif self.args.resume:
                 stopped = [s for s in self.all_states() if s.get("status") == "stopped"]
                 queue = [("resume", s["_dir"]) for s in stopped]
-                self.resume_picks = any(s.get("picked") is True for s in stopped)
+                self.resume_picks = any(s.get("picked") is True and (s.get("repo") or "").lower() == self.repo.lower()
+                                        for s in stopped)   # only this repo's picks; another repo's pick says nothing here
             while len(self.done) < self.run_limit():
                 self.check_stop(between=True)
                 mine, ready = self.open_count()

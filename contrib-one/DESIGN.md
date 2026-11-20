@@ -1033,7 +1033,7 @@ candidates first, for more oversight of the work that will be done.
   `--issue-less` and `--topic`, which each choose the work another way.
 - A `--resume` in pause mode works the stopped candidates and ends without scouting: a scout
   would replace the list before the user picked from it. So does a `--resume` that finishes a
-  picked candidate on any profile: a pick's state says `picked`, so after `--mode pause` on an
+  picked candidate of this repo on any profile (another repo's stopped pick does not count): a pick's state says `picked`, so after `--mode pause` on an
   autonomous profile the plain `--resume` the banner prints cannot go on to scout and work
   candidates the user never chose. A pick run that stops names the picks it did not reach in
   its banner, with a ready `--pick` command for them. A stop asked for during a pause run's

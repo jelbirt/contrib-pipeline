@@ -244,6 +244,12 @@ check("autonomous: a resume that finishes a picked candidate does not scout",
 check("autonomous: and its stop reason says why",
       d.stop_reason == "resumed 2 stopped candidates; a resume in pause mode or of a pick does not scout")
 shutil.rmtree(LEDGER / "candidates" / "stopped-a"); shutil.rmtree(LEDGER / "candidates" / "stopped-p")
+# A stopped pick in another repo does not stop this repo's autonomous resume from scouting.
+put_state("other-p", repo="other/repo", status="stopped", picked=True)
+d = driver("autonomous", scouted=FOUND, limit=2); d.args.resume = True; d.main()
+check("autonomous: another repo's stopped pick does not stop this repo's resume from scouting",
+      d.resume_picks is False and d.scouts == [1])
+shutil.rmtree(LEDGER / "candidates" / "other-p")
 
 # The real scout(): the fields a pick is made on survive its filter (guards the merge with the probe work).
 d = driver("pause"); del d.scout
