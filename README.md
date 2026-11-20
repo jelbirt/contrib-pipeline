@@ -155,7 +155,7 @@ setsid nohup ~/contrib-pipeline/contrib-one/bin/contrib-run --repo <owner/name> 
 - Stop with `touch ~/contrib-queue/STOP` (after the current stage) or `STOP-NOW` (at once).
 - Answer a needs-you question with
   `~/contrib-pipeline/contrib-one/bin/contrib-run --repo <owner/name> --answer SLUG "text"`;
-  continue stopped work by adding `--resume` to a run.
+  continue stopped work by adding `--resume` to a run of the same repo.
 - Two run modes, set by `RUN_MODE` in the profile and overridden for one run with
   `--mode autonomous|pause`. `autonomous` (the default) works what the scout finds. `pause`
   scouts, lists the candidates at the top of `QUEUE.md`, and stops before any work; then

@@ -31,8 +31,8 @@ setsid nohup ~/.claude/skills/contrib-one/bin/contrib-run --repo <owner/name> --
 Flags: `--limit N` candidates to finish (default 3), `--hours H` deadline, `--topic "..."`
 to steer the scout, `--issue-less` to work one fix that no open issue reports (the scout
 skips open issues, the driver drops any candidate that names one, and the limit becomes 1;
-with `--resume`, a stopped candidate takes that one slot and the scout runs only when none is
-stopped; not with `--answer`), `--resume` to pick up stopped candidates first, `--answer SLUG
+with `--resume`, a stopped candidate of this repo takes that one slot and the scout runs only when none is
+stopped; not with `--answer`), `--resume` to pick up this repo's stopped candidates first, `--answer SLUG
 "TEXT"` to answer a needs-you candidate's question and continue only that candidate,
 `--model` and `--scout-model` (defaults `opus` and `sonnet`).
 
@@ -48,7 +48,7 @@ set it) and overridden for one run by `--mode autonomous|pause`:
   and refuses a slug that is not on the list or whose issue a later run already took. A picked
   candidate leaves the list when its work starts; the rest stay until the next pause run
   replaces the list. A `--resume` in pause mode, or one that finishes a picked candidate of this repo, works
-  only the stopped candidates and does not scout. When a pick run stops, its banner gives the
+  only this repo's stopped candidates and does not scout. When a pick run stops, its banner gives the
   `--resume` for the stopped pick and a `--pick` command for the picks it did not reach. Stage A
   rechecks claims and overlapping PRs before any fix, so an older list is safe to pick from. `--pick` does not go
   with `--answer`, `--resume`, `--issue-less` or `--topic`.
