@@ -997,3 +997,49 @@ its own docs.
   for a stage that reads and does not run). Both reached stages A and C only, so a scout
   could pick a fix the gate would refuse (81 of pydantic's last 277 commits touch
   pydantic-core), and lost turns to denied interpreter calls in earlier pydantic runs.
+
+## Scout probes (2026-11-19, found in a pydantic scout run)
+
+The next `--issue-less` pydantic scout listed about 60 recent fixes, read two diffs and one
+marker search, and returned an empty list. The cause was not effort: every rule asks for a
+named user-visible failure, and a session that may only read cannot confirm one, so a
+careful scout drops every lead it cannot prove. The outside fixes pydantic merged in the
+last three months (92 of 100 with no issue, about 15 of them real Python-side bug fixes)
+each open with a reproduction someone ran.
+
+- A new scout request, `probe`: the scout writes a test file in its session folder and names
+  a new path for it that the profile's TEST_FILES globs match. The driver copies it into a
+  fresh clone of the base (`clones/_scout-probe`, nothing restored), runs it with the
+  profile's TEST_CMD in the jail and under the build guard, as a stage's test request is run,
+  then removes the whole clone. It expects `fail` unless it says otherwise, and is judged as
+  a test. The file as run is kept in `results/<id>.probe`, which the scout cannot change.
+- One clone per probe, made in under a second and removed whole by `clear_tree`. The jail
+  can write the clone, so a probe could leave a symlink where its folder was, or lock a
+  folder; removing just the probe file by its path afterwards would then follow that link
+  onto the host. `clear_tree` unlinks a link or file left in the folder's place and hands a
+  folder to coreutils: `chmod -R u+rwx` opens up locked folders and, like `rm -rf
+  --one-file-system`, follows no link it meets inside and works at any depth. Python's
+  rmtree was tried first and dropped: it hits its recursion limit near 1,000 levels, and one
+  such tree at the fixed clone path would refuse every later probe. Nothing races the
+  removal, since the jail unshares its pid namespace and nothing it started is alive. A
+  probe is refused if the last clone could not be removed.
+- A test request's scratch folder (`tmp/cmd-<name>-<id>`) has a `report/` the jail can
+  write, so it too goes through `clear_tree`, before the run and after; a request is
+  refused rather than crashing on a leftover the driver cannot remove. A probe the test
+  command itself refused (for example a filter with no TEST_FILTER_FLAG) never ran, so its
+  kept copy is dropped and its id stays free.
+- The driver refuses a probe whose source is not a regular file directly in the session
+  folder (no subfolders, opened with O_NOFOLLOW, at most 32,000 bytes), whose id already ran
+  (each probe gets a new id, so one record per id decides), whose path the test globs do not match,
+  that sits under a SETUP_KEY path, that would overwrite a file the base has, or whose folder
+  does not exist at the base. Probes are a scout request only, in commands-mode repos; a
+  repo with no TEST_CMD keeps the old read-only scout.
+- In an issue-less run the driver keeps a candidate only if its `probe` field names a probe
+  that failed on the base as expected (the id read as the driver names result files, and a
+  refused request never counts), and logs how many it dropped. A kept candidate (in any
+  run) carries the probe's id, path, log and test text in state.json, and stage A starts from
+  that test. A probing scout gets six turns instead of four, since a probe takes one turn to
+  ask and one to read.
+- The scout's system prompt gains a Probes section built from the profile (its test command
+  and globs). After the scout, the probe clone and its build copy are removed and the
+  driver's probe state is reset, so a later stage's requests cannot reach the probe clone.

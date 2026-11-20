@@ -37,7 +37,7 @@ the snapshot: ask for a `gh search issues` read with the fix's terms before you 
 it (the driver drops a candidate whose source cites one), and give one candidate at most.
 
 ### Finding an issue-less fix
-No issue points at it, and you cannot run code, so find it by reading. Work these leads at
+No issue points at it, so find it by reading, then prove it with a probe (below). Work these leads at
 the base, in the paths the profile's scope allows (if it names none, the repo's main source
 and test folders), leaving out any your prompt says the final gate refuses:
 1. **What a recent fix missed.** List the recent fixes (`git -C <clone> log <remote>/<branch>
@@ -60,11 +60,16 @@ and test folders), leaving out any your prompt says the final gate refuses:
    release.
 
 For a lead you keep, name the input that triggers it, the wrong result, and the lines at the
-base that cause it. Say in `why` that the failure is read from the code, not run; stage A
+base that cause it. Then, when your instructions have a Probes section, prove it: write a
+probe that asserts the correct result, ask for it, and keep the lead only if the probe failed
+for the reason you name. A probe that passes means the base already behaves: drop the lead.
+Put the failing probe's id in the candidate's `probe` field (in a run that takes issue-less
+fixes only, the driver drops a candidate without one) and say in `why` what it showed. With
+no Probes section, say in `why` that the failure is read from the code, not run; stage A
 reproduces it before any fix. In a run that takes issue-less fixes only, one module read is
 not a search: work through at least the last 20 fix commits in scope (or all of them if
 there are fewer) and a marker search before you answer with an empty list, and say in
-`next.json`'s summary how many leads you checked.
+`next.json`'s summary how many leads you checked and how many you probed.
 
 ## Every candidate must pass all of these (drop it otherwise)
 - **Unclaimed:** no "I'll take this" in the last 14 days, no assignee other than the
@@ -75,7 +80,8 @@ there are fewer) and a marker search before you answer with an empty list, and s
   parameter or test file. A listed gap that an open PR closes is taken.
 - **Not owner-only:** no roadmap epic, release work, or "maintainers will handle" label.
 - **Fits the profile's scope:** a fix one PR can carry, with a test that fails before.
-- **Not already fixed on the base:** check the code at the base, not only the issue text.
+- **Not already fixed on the base:** check the code at the base, not only the issue text (a
+  probe, where you have them, is the surest check).
 - **Not declined before:** maintainers have not already turned this change down or put it
   off. For an issue, read its `## Linked from` list. Every closed, unmerged PR and every
   issue closed as not planned on it may hold their answer: ask for its comments and reviews
@@ -96,7 +102,8 @@ Write `candidates.json`: a list, best first, at most 5, each:
  "issue": 123, "why": "two sentences: what is wrong, likely fix",
  "files": ["paths the fix likely touches"], "overlap_checked": ["#PR numbers you read"],
  "size": "S|M", "confidence": "high|medium",
- "search_terms": ["1 to 3 short phrases another PR fixing this would likely use in its title"]}
+ "search_terms": ["1 to 3 short phrases another PR fixing this would likely use in its title"],
+ "probe": "id of a probe that failed on the base, or null"}
 ```
 
 When your prompt says work on an issue starts only once the issue is assigned to the

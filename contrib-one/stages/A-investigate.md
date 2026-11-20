@@ -5,7 +5,9 @@ You may write tests in this stage, but not the fix.
 
 ## Checklist
 The scout's `why` and any fix it suggests are a hypothesis from a short look, not a finding:
-confirm them from the code before relying on them.
+confirm them from the code before relying on them. When state.json's `candidate` has a
+`probe`, the scout's test (its `test`) failed on the base as a new file at its `path` (log at
+its `log`): start from that test, and check that it still fails in your clone, for that reason.
 
 1. **Recheck the claim and overlap** from `gh/` (fresh snapshot for this candidate): the
    issue's own file in `gh/issues/` for a new claim or assignee (no file: the issue is older
