@@ -2005,10 +2005,12 @@ class Driver:
     def ensure_fetched(self, rid):
         """Download crates for the base commit's Cargo.lock, never the session's. The fetch jail
         has network, so it sees only upstream files exported from the pipeline clone. A candidate
-        that adds a dependency fails its offline build, and the session is told why."""
-        base = self.st()["base_sha"]
+        that adds a dependency fails its offline build, and the session is told why. The base is
+        the one the tree sits on: the recorded base, or for a retest after a rebase or with
+        --merge the upstream commit it now has (setup_base), whose Cargo.lock may be newer."""
+        base = getattr(self, "setup_base", None) or self.st().get("base_sha")
         if not re.fullmatch(r"[0-9a-f]{40}", base or ""):
-            raise RuntimeError("state.json base_sha is not a commit id")
+            raise RuntimeError("the fetch base is not a commit id")
         root = self.prof.get("CRATE_ROOT", ".")
         lock_id = self.git("rev-parse", "--verify", "--quiet", f"{base}:{root}/Cargo.lock", check=False) or base
         home = WORK / "cargo-home"
@@ -5047,9 +5049,9 @@ class Driver:
     def retest(self, slug, merge):
         """Re-run, in the jail, a candidate's checks on its branch as it now is in the pipeline
         clone, or with --merge on a trial merge with the current base: the final gate's runs in
-        commands mode (with the dependency setup for that base), else its passing test requests,
-        clippy on their crates and the full YAML suite. Nothing is saved back: the clone is
-        thrown away."""
+        commands mode, else cargo fmt --check, its passing test requests, clippy on their crates
+        and the full YAML suite. Either way the dependencies (SETUP_CMD or cargo fetch) are those
+        of the base the tree now sits on. Nothing is saved back: the clone is thrown away."""
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", slug or ""):
             raise RuntimeError(f"bad slug {slug!r}")
         self.cand = LEDGER / "candidates" / slug
@@ -5092,10 +5094,11 @@ class Driver:
                 except RuntimeError as e:
                     raise RuntimeError(f"the trial merge with the base failed ({one_line(e, 150)}); rebase first")
                 merged = base_now
+            # The dependencies of the base this tree now has: after a rebase or a trial merge its
+            # lockfile is upstream's newer one, not the recorded base's (both modes read this).
+            self.setup_base = merged or fork_pt
             if self.commands:
-                # The dependencies of the base this tree now has, and the branch's own commits
-                # only (head, not a trial merge) for the changed test files.
-                self.setup_base = merged or fork_pt
+                # The branch's own commits only (head, not a trial merge) for the changed test files.
                 refusal, reqs, missing = self.commands_gate_reqs(tests, f"retest-{stamp}", fork_pt, tip=head)
                 if refusal:
                     raise RuntimeError(refusal)

@@ -86,9 +86,11 @@ reported as `already conflicts with this branch's base` and not counted as an ov
 the same repo.
 
 A retest re-runs the final gate's checks in the jail, one heavy job at a time under the
-guard: in commands mode the gate checks, the replayed tests and the changed test files (with
-`--merge`, on the dependencies of the base it merged); otherwise `cargo fmt --check`, the
-replayed tests, workspace clippy and the full YAML suite. It prints `RETEST ok` or
+guard: in commands mode the gate checks, the replayed tests and the changed test files;
+otherwise `cargo fmt --check`, the replayed tests, workspace clippy and the full YAML suite.
+Either way it sets up the dependencies of the base the tree now sits on (after a rebase, the
+new fork point; with `--merge`, the base it merged): its `Cargo.lock` is fetched, or
+`SETUP_CMD` runs for its `SETUP_KEY` files. It prints `RETEST ok` or
 `RETEST failed` with each log's path, and records the result in `state.json`. It cannot run
 while an unattended run holds the ledger lock (exit 40): say so and wait.
 
