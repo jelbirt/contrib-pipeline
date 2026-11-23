@@ -1179,3 +1179,26 @@ says to run the same `--lead` again. Stage A's step 4 ("does not reproduce: aban
 defers to the lead rule (`needs-you`), and a lead, which carries no `search_terms`, takes its
 search terms from its `why`. On an assignment-first repo the stop for `--lead --issue N` says
 no scout drafted a comment, rather than pointing at a draft that does not exist.
+
+## A retest fetches the crates of the base it builds on (2026-11-22, found publishing xerj #3454)
+
+`ensure_fetched` downloaded crates for the `Cargo.lock` of the candidate's recorded `base_sha`
+only. That is right for a normal run, whose tree sits on that base, but contrib-publish's step 4
+rebases a branch onto today's upstream and then runs `--retest`, and `--merge` builds a trial
+merge with the current base. Both trees carry upstream's newer lockfile. When upstream had bumped
+a dependency in between (xerj's `tokio` 1.53.2), every offline build step failed with "failed to
+download ... --offline was specified"; only `cargo fmt --check` and steps that needed nothing new
+passed. The retest looked like a failed fix when the fix was never built. Commands mode had this
+right already: `retest` set `setup_base` (the fork point, or the merged base) for `ensure_setup`,
+but only inside its commands branch.
+
+Now `retest` sets `setup_base` before choosing a mode, and `ensure_fetched` reads it the same way
+`ensure_setup` does: `setup_base`, else the recorded base. A lockfile already fetched is stamped
+by its blob id in `cargo-home/.fetched-locks`, so a rebase that left `Cargo.lock` alone costs no
+second download. Normal runs never set `setup_base` in cargo mode (scout probes set it only when
+`probing`, which needs commands mode), so their fetch is unchanged. The fetch still exports only
+upstream files from the pipeline clone into the networked jail, never session code.
+
+`tests/smoke/unit_crates.py` checks the base each case fetches for (recorded, rebased with a new
+lockfile, rebased with the same one, `--merge`), the stamp, and the refusals; it fails on the
+driver from before this change, and catches seven planted bugs.
